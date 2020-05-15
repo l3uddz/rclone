@@ -69,6 +69,7 @@ type ConfigInfo struct {
 	IgnoreChecksum         bool
 	IgnoreCaseSync         bool
 	NoTraverse             bool
+	CheckFirst             bool
 	NoCheckDest            bool
 	NoUpdateModTime        bool
 	DataRateUnit           string

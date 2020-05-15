@@ -66,6 +66,7 @@ type syncCopyMove struct {
 	renameCheck          []fs.Object            // accumulate files to check for rename here
 	compareCopyDest      fs.Fs                  // place to check for files to server side copy
 	backupDir            fs.Fs                  // place to store overwrites/deletes
+	checkFirst           bool                   // if set run all the checkers before starting transfers
 }
 
 type trackRenamesStrategy byte
@@ -106,17 +107,23 @@ func newSyncCopyMove(ctx context.Context, fdst, fsrc fs.Fs, deleteMode fs.Delete
 		trackRenames:       fs.Config.TrackRenames,
 		commonHash:         fsrc.Hashes().Overlap(fdst.Hashes()).GetOne(),
 		trackRenamesCh:     make(chan fs.Object, fs.Config.Checkers),
+		checkFirst:         fs.Config.CheckFirst,
+	}
+	backlog := fs.Config.MaxBacklog
+	if s.checkFirst {
+		fs.Infof(s.fdst, "Running all checks before starting transfers")
+		backlog = -1
 	}
 	var err error
-	s.toBeChecked, err = newPipe(fs.Config.OrderBy, accounting.Stats(ctx).SetCheckQueue, fs.Config.MaxBacklog)
+	s.toBeChecked, err = newPipe(fs.Config.OrderBy, accounting.Stats(ctx).SetCheckQueue, backlog)
 	if err != nil {
 		return nil, err
 	}
-	s.toBeUploaded, err = newPipe(fs.Config.OrderBy, accounting.Stats(ctx).SetTransferQueue, fs.Config.MaxBacklog)
+	s.toBeUploaded, err = newPipe(fs.Config.OrderBy, accounting.Stats(ctx).SetTransferQueue, backlog)
 	if err != nil {
 		return nil, err
 	}
-	s.toBeRenamed, err = newPipe(fs.Config.OrderBy, accounting.Stats(ctx).SetRenameQueue, fs.Config.MaxBacklog)
+	s.toBeRenamed, err = newPipe(fs.Config.OrderBy, accounting.Stats(ctx).SetRenameQueue, backlog)
 	if err != nil {
 		return nil, err
 	}
@@ -774,7 +781,9 @@ func (s *syncCopyMove) run() error {
 	// Start background checking and transferring pipeline
 	s.startCheckers()
 	s.startRenamers()
-	s.startTransfers()
+	if !s.checkFirst {
+		s.startTransfers()
+	}
 	s.startDeleters()
 	s.dstFiles = make(map[string]fs.Object)
 
@@ -792,6 +801,10 @@ func (s *syncCopyMove) run() error {
 		NoCheckDest:   s.noCheckDest,
 	}
 	s.processError(m.Run())
+
+	if s.checkFirst {
+		s.startTransfers()
+	}
 
 	s.stopTrackRenames()
 	if s.trackRenames {
