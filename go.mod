@@ -26,6 +26,7 @@ require (
 	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
 	github.com/koofr/go-httpclient v0.0.0-20190818202018-e0dc8fd921dc
 	github.com/koofr/go-koofrclient v0.0.0-20190724113126-8e5366da203a
+	github.com/lucperkins/rek v0.1.3
 	github.com/mattn/go-colorable v0.1.4
 	github.com/mattn/go-ieproxy v0.0.0-20200203040449-2dbc853185d9 // indirect
 	github.com/mattn/go-isatty v0.0.12 // indirect

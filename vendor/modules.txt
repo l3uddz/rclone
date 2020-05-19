@@ -136,6 +136,8 @@ github.com/koofr/go-httpclient
 github.com/koofr/go-koofrclient
 # github.com/kr/fs v0.1.0
 github.com/kr/fs
+# github.com/lucperkins/rek v0.1.3
+github.com/lucperkins/rek
 # github.com/mattn/go-colorable v0.1.4
 github.com/mattn/go-colorable
 # github.com/mattn/go-ieproxy v0.0.0-20200203040449-2dbc853185d9

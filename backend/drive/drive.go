@@ -12,9 +12,11 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/lucperkins/rek"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"mime"
 	"net/http"
 	"net/url"
@@ -227,6 +229,12 @@ in with the ID of the root folder.
 		}, {
 			Name: "service_account_file",
 			Help: "Service Account Credentials JSON file path \nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
+		}, {
+			Name: "service_account_file_path",
+			Help: "Service Account Credentials JSON file path .\n",
+		}, {
+			Name: "service_account_url",
+			Help: "Service Account Credentials URL to request file path .\n",
 		}, {
 			Name:     "service_account_credentials",
 			Help:     "Service Account Credentials JSON blob\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
@@ -471,6 +479,21 @@ See: https://github.com/rclone/rclone/issues/3857
 `,
 			Advanced: true,
 		}, {
+			Name:    "stop_on_download_limit",
+			Default: false,
+			Help: `Make download limit errors be fatal
+
+At the time of writing it is only possible to download 10TB of data from
+Google Drive a day (this is an undocumented limit). When this limit is
+reached Google Drive produces a downloadQuotaExceeded error message. When
+this flag is set it causes these errors to be fatal.  These will stop
+the in-progress sync.
+
+Note that this detection is relying on error message strings which
+Google don't document so it may break in the future.
+`,
+			Advanced: true,
+		}, {
 			Name: "skip_shortcuts",
 			Help: `If set skip shortcut files
 
@@ -509,6 +532,8 @@ type Options struct {
 	Scope                     string               `config:"scope"`
 	RootFolderID              string               `config:"root_folder_id"`
 	ServiceAccountFile        string               `config:"service_account_file"`
+	ServiceAccountFilePath    string               `config:"service_account_file_path"`
+	ServiceAccountUrl         string               `config:"service_account_url"`
 	ServiceAccountCredentials string               `config:"service_account_credentials"`
 	TeamDriveID               string               `config:"team_drive"`
 	AuthOwnerOnly             bool                 `config:"auth_owner_only"`
@@ -537,27 +562,30 @@ type Options struct {
 	ServerSideAcrossConfigs   bool                 `config:"server_side_across_configs"`
 	DisableHTTP2              bool                 `config:"disable_http2"`
 	StopOnUploadLimit         bool                 `config:"stop_on_upload_limit"`
+	StopOnDownloadLimit       bool                 `config:"stop_on_download_limit"`
 	SkipShortcuts             bool                 `config:"skip_shortcuts"`
 	Enc                       encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote drive server
 type Fs struct {
-	name             string             // name of this remote
-	root             string             // the path we are working on
-	opt              Options            // parsed options
-	features         *fs.Features       // optional features
-	svc              *drive.Service     // the connection to the drive server
-	v2Svc            *drive_v2.Service  // used to create download links for the v2 api
-	client           *http.Client       // authorized client
-	rootFolderID     string             // the id of the root folder
-	dirCache         *dircache.DirCache // Map of directory path to directory id
-	pacer            *fs.Pacer          // To pace the API calls
-	exportExtensions []string           // preferred extensions to download docs
-	importMimeTypes  []string           // MIME types to convert to docs
-	isTeamDrive      bool               // true if this is a team drive
-	fileFields       googleapi.Field    // fields to fetch file info with
-	m                configmap.Mapper
+	name                string             // name of this remote
+	root                string             // the path we are working on
+	opt                 Options            // parsed options
+	features            *fs.Features       // optional features
+	svc                 *drive.Service     // the connection to the drive server
+	v2Svc               *drive_v2.Service  // used to create download links for the v2 api
+	client              *http.Client       // authorized client
+	rootFolderID        string             // the id of the root folder
+	dirCache            *dircache.DirCache // Map of directory path to directory id
+	pacer               *fs.Pacer          // To pace the API calls
+	exportExtensions    []string           // preferred extensions to download docs
+	importMimeTypes     []string           // MIME types to convert to docs
+	isTeamDrive         bool               // true if this is a team drive
+	fileFields          googleapi.Field    // fields to fetch file info with
+	m                   configmap.Mapper
+	ServiceAccountFiles map[string]int
+	waitChangeSvc       sync.Mutex
 }
 
 type baseObject struct {
@@ -613,6 +641,14 @@ func (f *Fs) Features() *fs.Features {
 
 // shouldRetry determines whether a given err rates being retried
 func (f *Fs) shouldRetry(err error) (bool, error) {
+	// attempt to type-cast err in-case we have additional context r.e. retry (service account...)
+	rec, ok := err.(*ErrorWithRetryContext)
+	serviceAccount := ""
+	if ok {
+		err = rec.err
+		serviceAccount = rec.ServiceAccountFile
+	}
+
 	if err == nil {
 		return false, nil
 	}
@@ -627,19 +663,90 @@ func (f *Fs) shouldRetry(err error) (bool, error) {
 		}
 		if len(gerr.Errors) > 0 {
 			reason := gerr.Errors[0].Reason
-			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
-				if f.opt.StopOnUploadLimit && gerr.Errors[0].Message == "User rate limit exceeded." {
-					fs.Errorf(f, "Received upload limit error: %v", err)
-					return false, fserrors.FatalError(err)
-				}
-				return true, err
-			} else if f.opt.StopOnUploadLimit && reason == "teamDriveFileLimitExceeded" {
-				fs.Errorf(f, "Received team drive file limit error: %v", err)
-				return false, fserrors.FatalError(err)
-			}
+			msg := gerr.Errors[0].Message
+			return f.handleCycleError(err, reason, msg, serviceAccount)
 		}
 	}
 	return false, err
+}
+
+func (f *Fs) handleCycleError(origError error, reason string, message string, txFailedServiceAccount string) (bool, error) {
+	var e error
+	sac := false
+
+	// handle error accordingly
+	switch {
+	case reason == "rateLimitExceeded", reason == "userRateLimitExceeded":
+		// rate limit exceeded
+		if message == "User rate limit exceeded." {
+			switch {
+			case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+				sac = true
+
+				f.waitChangeSvc.Lock()
+				e = f.cycleServiceAccountFile(txFailedServiceAccount)
+				f.waitChangeSvc.Unlock()
+			default:
+				break
+			}
+
+			// was service-account-file-path or service-account-url logic applied?
+			switch {
+			case sac && e == nil:
+				return true, e
+			case sac:
+				fmt.Println("gclone, service account cycle error:", e)
+			default:
+				break
+			}
+
+			if f.opt.StopOnUploadLimit {
+				fs.Errorf(f, "Received upload limit error: %v", origError)
+				return false, fserrors.FatalError(origError)
+			}
+		}
+
+		return true, origError
+
+	case reason == "downloadQuotaExceeded":
+		// download quota exceeded
+		switch {
+		case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+			sac = true
+
+			f.waitChangeSvc.Lock()
+			e = f.cycleServiceAccountFile(txFailedServiceAccount)
+			f.waitChangeSvc.Unlock()
+		default:
+			break
+		}
+
+		// was service-account-file-path or service-account-url logic applied?
+		switch {
+		case sac && e == nil:
+			return true, e
+		case sac:
+			fmt.Println("gclone, service account cycle error:", e)
+		default:
+			break
+		}
+
+		if f.opt.StopOnDownloadLimit {
+			fs.Errorf(f, "Received download limit error: %v", origError)
+			return false, fserrors.FatalError(origError)
+		}
+
+	case reason == "teamDriveFileLimitExceeded":
+		// teamdrive file limit exceeded
+		if f.opt.StopOnUploadLimit {
+			fs.Errorf(f, "Received team drive file limit error: %v", origError)
+			return false, fserrors.FatalError(origError)
+		}
+	default:
+		break
+	}
+
+	return false, origError
 }
 
 // parseParse parses a drive 'url'
@@ -2256,12 +2363,14 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	var info *drive.File
 	err = f.pacer.Call(func() (bool, error) {
+		sa := f.opt.ServiceAccountFile
+
 		info, err = f.svc.Files.Copy(id, createInfo).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			KeepRevisionForever(f.opt.KeepRevisionForever).
 			Do()
-		return f.shouldRetry(err)
+		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
@@ -2414,13 +2523,15 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// Do the move
 	var info *drive.File
 	err = f.pacer.Call(func() (bool, error) {
+		sa := f.opt.ServiceAccountFile
+
 		info, err = f.svc.Files.Update(shortcutID(srcObj.id), dstInfo).
 			RemoveParents(srcParentID).
 			AddParents(dstParents).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			Do()
-		return f.shouldRetry(err)
+		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
@@ -2743,6 +2854,91 @@ func (f *Fs) changeChunkSize(chunkSizeString string) (err error) {
 		f.opt.ChunkSize = chunkSize
 	}
 	return err
+}
+
+func (f *Fs) cycleServiceAccountFile(oldFile string) error {
+	opt := &f.opt
+	currentServiceAccount := opt.ServiceAccountFile
+	nextServiceAccount := ""
+
+	switch {
+	case opt.ServiceAccountUrl != "" && oldFile == currentServiceAccount:
+		// rotate based on service account from url
+		payload := map[string]string{
+			"old":    currentServiceAccount,
+			"remote": f.Name(),
+		}
+
+		// send request
+		res, err := rek.Post(opt.ServiceAccountUrl, rek.Json(payload), rek.Timeout(10*time.Second))
+		switch {
+		case err != nil:
+			return errors.Wrap(err, "request ServiceAccountUrl request error")
+		case res.StatusCode() != 200:
+			// drain body
+			_, _ = rek.BodyAsBytes(res.Body())
+			return fmt.Errorf("request ServiceAccountUrl response status: %s", res.Status())
+		default:
+			break
+		}
+
+		// validate response
+		sa, err := rek.BodyAsString(res.Body())
+		switch {
+		case err != nil:
+			return errors.Wrap(err, "validate ServiceAccountUrl response")
+		case sa == "":
+			return errors.New("validate ServiceAccountUrl response service account")
+		default:
+			break
+		}
+
+		// we have a service account, set it
+		nextServiceAccount = sa
+		break
+	case opt.ServiceAccountFilePath != "" && oldFile == currentServiceAccount:
+		// default route (rotate from file path)
+		if len(f.ServiceAccountFiles) == 0 {
+			f.ServiceAccountFiles = make(map[string]int)
+
+			dirList, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
+			if e != nil {
+				return errors.Wrap(e, "read ServiceAccountFilePath files error")
+			}
+
+			for i, v := range dirList {
+				filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
+				if ".json" == path.Ext(filePath) {
+					//fmt.Println(filePath)
+					f.ServiceAccountFiles[filePath] = i
+				}
+			}
+		}
+
+		if len(f.ServiceAccountFiles) <= 0 {
+			return errors.New("no more service accounts available")
+		}
+
+		r := rand.Intn(len(f.ServiceAccountFiles))
+		for k := range f.ServiceAccountFiles {
+			if r == 0 {
+				nextServiceAccount = k
+			}
+			r--
+		}
+
+		delete(f.ServiceAccountFiles, nextServiceAccount)
+		break
+	default:
+		break
+	}
+
+	if currentServiceAccount == nextServiceAccount {
+		// current service account is already loaded
+		return nil
+	}
+
+	return f.changeServiceAccountFile(f.opt.ServiceAccountFile)
 }
 
 func (f *Fs) changeServiceAccountFile(file string) (err error) {
@@ -3222,11 +3418,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	if o.v2Download {
 		var v2File *drive_v2.File
 		err = o.fs.pacer.Call(func() (bool, error) {
+			sa := o.fs.opt.ServiceAccountFile
+
 			v2File, err = o.fs.v2Svc.Files.Get(actualID(o.id)).
 				Fields("downloadUrl").
 				SupportsAllDrives(true).
 				Do()
-			return o.fs.shouldRetry(err)
+			return o.fs.shouldRetry(NewErrorWithRetryContext(err, sa))
 		})
 		if err == nil {
 			fs.Debugf(o, "Using v2 download: %v", v2File.DownloadUrl)
