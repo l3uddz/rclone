@@ -2909,7 +2909,6 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 			for i, v := range dirList {
 				filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
 				if ".json" == path.Ext(filePath) {
-					//fmt.Println(filePath)
 					f.ServiceAccountFiles[filePath] = i
 				}
 			}
@@ -2933,8 +2932,8 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 		break
 	}
 
-	if currentServiceAccount == nextServiceAccount {
-		// current service account is already loaded
+	if nextServiceAccount == "" {
+		// current service account should be re-tried
 		return nil
 	}
 
