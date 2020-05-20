@@ -16,7 +16,6 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"mime"
 	"net/http"
 	"net/url"
@@ -584,7 +583,7 @@ type Fs struct {
 	isTeamDrive         bool               // true if this is a team drive
 	fileFields          googleapi.Field    // fields to fetch file info with
 	m                   configmap.Mapper
-	ServiceAccountFiles map[string]int
+	ServiceAccountFiles map[string]time.Time
 	waitChangeSvc       sync.Mutex
 }
 
@@ -2899,34 +2898,37 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 	case opt.ServiceAccountFilePath != "" && oldFile == currentServiceAccount:
 		// default route (rotate from file path)
 		if len(f.ServiceAccountFiles) == 0 {
-			f.ServiceAccountFiles = make(map[string]int)
+			f.ServiceAccountFiles = make(map[string]time.Time)
 
 			dirList, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
 			if e != nil {
 				return errors.Wrap(e, "read ServiceAccountFilePath files error")
 			}
 
-			for i, v := range dirList {
+			for _, v := range dirList {
 				filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
 				if ".json" == path.Ext(filePath) {
-					f.ServiceAccountFiles[filePath] = i
+					f.ServiceAccountFiles[filePath] = time.Now().UTC().Add(-1*time.Hour)
 				}
 			}
 		}
 
-		if len(f.ServiceAccountFiles) <= 0 {
+		f.ServiceAccountFiles[oldFile] = time.Now().UTC().Add(25 * time.Hour)
+		now := time.Now().UTC()
+		found := false
+
+		for k, v := range f.ServiceAccountFiles {
+			if now.After(v) {
+				found = true
+				nextServiceAccount = k
+				break
+			}
+		}
+
+		if !found {
 			return errors.New("no more service accounts available")
 		}
 
-		r := rand.Intn(len(f.ServiceAccountFiles))
-		for k := range f.ServiceAccountFiles {
-			if r == 0 {
-				nextServiceAccount = k
-			}
-			r--
-		}
-
-		delete(f.ServiceAccountFiles, nextServiceAccount)
 		break
 	default:
 		break
