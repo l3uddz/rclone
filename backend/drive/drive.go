@@ -2908,12 +2908,17 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 			for _, v := range dirList {
 				filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
 				if ".json" == path.Ext(filePath) {
-					f.ServiceAccountFiles[filePath] = time.Now().UTC().Add(-1*time.Hour)
+					f.ServiceAccountFiles[filePath] = time.Now().UTC().Add(-1 * time.Hour)
 				}
+			}
+
+			if len(f.ServiceAccountFiles) == 0 {
+				return errors.New("no service accounts were found in ServiceAccountFilePath")
 			}
 		}
 
 		f.ServiceAccountFiles[oldFile] = time.Now().UTC().Add(25 * time.Hour)
+		fs.Debugf(nil, "Not re-using service account file %s until %v", oldFile, f.ServiceAccountFiles[oldFile])
 		now := time.Now().UTC()
 		found := false
 
