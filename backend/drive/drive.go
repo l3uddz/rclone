@@ -2944,7 +2944,7 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 		return nil
 	}
 
-	return f.changeServiceAccountFile(f.opt.ServiceAccountFile)
+	return f.changeServiceAccountFile(nextServiceAccount)
 }
 
 func (f *Fs) changeServiceAccountFile(file string) (err error) {
