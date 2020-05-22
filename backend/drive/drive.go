@@ -725,7 +725,7 @@ func (f *Fs) handleCycleError(origError error, reason string, message string, tx
 		case sac && e == nil:
 			return true, e
 		case sac:
-			fmt.Println("gclone, service account cycle error:", e)
+			fmt.Println("rclone, service account cycle error:", e)
 		default:
 			break
 		}
