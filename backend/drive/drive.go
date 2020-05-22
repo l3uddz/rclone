@@ -2860,8 +2860,10 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 	currentServiceAccount := opt.ServiceAccountFile
 	nextServiceAccount := ""
 
+	fmt.Printf("cycleServiceAccountFile, old: %v - current: %v\n", oldFile, currentServiceAccount)
+
 	switch {
-	case opt.ServiceAccountUrl != "" && oldFile == currentServiceAccount:
+	case opt.ServiceAccountUrl != "" && (oldFile == currentServiceAccount || oldFile == ""):
 		// rotate based on service account from url
 		payload := map[string]string{
 			"old":    currentServiceAccount,
@@ -2895,7 +2897,7 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 		// we have a service account, set it
 		nextServiceAccount = sa
 		break
-	case opt.ServiceAccountFilePath != "" && oldFile == currentServiceAccount:
+	case opt.ServiceAccountFilePath != "" && (oldFile == currentServiceAccount || oldFile == ""):
 		// default route (rotate from file path)
 		if len(f.ServiceAccountFiles) == 0 {
 			f.ServiceAccountFiles = make(map[string]time.Time)
@@ -2941,6 +2943,7 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 
 	if nextServiceAccount == "" {
 		// current service account should be re-tried
+		fmt.Println("cycleServiceAccountFile, retrying current")
 		return nil
 	}
 
