@@ -71,6 +71,8 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 	var res *http.Response
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
+		sa:= f.opt.ServiceAccountFile
+
 		var body io.Reader
 		body, err = googleapi.WithoutDataWrapper.JSONReader(info)
 		if err != nil {
@@ -95,7 +97,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 			defer googleapi.CloseBody(res)
 			err = googleapi.CheckResponse(res)
 		}
-		return f.shouldRetry(err)
+		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
