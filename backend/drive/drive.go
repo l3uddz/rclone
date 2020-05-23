@@ -1282,6 +1282,14 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 		f.root = tempF.root
 		return f, fs.ErrorIsFile
 	}
+
+	// load service accounts
+	if f.opt.ServiceAccountFilePath != "" {
+		if err := f.loadServiceAccountsFromPath(); err != nil {
+			return nil, err
+		}
+	}
+
 	// fmt.Printf("Root id %s", f.dirCache.RootID())
 	return f, nil
 }
@@ -2898,27 +2906,11 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 	case opt.ServiceAccountFilePath != "" && oldFile == currentServiceAccount:
 		// default route (rotate from file path)
 		if len(f.ServiceAccountFiles) == 0 {
-			f.ServiceAccountFiles = make(map[string]time.Time)
-
-			dirList, e := ioutil.ReadDir(opt.ServiceAccountFilePath)
-			if e != nil {
-				return errors.Wrap(e, "read ServiceAccountFilePath files error")
-			}
-
-			for _, v := range dirList {
-				filePath := fmt.Sprintf("%s%s", opt.ServiceAccountFilePath, v.Name())
-				if ".json" == path.Ext(filePath) {
-					f.ServiceAccountFiles[filePath] = time.Now().UTC().Add(-1 * time.Hour)
-				}
-			}
-
-			if len(f.ServiceAccountFiles) == 0 {
-				return errors.New("no service accounts were found in ServiceAccountFilePath")
-			}
+			return fmt.Errorf("no service accounts were loaded from: %v", opt.ServiceAccountFilePath)
 		}
 
 		f.ServiceAccountFiles[oldFile] = time.Now().UTC().Add(25 * time.Hour)
-		fs.Debugf(nil, "Not re-using service account file %s until %v", oldFile, f.ServiceAccountFiles[oldFile])
+		fs.Logf(nil, "Not re-using service account until %v: %v", f.ServiceAccountFiles[oldFile], oldFile)
 		now := time.Now().UTC()
 		found := false
 
@@ -2946,6 +2938,34 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 
 	fs.Logf(nil, "Cycling to service account: %v", nextServiceAccount)
 	return f.changeServiceAccountFile(nextServiceAccount)
+}
+
+func (f *Fs) loadServiceAccountsFromPath() error {
+	if len(f.ServiceAccountFiles) > 0 {
+		return nil
+	}
+
+	f.ServiceAccountFiles = make(map[string]time.Time)
+
+	dirList, e := ioutil.ReadDir(f.opt.ServiceAccountFilePath)
+	if e != nil {
+		return errors.Wrap(e, "read ServiceAccountFilePath files error")
+	}
+
+	for _, v := range dirList {
+		filePath := fmt.Sprintf("%s%s", f.opt.ServiceAccountFilePath, v.Name())
+		if ".json" == path.Ext(filePath) {
+			f.ServiceAccountFiles[filePath] = time.Now().UTC().Add(-1 * time.Hour)
+		}
+	}
+
+	saCount := len(f.ServiceAccountFiles)
+	if saCount == 0 {
+		return errors.New("no service accounts were found in ServiceAccountFilePath")
+	}
+
+	fs.Logf(nil, "Loaded %d service accounts from: %v", saCount, f.opt.ServiceAccountFilePath)
+	return nil
 }
 
 func (f *Fs) changeServiceAccountFile(file string) (err error) {
