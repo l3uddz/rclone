@@ -2860,8 +2860,6 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 	currentServiceAccount := opt.ServiceAccountFile
 	nextServiceAccount := ""
 
-	//fmt.Printf("cycleServiceAccountFile, old: %v - current: %v\n", oldFile, currentServiceAccount)
-
 	switch {
 	case opt.ServiceAccountUrl != "" && oldFile == currentServiceAccount:
 		// rotate based on service account from url
@@ -2943,10 +2941,10 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 
 	if nextServiceAccount == "" {
 		// current service account should be re-tried
-		//fmt.Println("cycleServiceAccountFile, retrying current")
 		return nil
 	}
 
+	fs.Logf(nil, "Cycling to service account: %v", nextServiceAccount)
 	return f.changeServiceAccountFile(nextServiceAccount)
 }
 
