@@ -2902,6 +2902,8 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 
 		// we have a service account, set it
 		nextServiceAccount = sa
+
+		fs.Logf(nil, "Cycling to service account: %v", nextServiceAccount)
 		break
 	case opt.ServiceAccountFilePath != "" && oldFile == currentServiceAccount:
 		// default route (rotate from file path)
@@ -2926,6 +2928,7 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 			return errors.New("no more service accounts available")
 		}
 
+		fs.Logf(nil, "Cycling to service account: %v", nextServiceAccount)
 		break
 	default:
 		break
@@ -2936,7 +2939,6 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 		return nil
 	}
 
-	fs.Logf(nil, "Cycling to service account: %v", nextServiceAccount)
 	return f.changeServiceAccountFile(nextServiceAccount)
 }
 
