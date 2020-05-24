@@ -2864,20 +2864,18 @@ func (f *Fs) changeChunkSize(chunkSizeString string) (err error) {
 }
 
 func (f *Fs) cycleServiceAccountFile(oldFile string) error {
-	opt := &f.opt
-	currentServiceAccount := opt.ServiceAccountFile
 	nextServiceAccount := ""
 
 	switch {
-	case opt.ServiceAccountUrl != "" && oldFile == currentServiceAccount:
+	case f.opt.ServiceAccountUrl != "" && oldFile == f.opt.ServiceAccountFile:
 		// rotate based on service account from url
 		payload := map[string]string{
-			"old":    currentServiceAccount,
+			"old":    f.opt.ServiceAccountFile,
 			"remote": f.Name(),
 		}
 
 		// send request
-		res, err := rek.Post(opt.ServiceAccountUrl, rek.Json(payload), rek.Timeout(10*time.Second))
+		res, err := rek.Post(f.opt.ServiceAccountUrl, rek.Json(payload), rek.Timeout(10*time.Second))
 		switch {
 		case err != nil:
 			return errors.Wrap(err, "request ServiceAccountUrl request error")
@@ -2905,10 +2903,10 @@ func (f *Fs) cycleServiceAccountFile(oldFile string) error {
 
 		fs.Logf(nil, "Cycling to service account: %v", nextServiceAccount)
 		break
-	case opt.ServiceAccountFilePath != "" && oldFile == currentServiceAccount:
+	case f.opt.ServiceAccountFilePath != "" && oldFile == f.opt.ServiceAccountFile:
 		// default route (rotate from file path)
 		if len(f.ServiceAccountFiles) == 0 {
-			return fmt.Errorf("no service accounts were loaded from: %v", opt.ServiceAccountFilePath)
+			return fmt.Errorf("no service accounts were loaded from: %v", f.opt.ServiceAccountFilePath)
 		}
 
 		f.ServiceAccountFiles[oldFile] = time.Now().UTC().Add(25 * time.Hour)
