@@ -136,10 +136,18 @@ clean:
 	rm -f rclone fs/operations/operations.test fs/sync/sync.test fs/test_all.log test.log
 
 website:
+	rm -rf docs/public
 	cd docs && hugo
+	@if grep -R "raw HTML omitted" docs/public ; then echo "ERROR: found unescaped HTML - fix the markdown source" ; fi
 
 upload_website:	website
 	rclone -v sync docs/public memstore:www-rclone-org
+
+upload_test_website:	website
+	rclone -P sync docs/public test-rclone-org:
+
+validate_website: website
+	find docs/public -type f -name "*.html" | xargs tidy --mute-id yes -errors --gnu-emacs yes --drop-empty-elements no --warn-proprietary-attributes no --mute MISMATCHED_ATTRIBUTE_WARN
 
 tarball:
 	git archive -9 --format=tar.gz --prefix=rclone-$(TAG)/ -o build/rclone-$(TAG).tar.gz $(TAG)
@@ -209,7 +217,7 @@ fetch_binaries:
 	rclone -P sync --exclude "/testbuilds/**" --delete-excluded $(BETA_UPLOAD) build/
 
 serve:	website
-	cd docs && hugo server -v -w
+	cd docs && hugo server -v -w --disableFastRender
 
 tag:	doc
 	@echo "Old tag is $(VERSION)"

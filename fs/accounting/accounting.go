@@ -58,7 +58,7 @@ type accountValues struct {
 
 const averagePeriod = 16 // period to do exponentially weighted averages over
 
-// newAccountSizeName makes a Account reader for an io.ReadCloser of
+// newAccountSizeName makes an Account reader for an io.ReadCloser of
 // the given size and name
 func newAccountSizeName(stats *StatsInfo, in io.ReadCloser, size int64, name string) *Account {
 	acc := &Account{
@@ -359,7 +359,7 @@ func (acc *Account) progress() (bytes, size int64) {
 }
 
 // speed returns the speed of the current file transfer
-// in bytes per second, as well a an exponentially weighted moving average
+// in bytes per second, as well an exponentially weighted moving average
 // If no read has completed yet, 0 is returned for both values.
 func (acc *Account) speed() (bps, current float64) {
 	if acc == nil {

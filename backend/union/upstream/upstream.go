@@ -100,7 +100,7 @@ func New(remote, root string, cacheTime time.Duration) (*Fs, error) {
 	return f, err
 }
 
-// WrapDirectory wraps a fs.Directory to include the info
+// WrapDirectory wraps an fs.Directory to include the info
 // of the upstream Fs
 func (f *Fs) WrapDirectory(e fs.Directory) *Directory {
 	if e == nil {
@@ -112,7 +112,7 @@ func (f *Fs) WrapDirectory(e fs.Directory) *Directory {
 	}
 }
 
-// WrapObject wraps a fs.Object to include the info
+// WrapObject wraps an fs.Object to include the info
 // of the upstream Fs
 func (f *Fs) WrapObject(o fs.Object) *Object {
 	if o == nil {
@@ -124,7 +124,7 @@ func (f *Fs) WrapObject(o fs.Object) *Object {
 	}
 }
 
-// WrapEntry wraps a fs.DirEntry to include the info
+// WrapEntry wraps an fs.DirEntry to include the info
 // of the upstream Fs
 func (f *Fs) WrapEntry(e fs.DirEntry) (Entry, error) {
 	switch e.(type) {
@@ -219,7 +219,7 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 
 // Update in to the object with the modTime given of the given size
 //
-// When called from outside a Fs by rclone, src.Size() will always be >= 0.
+// When called from outside an Fs by rclone, src.Size() will always be >= 0.
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {

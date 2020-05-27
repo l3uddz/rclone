@@ -12,9 +12,9 @@ Authors
 Contributors
 ------------
 
-<!--- NB email addresses removed from here need to be addeed to
+{{< rem `email addresses removed from here need to be addeed to
 bin/.ignore-emails to make sure update-authors.py doesn't immediately
-put them back in again. -->
+put them back in again.` >}}
 
   * Alex Couper <amcouper@gmail.com>
   * Leonid Shalupov <leonid@shalupov.com> <shalupov@diverse.org.ru>
@@ -377,3 +377,4 @@ put them back in again. -->
   * Ben Zenker <imbenzenker@gmail.com>
   * Martin Michlmayr <tbm@cyrius.com>
   * Brandon McNama <bmcnama@pagerduty.com>
+  * Daniel Slyman <github@skylayer.eu>

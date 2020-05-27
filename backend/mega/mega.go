@@ -150,7 +150,7 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// parsePath parses an mega 'url'
+// parsePath parses a mega 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
 	return
@@ -871,7 +871,7 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 			return errors.Errorf("MergeDirs failed to find node for: %v", srcDir)
 		}
 
-		// list the the objects
+		// list the objects
 		infos := []*mega.Node{}
 		_, err := f.list(ctx, srcDirNode, func(info *mega.Node) bool {
 			infos = append(infos, info)

@@ -63,7 +63,7 @@ func init() {
 			//   ? (question mark) -> '？' // FULLWIDTH QUESTION MARK
 			//   * (asterisk)      -> '＊' // FULLWIDTH ASTERISK
 			//
-			// Additionally names can't begin or end with a ASCII whitespace.
+			// Additionally names can't begin or end with an ASCII whitespace.
 			// List of replaced characters:
 			//     (space)           -> '␠'  // SYMBOL FOR SPACE
 			//     (horizontal tab)  -> '␉'  // SYMBOL FOR HORIZONTAL TABULATION
@@ -677,7 +677,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	if "" == o.id {
-		// We need to create a ID for this file
+		// We need to create an ID for this file
 		var resp *http.Response
 		response := createFileResponse{}
 		err := o.fs.pacer.Call(func() (bool, error) {

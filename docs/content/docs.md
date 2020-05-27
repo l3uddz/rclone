@@ -44,7 +44,7 @@ See the following for detailed instructions for
   * [Memory](/memory/)
   * [Microsoft Azure Blob Storage](/azureblob/)
   * [Microsoft OneDrive](/onedrive/)
-  * [Openstack Swift / Rackspace Cloudfiles / Memset Memstore](/swift/)
+  * [OpenStack Swift / Rackspace Cloudfiles / Memset Memstore](/swift/)
   * [OpenDrive](/opendrive/)
   * [Pcloud](/pcloud/)
   * [premiumize.me](/premiumizeme/)
@@ -359,10 +359,10 @@ For example, to limit bandwidth usage to 10 MBytes/s use `--bwlimit 10M`
 
 It is also possible to specify a "timetable" of limits, which will cause
 certain limits to be applied at certain times. To specify a timetable, format your
-entries as "WEEKDAY-HH:MM,BANDWIDTH WEEKDAY-HH:MM,BANDWIDTH..." where:
-WEEKDAY is optional element.
+entries as `WEEKDAY-HH:MM,BANDWIDTH WEEKDAY-HH:MM,BANDWIDTH...` where:
+`WEEKDAY` is optional element.
 It could be written as whole world or only using 3 first characters.
-HH:MM is an hour from 00:00 to 23:59.
+`HH:MM` is an hour from 00:00 to 23:59.
 
 An example of a typical timetable to avoid link saturation during daytime
 working hours could be:
@@ -375,7 +375,7 @@ At 6pm, the bandwidth limit will be set to 30MBytes/s, and at 11pm it will be
 completely disabled (full speed). Anything between 11pm and 8am will remain
 unlimited.
 
-An example of timetable with WEEKDAY could be:
+An example of timetable with `WEEKDAY` could be:
 
 `--bwlimit "Mon-00:00,512 Fri-23:59,10M Sat-10:00,1M Sun-20:00,off"`
 
@@ -402,7 +402,7 @@ you have a 10 Mbit/s connection and you wish rclone to use half of it
 - 5 Mbit/s.  This is 5/8 = 0.625MByte/s so you would use a `--bwlimit
 0.625M` parameter for rclone.
 
-On Unix systems (Linux, MacOS, …) the bandwidth limiter can be toggled by
+On Unix systems (Linux, macOS, …) the bandwidth limiter can be toggled by
 sending a `SIGUSR2` signal to rclone. This allows to remove the limitations
 of a long running rclone transfer and to restore it back to the value specified
 with `--bwlimit` quickly when needed. Assuming there is only one rclone instance
@@ -424,10 +424,24 @@ When using `mount` or `cmount` each open file descriptor will use this much
 memory for buffering.
 See the [mount](/commands/rclone_mount/#file-buffering) documentation for more details.
 
-Set to 0 to disable the buffering for the minimum memory usage.
+Set to `0` to disable the buffering for the minimum memory usage.
 
 Note that the memory allocation of the buffers is influenced by the
 [--use-mmap](#use-mmap) flag.
+
+### --check-first ###
+
+If this flag is set then in a `sync`, `copy` or `move`, rclone will do
+all the checks to see whether files need to be transferred before
+doing any of the transfers. Normally rclone would start running
+transfers as soon as possible.
+
+This flag can be useful on IO limited systems where transfers
+interfere with checking.
+
+Using this flag can use more memory as it effectively sets
+`--max-backlog` to infinite. This means that all the info on the
+objects to transfer is held in memory before the transfers start.
 
 ### --checkers=N ###
 
@@ -553,7 +567,7 @@ Zero means no timeout and causes the body to be sent immediately,
 without waiting for the server to approve.  This time does not include
 the time to send the request header.
 
-The default is `1s`.  Set to 0 to disable.
+The default is `1s`.  Set to `0` to disable.
 
 ### --error-on-no-transfer ###
 
@@ -591,7 +605,7 @@ add multiple headers.
 rclone sync s3:test/src ~/dst --header-download "X-Amz-Meta-Test: Foo" --header-download "X-Amz-Meta-Test2: Bar"
 ```
 
-See the Github issue [here](https://github.com/rclone/rclone/issues/59) for
+See the GitHub issue [here](https://github.com/rclone/rclone/issues/59) for
 currently supported backends.
 
 ### --header-upload ###
@@ -603,7 +617,7 @@ multiple headers.
 rclone sync ~/src s3:test/dst --header-upload "Content-Disposition: attachment; filename='cool.html'" --header-upload "X-Amz-Meta-Test: FooBar"
 ```
 
-See the Github issue [here](https://github.com/rclone/rclone/issues/59) for
+See the GitHub issue [here](https://github.com/rclone/rclone/issues/59) for
 currently supported backends.
 
 ### --ignore-case-sync ###
@@ -745,6 +759,9 @@ time and make `--order-by` work more accurately.
 Setting this small will make rclone more synchronous to the listings
 of the remote which may be desirable.
 
+Setting this to a negative number will make the backlog as large as
+possible.
+
 ### --max-delete=N ###
 
 This tells rclone not to delete more than N files.  If that limit is
@@ -819,7 +836,7 @@ This command line flag allows you to override that computed default.
 ### --multi-thread-cutoff=SIZE ###
 
 When downloading files to the local backend above this size, rclone
-will use multiple threads to download the file. (default 250M)
+will use multiple threads to download the file (default 250M).
 
 Rclone preallocates the file (using `fallocate(FALLOC_FL_KEEP_SIZE)`
 on unix or `NTSetInformationFile` on Windows both of which takes no
@@ -854,7 +871,7 @@ with `--multi-thread-streams 0`
 
 When using multi thread downloads (see above `--multi-thread-cutoff`)
 this sets the maximum number of streams to use.  Set to `0` to disable
-multi thread downloads. (Default 4)
+multi thread downloads (Default 4).
 
 Exactly how many streams rclone uses for the download depends on the
 size of the file. To calculate the number of download streams Rclone
@@ -864,7 +881,7 @@ up, up to the maximum set with `--multi-thread-streams`.
 So if `--multi-thread-cutoff 250MB` and `--multi-thread-streams 4` are
 in effect (the defaults):
 
-- 0MB.250MB files will be downloaded with 1 stream
+- 0MB..250MB files will be downloaded with 1 stream
 - 250MB..500MB files will be downloaded with 2 streams
 - 500MB..750MB files will be downloaded with 3 streams
 - 750MB+ files will be downloaded with 4 streams
@@ -1009,7 +1026,7 @@ Eg
 
 See the [Configuration Encryption](#configuration-encryption) for more info.
 
-See a [Windows Powershell example on the Wiki.](https://github.com/rclone/rclone/wiki/Windows-Powershell-use-rclone-password-command-for-Config-file-password)
+See a [Windows PowerShell example on the Wiki](https://github.com/rclone/rclone/wiki/Windows-Powershell-use-rclone-password-command-for-Config-file-password).
 
 ### -P, --progress ###
 
@@ -1047,7 +1064,7 @@ Disable retries with `--retries 1`.
 
 This sets the interval between each retry specified by `--retries` 
 
-The default is 0. Use 0 to disable.
+The default is `0`. Use `0` to disable.
 
 ### --size-only ###
 
@@ -1067,7 +1084,7 @@ their progress.
 
 This sets the interval.
 
-The default is `1m`. Use 0 to disable.
+The default is `1m`. Use `0` to disable.
 
 If you set the stats interval then all commands can show stats.  This
 can be useful when running other commands, `check` or `mount` for
@@ -1187,7 +1204,7 @@ See also `--tpslimit-burst`.
 
 ### --tpslimit-burst int ###
 
-Max burst of transactions for `--tpslimit`. (default 1)
+Max burst of transactions for `--tpslimit` (default `1`).
 
 Normally `--tpslimit` will do exactly the number of transaction per
 second specified.  However if you supply `--tps-burst` then rclone can
@@ -1295,7 +1312,7 @@ rclone will just ignore it.
 This sets the IO idle timeout.  If a transfer has started but then
 becomes idle for this long it is considered broken and disconnected.
 
-The default is `5m`.  Set to 0 to disable.
+The default is `5m`.  Set to `0` to disable.
 
 ### --transfers=N ###
 
@@ -1754,7 +1771,7 @@ you must create the `..._TYPE` variable as above.
 
 ### Other environment variables ###
 
-  * RCLONE_CONFIG_PASS` set to contain your config file password (see [Configuration Encryption](#configuration-encryption) section)
-  * HTTP_PROXY, HTTPS_PROXY and NO_PROXY (or the lowercase versions thereof).
-    * HTTPS_PROXY takes precedence over HTTP_PROXY for https requests.
+  * `RCLONE_CONFIG_PASS` set to contain your config file password (see [Configuration Encryption](#configuration-encryption) section)
+  * `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` (or the lowercase versions thereof).
+    * `HTTPS_PROXY` takes precedence over `HTTP_PROXY` for https requests.
     * The environment values may be either a complete URL or a "host[:port]" for, in which case the "http" scheme is assumed.

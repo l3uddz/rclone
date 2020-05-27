@@ -93,7 +93,7 @@ func init() {
 					log.Fatalf("Failed to configure token with jwt authentication: %v", err)
 				}
 			} else {
-				err = oauthutil.Config("box", name, m, oauthConfig)
+				err = oauthutil.Config("box", name, m, oauthConfig, nil)
 				if err != nil {
 					log.Fatalf("Failed to configure token with oauth authentication: %v", err)
 				}
@@ -296,7 +296,7 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// parsePath parses an box 'url'
+// parsePath parses a box 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
 	return
@@ -883,6 +883,30 @@ func (f *Fs) move(ctx context.Context, endpoint, id, leaf, directoryID string) (
 	return info, nil
 }
 
+// About gets quota information
+func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/users/me",
+	}
+	var user api.User
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &user)
+		return shouldRetry(resp, err)
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read user info")
+	}
+	// FIXME max upload size would be useful to use in Update
+	usage = &fs.Usage{
+		Used:  fs.NewUsageValue(user.SpaceUsed),                    // bytes in use
+		Total: fs.NewUsageValue(user.SpaceAmount),                  // bytes total
+		Free:  fs.NewUsageValue(user.SpaceAmount - user.SpaceUsed), // bytes free
+	}
+	return usage, nil
+}
+
 // Move src to this remote using server side move operations.
 //
 // This is stored with the remote path given
@@ -1274,6 +1298,7 @@ var (
 	_ fs.Purger          = (*Fs)(nil)
 	_ fs.PutStreamer     = (*Fs)(nil)
 	_ fs.Copier          = (*Fs)(nil)
+	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.DirCacheFlusher = (*Fs)(nil)

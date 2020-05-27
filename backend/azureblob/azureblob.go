@@ -201,7 +201,7 @@ type Fs struct {
 	pool          *pool.Pool                      // memory pool
 }
 
-// Object describes a azure object
+// Object describes an azure object
 type Object struct {
 	fs         *Fs                   // what this object is part of
 	remote     string                // The remote path
@@ -338,7 +338,7 @@ func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
 }
 
 // httpClientFactory creates a Factory object that sends HTTP requests
-// to a rclone's http.Client.
+// to an rclone's http.Client.
 //
 // copied from azblob.newDefaultHTTPClientFactory
 func httpClientFactory(client *http.Client) pipeline.Factory {
@@ -1455,7 +1455,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	httpHeaders.ContentType = fs.MimeType(ctx, o)
 	// Compute the Content-MD5 of the file, for multiparts uploads it
 	// will be set in PutBlockList API call using the 'x-ms-blob-content-md5' header
-	// Note: If multipart, a MD5 checksum will also be computed for each uploaded block
+	// Note: If multipart, an MD5 checksum will also be computed for each uploaded block
 	// 		 in order to validate its integrity during transport
 	if !o.fs.opt.DisableCheckSum {
 		if sourceMD5, _ := src.Hash(ctx, hash.MD5); sourceMD5 != "" {

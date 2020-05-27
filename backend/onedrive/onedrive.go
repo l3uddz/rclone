@@ -79,7 +79,7 @@ func init() {
 		NewFs:       NewFs,
 		Config: func(name string, m configmap.Mapper) {
 			ctx := context.TODO()
-			err := oauthutil.Config("onedrive", name, m, oauthConfig)
+			err := oauthutil.Config("onedrive", name, m, oauthConfig, nil)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 				return
@@ -396,7 +396,7 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// parsePath parses an one drive 'url'
+// parsePath parses a one drive 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
 	return
@@ -1310,7 +1310,7 @@ func (f *Fs) Hashes() hash.Set {
 	return hash.Set(QuickXorHashType)
 }
 
-// PublicLink returns a link for downloading without accout.
+// PublicLink returns a link for downloading without account.
 func (f *Fs) PublicLink(ctx context.Context, remote string) (link string, err error) {
 	info, _, err := f.readMetaDataForPath(ctx, f.rootPath(remote))
 	if err != nil {

@@ -217,7 +217,7 @@ func decodeFileName(in string) ([]byte, error) {
 // 2003 paper "A Parallelizable Enciphering Mode" by Halevi and
 // Rogaway.
 //
-// This makes for determinstic encryption which is what we want - the
+// This makes for deterministic encryption which is what we want - the
 // same filename must encrypt to the same thing.
 //
 // This means that
@@ -559,7 +559,7 @@ func (n *nonce) increment() {
 	n.carry(0)
 }
 
-// add an uint64 to the nonce
+// add a uint64 to the nonce
 func (n *nonce) add(x uint64) {
 	carry := uint16(0)
 	for i := 0; i < 8; i++ {

@@ -69,6 +69,7 @@ type ConfigInfo struct {
 	IgnoreChecksum         bool
 	IgnoreCaseSync         bool
 	NoTraverse             bool
+	CheckFirst             bool
 	NoCheckDest            bool
 	NoUnicodeNormalization bool
 	NoUpdateModTime        bool
@@ -156,7 +157,7 @@ func NewConfig() *ConfigInfo {
 	return c
 }
 
-// ConfigToEnv converts an config section and name, eg ("myremote",
+// ConfigToEnv converts a config section and name, eg ("myremote",
 // "ignore-size") into an environment name
 // "RCLONE_CONFIG_MYREMOTE_IGNORE_SIZE"
 func ConfigToEnv(section, name string) string {

@@ -48,7 +48,7 @@ type (
 
 // Global constants
 const (
-	MaxLeafSize = 4095 // don't pass file names longer than this
+	MaxLeafSize = 1024 // don't pass file names longer than this
 )
 
 func init() {
@@ -118,7 +118,7 @@ FUSE.
 
 First set up your remote using ` + "`rclone config`" + `.  Check it works with ` + "`rclone ls`" + ` etc.
 
-You can either run mount in foreground mode or background(daemon) mode. Mount runs in
+You can either run mount in foreground mode or background (daemon) mode. Mount runs in
 foreground mode by default, use the --daemon flag to specify background mode mode.
 Background mode is only supported on Linux and OSX, you can only run mount in
 foreground mode on Windows.
@@ -154,7 +154,7 @@ Stopping the mount manually:
 To run rclone ` + commandName + ` on Windows, you will need to
 download and install [WinFsp](http://www.secfs.net/winfsp/).
 
-WinFsp is an [open source](https://github.com/billziss-gh/winfsp)
+[WinFsp](https://github.com/billziss-gh/winfsp) is an open source
 Windows File System Proxy which makes it easy to write user space file
 systems for Windows.  It provides a FUSE emulation layer which rclone
 uses combination with
@@ -385,7 +385,7 @@ be copied to the vfs cache before opening with --vfs-cache-mode full.
 	return commandDefinition
 }
 
-// ClipBlocks clips the blocks pointed to to the OS max
+// ClipBlocks clips the blocks pointed to the OS max
 func ClipBlocks(b *uint64) {
 	var max uint64
 	switch runtime.GOOS {

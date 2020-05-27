@@ -158,7 +158,7 @@ with modules beneath.
     * fserrors - rclone specific error handling
     * fshttp - http handling for rclone
     * fspath - path handling for rclone
-    * hash - defines rclones hash types and functions
+    * hash - defines rclone's hash types and functions
     * list - list a remote
     * log - logging facilities
     * march - iterates directories in lock step
@@ -295,7 +295,7 @@ If you need to update a dependency then run
     GO111MODULE=on go get -u github.com/pkg/errors
     GO111MODULE=on go mod vendor
 
-Check in in a single commit as above.
+Check in a single commit as above.
 
 ## Updating all the dependencies ##
 
@@ -383,7 +383,7 @@ alphabetical order of full name of remote (eg `drive` is ordered as
     * update them with `make backenddocs` - revert any changes in other backends
   * `docs/content/overview.md` - overview docs
   * `docs/content/docs.md` - list of remotes in config section
-  * `docs/content/about.md` - front page of rclone.org
+  * `docs/content/_index.md` - front page of rclone.org
   * `docs/layouts/chrome/navbar.html` - add it to the website navigation
   * `bin/make_manual.py` - add the page to the `docs` constant
 

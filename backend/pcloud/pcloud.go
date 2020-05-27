@@ -67,7 +67,10 @@ func init() {
 		Description: "Pcloud",
 		NewFs:       NewFs,
 		Config: func(name string, m configmap.Mapper) {
-			err := oauthutil.Config("pcloud", name, m, oauthConfig)
+			opt := oauthutil.Options{
+				StateBlankOK: true, // pCloud seems to drop the state parameter now - see #4210
+			}
+			err := oauthutil.Config("pcloud", name, m, oauthConfig, &opt)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
@@ -152,7 +155,7 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// parsePath parses an pcloud 'url'
+// parsePath parses a pcloud 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
 	return
