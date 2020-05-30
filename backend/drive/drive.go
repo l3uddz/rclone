@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -2953,7 +2954,7 @@ func (f *Fs) loadServiceAccountsFromPath() error {
 	}
 
 	for _, v := range dirList {
-		filePath := fmt.Sprintf("%s%s", f.opt.ServiceAccountFilePath, v.Name())
+		filePath := filepath.Join(f.opt.ServiceAccountFilePath, v.Name())
 		if ".json" == path.Ext(filePath) {
 			f.ServiceAccountFiles[filePath] = time.Now().UTC().Add(-1 * time.Hour)
 		}
