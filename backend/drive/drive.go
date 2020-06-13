@@ -572,24 +572,24 @@ type Options struct {
 
 // Fs represents a remote drive server
 type Fs struct {
-	name             string             // name of this remote
-	root             string             // the path we are working on
-	opt              Options            // parsed options
-	features         *fs.Features       // optional features
-	svc              *drive.Service     // the connection to the drive server
-	v2Svc            *drive_v2.Service  // used to create download links for the v2 api
-	client           *http.Client       // authorized client
-	rootFolderID     string             // the id of the root folder
-	dirCache         *dircache.DirCache // Map of directory path to directory id
-	pacer            *fs.Pacer          // To pace the API calls
-	exportExtensions []string           // preferred extensions to download docs
-	importMimeTypes  []string           // MIME types to convert to docs
-	isTeamDrive      bool               // true if this is a team drive
-	fileFields       googleapi.Field    // fields to fetch file info with
-	m                configmap.Mapper
-	grouping         int32               // number of IDs to search at once in ListR - read with atomic
-	listRmu          *sync.Mutex         // protects listRempties
-	listRempties     map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
+	name                string             // name of this remote
+	root                string             // the path we are working on
+	opt                 Options            // parsed options
+	features            *fs.Features       // optional features
+	svc                 *drive.Service     // the connection to the drive server
+	v2Svc               *drive_v2.Service  // used to create download links for the v2 api
+	client              *http.Client       // authorized client
+	rootFolderID        string             // the id of the root folder
+	dirCache            *dircache.DirCache // Map of directory path to directory id
+	pacer               *fs.Pacer          // To pace the API calls
+	exportExtensions    []string           // preferred extensions to download docs
+	importMimeTypes     []string           // MIME types to convert to docs
+	isTeamDrive         bool               // true if this is a team drive
+	fileFields          googleapi.Field    // fields to fetch file info with
+	m                   configmap.Mapper
+	grouping            int32               // number of IDs to search at once in ListR - read with atomic
+	listRmu             *sync.Mutex         // protects listRempties
+	listRempties        map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
 	ServiceAccountFiles map[string]time.Time
 	waitChangeSvc       sync.Mutex
 }
