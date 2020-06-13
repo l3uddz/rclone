@@ -54,21 +54,6 @@ func New(client pb.DRPCMetainfoClient, apiKey *macaroon.APIKey, userAgent string
 	}
 }
 
-// Dial dials to metainfo endpoint with the specified api key.
-func Dial(ctx context.Context, dialer rpc.Dialer, address string, apiKey *macaroon.APIKey, userAgent string) (*Client, error) {
-	conn, err := dialer.DialAddressInsecureBestEffort(ctx, address)
-	if err != nil {
-		return nil, Error.Wrap(err)
-	}
-
-	return &Client{
-		conn:      conn,
-		client:    pb.NewDRPCMetainfoClient(conn),
-		apiKeyRaw: apiKey.SerializeRaw(),
-		userAgent: userAgent,
-	}, nil
-}
-
 // DialNodeURL dials to metainfo endpoint with the specified api key.
 func DialNodeURL(ctx context.Context, dialer rpc.Dialer, nodeURL string, apiKey *macaroon.APIKey, userAgent string) (*Client, error) {
 	url, err := storj.ParseNodeURL(nodeURL)
@@ -80,7 +65,7 @@ func DialNodeURL(ctx context.Context, dialer rpc.Dialer, nodeURL string, apiKey 
 		return nil, Error.New("node ID is required in node URL %q", nodeURL)
 	}
 
-	conn, err := dialer.DialAddressID(ctx, url.Address, url.ID)
+	conn, err := dialer.DialNodeURL(ctx, url)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -457,7 +442,7 @@ func (params *BeginObjectParams) toRequest(header *pb.RequestHeader) *pb.ObjectB
 	}
 }
 
-// BatchItem returns single item for batch request....
+// BatchItem returns single item for batch request.
 func (params *BeginObjectParams) BatchItem() *pb.BatchRequestItem {
 	return &pb.BatchRequestItem{
 		Request: &pb.BatchRequestItem_ObjectBegin{
@@ -1175,10 +1160,6 @@ func (client *Client) Batch(ctx context.Context, requests ...BatchItem) (resp []
 		Requests: batchItems,
 	})
 	if err != nil {
-		if errs2.IsRPC(err, rpcstatus.NotFound) {
-			return []BatchResponse{}, storj.ErrObjectNotFound.Wrap(err)
-		}
-
 		return []BatchResponse{}, Error.Wrap(err)
 	}
 

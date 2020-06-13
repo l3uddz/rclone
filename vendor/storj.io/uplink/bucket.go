@@ -11,7 +11,6 @@ import (
 	"github.com/zeebo/errs"
 
 	"storj.io/common/errs2"
-	"storj.io/common/memory"
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/common/storj"
 )
@@ -36,16 +35,11 @@ type Bucket struct {
 
 // StatBucket returns information about a bucket.
 func (project *Project) StatBucket(ctx context.Context, bucket string) (info *Bucket, err error) {
-	defer mon.Func().ResetTrace(&ctx)(&err)
+	defer mon.Func().RestartTrace(&ctx)(&err)
 
 	b, err := project.project.GetBucket(ctx, bucket)
 	if err != nil {
-		if storj.ErrNoBucket.Has(err) {
-			return nil, errwrapf("%w (%q)", ErrBucketNameInvalid, bucket)
-		} else if storj.ErrBucketNotFound.Has(err) {
-			return nil, errwrapf("%w (%q)", ErrBucketNotFound, bucket)
-		}
-		return nil, convertKnownErrors(err, bucket)
+		return nil, convertKnownErrors(err, bucket, "")
 	}
 
 	return &Bucket{
@@ -58,20 +52,9 @@ func (project *Project) StatBucket(ctx context.Context, bucket string) (info *Bu
 //
 // When bucket already exists it returns a valid Bucket and ErrBucketExists.
 func (project *Project) CreateBucket(ctx context.Context, bucket string) (created *Bucket, err error) {
-	defer mon.Func().ResetTrace(&ctx)(&err)
+	defer mon.Func().RestartTrace(&ctx)(&err)
 
-	// TODO remove bucket configuration when proper fix will be deployed on satellite
-	b, err := project.project.CreateBucket(ctx, bucket, &storj.Bucket{
-		PathCipher: storj.EncAESGCM,
-		DefaultRedundancyScheme: storj.RedundancyScheme{
-			Algorithm:      storj.ReedSolomon,
-			ShareSize:      256 * memory.B.Int32(),
-			RequiredShares: 29,
-			RepairShares:   35,
-			OptimalShares:  80,
-			TotalShares:    110,
-		},
-	})
+	b, err := project.project.CreateBucket(ctx, bucket)
 
 	if err != nil {
 		if storj.ErrNoBucket.Has(err) {
@@ -81,11 +64,11 @@ func (project *Project) CreateBucket(ctx context.Context, bucket string) (create
 			// TODO: Ideally, the satellite should return the existing bucket when this error occurs.
 			existing, err := project.StatBucket(ctx, bucket)
 			if err != nil {
-				return existing, errs.Combine(errwrapf("%w (%q)", ErrBucketAlreadyExists, bucket), convertKnownErrors(err, bucket))
+				return existing, errs.Combine(errwrapf("%w (%q)", ErrBucketAlreadyExists, bucket), convertKnownErrors(err, bucket, ""))
 			}
 			return existing, errwrapf("%w (%q)", ErrBucketAlreadyExists, bucket)
 		}
-		return nil, convertKnownErrors(err, bucket)
+		return nil, convertKnownErrors(err, bucket, "")
 	}
 
 	return &Bucket{
@@ -98,11 +81,11 @@ func (project *Project) CreateBucket(ctx context.Context, bucket string) (create
 //
 // When bucket already exists it returns a valid Bucket and no error.
 func (project *Project) EnsureBucket(ctx context.Context, bucket string) (ensured *Bucket, err error) {
-	defer mon.Func().ResetTrace(&ctx)(&err)
+	defer mon.Func().RestartTrace(&ctx)(&err)
 
 	ensured, err = project.CreateBucket(ctx, bucket)
 	if err != nil && !errors.Is(err, ErrBucketAlreadyExists) {
-		return nil, convertKnownErrors(err, bucket)
+		return nil, convertKnownErrors(err, bucket, "")
 	}
 
 	return ensured, nil
@@ -112,18 +95,14 @@ func (project *Project) EnsureBucket(ctx context.Context, bucket string) (ensure
 //
 // When bucket is not empty it returns ErrBucketNotEmpty.
 func (project *Project) DeleteBucket(ctx context.Context, bucket string) (deleted *Bucket, err error) {
-	defer mon.Func().ResetTrace(&ctx)(&err)
+	defer mon.Func().RestartTrace(&ctx)(&err)
 
 	existing, err := project.project.DeleteBucket(ctx, bucket)
 	if err != nil {
 		if errs2.IsRPC(err, rpcstatus.FailedPrecondition) {
 			return nil, errwrapf("%w (%q)", ErrBucketNotEmpty, bucket)
-		} else if storj.ErrBucketNotFound.Has(err) {
-			return nil, errwrapf("%w (%q)", ErrBucketNotFound, bucket)
-		} else if storj.ErrNoBucket.Has(err) {
-			return nil, errwrapf("%w (%q)", ErrBucketNameInvalid, bucket)
 		}
-		return nil, convertKnownErrors(err, bucket)
+		return nil, convertKnownErrors(err, bucket, "")
 	}
 
 	if existing == (storj.Bucket{}) {

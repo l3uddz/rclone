@@ -26,7 +26,7 @@ type ListObjectsOptions struct {
 
 // ListObjects returns an iterator over the objects.
 func (project *Project) ListObjects(ctx context.Context, bucket string, options *ListObjectsOptions) *ObjectIterator {
-	defer mon.Func().ResetTrace(&ctx)(nil)
+	defer mon.Func().RestartTrace(&ctx)(nil)
 
 	b := storj.Bucket{Name: bucket, PathCipher: storj.EncAESGCM}
 	opts := storj.ListOptions{
@@ -96,9 +96,9 @@ func (objects *ObjectIterator) Next() bool {
 }
 
 func (objects *ObjectIterator) loadNext() bool {
-	list, err := objects.project.db.ListObjectsExtended(objects.ctx, objects.bucket, objects.options)
+	list, err := objects.project.db.ListObjects(objects.ctx, objects.bucket, objects.options)
 	if err != nil {
-		objects.err = convertKnownErrors(err, objects.bucket.Name)
+		objects.err = convertKnownErrors(err, objects.bucket.Name, "")
 		return false
 	}
 	objects.list = &list
