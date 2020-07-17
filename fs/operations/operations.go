@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -24,12 +25,14 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/cache"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/march"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
 	"golang.org/x/sync/errgroup"
@@ -204,16 +207,14 @@ func equal(ctx context.Context, src fs.ObjectInfo, dst fs.Object, opt equalOpt) 
 		fs.Debugf(src, "%v differ", ht)
 		return false
 	}
-	if ht == hash.None {
+	if ht == hash.None && !fs.Config.RefreshTimes {
 		// if couldn't check hash, return that they differ
 		return false
 	}
 
 	// mod time differs but hash is the same to reset mod time if required
 	if opt.updateModTime {
-		if fs.Config.DryRun {
-			fs.Logf(src, "Not updating modification time as --dry-run")
-		} else {
+		if !SkipDestructive(ctx, src, "update modification time") {
 			// Size and hash the same but mtime different
 			// Error if objects are treated as immutable
 			if fs.Config.Immutable {
@@ -348,8 +349,7 @@ func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Obj
 		tr.Done(err)
 	}()
 	newDst = dst
-	if fs.Config.DryRun {
-		fs.Logf(src, "Not copying as --dry-run")
+	if SkipDestructive(ctx, src, "copy") {
 		return newDst, nil
 	}
 	maxTries := fs.Config.LowLevelRetries
@@ -527,8 +527,7 @@ func Move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 		tr.Done(err)
 	}()
 	newDst = dst
-	if fs.Config.DryRun {
-		fs.Logf(src, "Not moving as --dry-run")
+	if SkipDestructive(ctx, src, "move") {
 		return newDst, nil
 	}
 	// See if we have Move available
@@ -603,12 +602,13 @@ func DeleteFileWithBackupDir(ctx context.Context, dst fs.Object, backupDir fs.Fs
 	if fs.Config.MaxDelete != -1 && numDeletes > fs.Config.MaxDelete {
 		return fserrors.FatalError(errors.New("--max-delete threshold reached"))
 	}
-	action, actioned, actioning := "delete", "Deleted", "deleting"
+	action, actioned := "delete", "Deleted"
 	if backupDir != nil {
-		action, actioned, actioning = "move into backup dir", "Moved into backup dir", "moving into backup dir"
+		action, actioned = "move into backup dir", "Moved into backup dir"
 	}
-	if fs.Config.DryRun {
-		fs.Logf(dst, "Not %s as --dry-run", actioning)
+	skip := SkipDestructive(ctx, dst, action)
+	if skip {
+		// do nothing
 	} else if backupDir != nil {
 		err = MoveBackupDir(ctx, backupDir, dst)
 	} else {
@@ -617,7 +617,7 @@ func DeleteFileWithBackupDir(ctx context.Context, dst fs.Object, backupDir fs.Fs
 	if err != nil {
 		fs.Errorf(dst, "Couldn't %s: %v", action, err)
 		err = fs.CountError(err)
-	} else if !fs.Config.DryRun {
+	} else if !skip {
 		fs.Infof(dst, actioned)
 	}
 	return err
@@ -756,6 +756,8 @@ type checkFn func(ctx context.Context, a, b fs.Object) (differ bool, noHash bool
 type checkMarch struct {
 	fdst, fsrc      fs.Fs
 	check           checkFn
+	wg              sync.WaitGroup
+	tokens          chan struct{}
 	oneway          bool
 	differences     int32
 	noHashes        int32
@@ -830,18 +832,29 @@ func (c *checkMarch) Match(ctx context.Context, dst, src fs.DirEntry) (recurse b
 	case fs.Object:
 		dstX, ok := dst.(fs.Object)
 		if ok {
-			differ, noHash := c.checkIdentical(ctx, dstX, srcX)
-			if differ {
-				atomic.AddInt32(&c.differences, 1)
-			} else {
-				atomic.AddInt32(&c.matches, 1)
-				if noHash {
-					atomic.AddInt32(&c.noHashes, 1)
-					fs.Debugf(dstX, "OK - could not check hash")
-				} else {
-					fs.Debugf(dstX, "OK")
-				}
+			if SkipDestructive(ctx, src, "check") {
+				return false
 			}
+			c.wg.Add(1)
+			c.tokens <- struct{}{} // put a token to limit concurrency
+			go func() {
+				defer func() {
+					<-c.tokens // get the token back to free up a slot
+					c.wg.Done()
+				}()
+				differ, noHash := c.checkIdentical(ctx, dstX, srcX)
+				if differ {
+					atomic.AddInt32(&c.differences, 1)
+				} else {
+					atomic.AddInt32(&c.matches, 1)
+					if noHash {
+						atomic.AddInt32(&c.noHashes, 1)
+						fs.Debugf(dstX, "OK - could not check hash")
+					} else {
+						fs.Debugf(dstX, "OK")
+					}
+				}
+			}()
 		} else {
 			err := errors.Errorf("is file on %v but directory on %v", c.fsrc, c.fdst)
 			fs.Errorf(src, "%v", err)
@@ -880,6 +893,7 @@ func CheckFn(ctx context.Context, fdst, fsrc fs.Fs, check checkFn, oneway bool) 
 		fsrc:   fsrc,
 		check:  check,
 		oneway: oneway,
+		tokens: make(chan struct{}, fs.Config.Checkers),
 	}
 
 	// set up a march over fdst and fsrc
@@ -892,6 +906,7 @@ func CheckFn(ctx context.Context, fdst, fsrc fs.Fs, check checkFn, oneway bool) 
 	}
 	fs.Debugf(fdst, "Waiting for checks to finish")
 	err := m.Run()
+	c.wg.Wait() // wait for background go-routines
 
 	if c.dstFilesMissing > 0 {
 		fs.Logf(fdst, "%d files missing", c.dstFilesMissing)
@@ -900,7 +915,10 @@ func CheckFn(ctx context.Context, fdst, fsrc fs.Fs, check checkFn, oneway bool) 
 		fs.Logf(fsrc, "%d files missing", c.srcFilesMissing)
 	}
 
-	fs.Logf(fdst, "%d differences found", accounting.Stats(ctx).GetErrors())
+	fs.Logf(fdst, "%d differences found", c.differences)
+	if errs := accounting.Stats(ctx).GetErrors(); errs > 0 {
+		fs.Logf(fdst, "%d errors while checking", errs)
+	}
 	if c.noHashes > 0 {
 		fs.Logf(fdst, "%d hashes could not be checked", c.noHashes)
 	}
@@ -948,18 +966,45 @@ func CheckEqualReaders(in1, in2 io.Reader) (differ bool, err error) {
 	return false, nil
 }
 
-// CheckIdentical checks to see if dst and src are identical by
-// reading all their bytes if necessary.
+// Retry runs fn up to maxTries times if it returns a retriable error
+func Retry(o interface{}, maxTries int, fn func() error) (err error) {
+	for tries := 1; tries <= maxTries; tries++ {
+		// Call the function which might error
+		err = fn()
+		if err == nil {
+			break
+		}
+		// Retry if err returned a retry error
+		if fserrors.IsRetryError(err) || fserrors.ShouldRetry(err) {
+			fs.Debugf(o, "Received error: %v - low level retry %d/%d", err, tries, maxTries)
+			continue
+		}
+		break
+	}
+	return err
+}
+
+// CheckIdenticalDownload checks to see if dst and src are identical
+// by reading all their bytes if necessary.
 //
 // it returns true if differences were found
-func CheckIdentical(ctx context.Context, dst, src fs.Object) (differ bool, err error) {
+func CheckIdenticalDownload(ctx context.Context, dst, src fs.Object) (differ bool, err error) {
+	err = Retry(src, fs.Config.LowLevelRetries, func() error {
+		differ, err = checkIdenticalDownload(ctx, dst, src)
+		return err
+	})
+	return differ, err
+}
+
+// Does the work for CheckIdenticalDownload
+func checkIdenticalDownload(ctx context.Context, dst, src fs.Object) (differ bool, err error) {
 	in1, err := dst.Open(ctx)
 	if err != nil {
 		return true, errors.Wrapf(err, "failed to open %q", dst)
 	}
 	tr1 := accounting.Stats(ctx).NewTransfer(dst)
 	defer func() {
-		tr1.Done(err)
+		tr1.Done(nil) // error handling is done by the caller
 	}()
 	in1 = tr1.Account(in1).WithBuffer() // account and buffer the transfer
 
@@ -969,7 +1014,7 @@ func CheckIdentical(ctx context.Context, dst, src fs.Object) (differ bool, err e
 	}
 	tr2 := accounting.Stats(ctx).NewTransfer(dst)
 	defer func() {
-		tr2.Done(err)
+		tr2.Done(nil) // error handling is done by the caller
 	}()
 	in2 = tr2.Account(in2).WithBuffer() // account and buffer the transfer
 
@@ -982,7 +1027,7 @@ func CheckIdentical(ctx context.Context, dst, src fs.Object) (differ bool, err e
 // and the actual contents of the files.
 func CheckDownload(ctx context.Context, fdst, fsrc fs.Fs, oneway bool) error {
 	check := func(ctx context.Context, a, b fs.Object) (differ bool, noHash bool) {
-		differ, err := CheckIdentical(ctx, a, b)
+		differ, err := CheckIdenticalDownload(ctx, a, b)
 		if err != nil {
 			err = fs.CountError(err)
 			fs.Errorf(a, "Failed to download: %v", err)
@@ -1138,8 +1183,7 @@ func ListDir(ctx context.Context, f fs.Fs, w io.Writer) error {
 
 // Mkdir makes a destination directory or container
 func Mkdir(ctx context.Context, f fs.Fs, dir string) error {
-	if fs.Config.DryRun {
-		fs.Logf(fs.LogDirName(f, dir), "Not making directory as dry run is set")
+	if SkipDestructive(ctx, fs.LogDirName(f, dir), "make directory") {
 		return nil
 	}
 	fs.Debugf(fs.LogDirName(f, dir), "Making directory")
@@ -1154,8 +1198,7 @@ func Mkdir(ctx context.Context, f fs.Fs, dir string) error {
 // TryRmdir removes a container but not if not empty.  It doesn't
 // count errors but may return one.
 func TryRmdir(ctx context.Context, f fs.Fs, dir string) error {
-	if fs.Config.DryRun {
-		fs.Logf(fs.LogDirName(f, dir), "Not deleting as dry run is set")
+	if SkipDestructive(ctx, fs.LogDirName(f, dir), "remove directory") {
 		return nil
 	}
 	fs.Debugf(fs.LogDirName(f, dir), "Removing directory")
@@ -1180,13 +1223,12 @@ func Purge(ctx context.Context, f fs.Fs, dir string) error {
 		// FIXME change the Purge interface so it takes a dir - see #1891
 		if doPurge := f.Features().Purge; doPurge != nil {
 			doFallbackPurge = false
-			if fs.Config.DryRun {
-				fs.Logf(f, "Not purging as --dry-run set")
-			} else {
-				err = doPurge(ctx)
-				if err == fs.ErrorCantPurge {
-					doFallbackPurge = true
-				}
+			if SkipDestructive(ctx, fs.LogDirName(f, dir), "purge directory") {
+				return nil
+			}
+			err = doPurge(ctx)
+			if err == fs.ErrorCantPurge {
+				doFallbackPurge = true
 			}
 		}
 	}
@@ -1255,8 +1297,7 @@ func CleanUp(ctx context.Context, f fs.Fs) error {
 	if doCleanUp == nil {
 		return errors.Errorf("%v doesn't support cleanup", f)
 	}
-	if fs.Config.DryRun {
-		fs.Logf(f, "Not running cleanup as --dry-run set")
+	if SkipDestructive(ctx, f, "clean up old files") {
 		return nil
 	}
 	return doCleanUp(ctx)
@@ -1394,8 +1435,7 @@ func Rcat(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadCloser,
 		fStreamTo = tmpLocalFs
 	}
 
-	if fs.Config.DryRun {
-		fs.Logf("stdin", "Not uploading as --dry-run")
+	if SkipDestructive(ctx, dstFileName, "upload from pipe") {
 		// prevents "broken pipe" errors
 		_, err = io.Copy(ioutil.Discard, in)
 		return nil, err
@@ -1416,12 +1456,12 @@ func Rcat(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadCloser,
 }
 
 // PublicLink adds a "readable by anyone with link" permission on the given file or folder.
-func PublicLink(ctx context.Context, f fs.Fs, remote string) (string, error) {
+func PublicLink(ctx context.Context, f fs.Fs, remote string, expire fs.Duration, unlink bool) (string, error) {
 	doPublicLink := f.Features().PublicLink
 	if doPublicLink == nil {
 		return "", errors.Errorf("%v doesn't support public links", f)
 	}
-	return doPublicLink(ctx, remote)
+	return doPublicLink(ctx, remote, expire, unlink)
 }
 
 // Rmdirs removes any empty directories (or directories only
@@ -1677,8 +1717,7 @@ func RcatSize(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClo
 		body := ioutil.NopCloser(in) // we let the server close the body
 		in := tr.Account(body)       // account the transfer (no buffering)
 
-		if fs.Config.DryRun {
-			fs.Logf("stdin", "Not uploading as --dry-run")
+		if SkipDestructive(ctx, dstFileName, "upload from pipe") {
 			// prevents "broken pipe" errors
 			_, err = io.Copy(ioutil.Discard, in)
 			return nil, err
@@ -2192,4 +2231,78 @@ func GetFsInfo(f fs.Fs) *FsInfo {
 		info.Hashes = append(info.Hashes, hashType.String())
 	}
 	return info
+}
+
+var (
+	interactiveMu sync.Mutex
+	skipped       = map[string]bool{}
+)
+
+// skipDestructiveChoose asks the user which action to take
+//
+// Call with interactiveMu held
+func skipDestructiveChoose(ctx context.Context, subject interface{}, action string) (skip bool) {
+	fmt.Printf("rclone: %s \"%v\"?\n", action, subject)
+	switch i := config.CommandDefault([]string{
+		"yYes, this is OK",
+		"nNo, skip this",
+		fmt.Sprintf("sSkip all %s operations with no more questions", action),
+		fmt.Sprintf("!Do all %s operations with no more questions", action),
+		"qExit rclone now.",
+	}, 0); i {
+	case 'y':
+		skip = false
+	case 'n':
+		skip = true
+	case 's':
+		skip = true
+		skipped[action] = true
+		fs.Logf(nil, "Skipping all %s operations from now on without asking", action)
+	case '!':
+		skip = false
+		skipped[action] = false
+		fs.Logf(nil, "Doing all %s operations from now on without asking", action)
+	case 'q':
+		fs.Logf(nil, "Quitting rclone now")
+		atexit.Run()
+		os.Exit(0)
+	default:
+		skip = true
+		fs.Errorf(nil, "Bad choice %c", i)
+	}
+	return skip
+}
+
+// SkipDestructive should be called whenever rclone is about to do an destructive operation.
+//
+// It will check the --dry-run flag and it will ask the user if the --interactive flag is set.
+//
+// subject should be the object or directory in use
+//
+// action should be a descriptive word or short phrase
+//
+// Together they should make sense in this sentence: "Rclone is about
+// to action subject".
+func SkipDestructive(ctx context.Context, subject interface{}, action string) (skip bool) {
+	var flag string
+	switch {
+	case fs.Config.DryRun:
+		flag = "--dry-run"
+		skip = true
+	case fs.Config.Interactive:
+		flag = "--interactive"
+		interactiveMu.Lock()
+		defer interactiveMu.Unlock()
+		var found bool
+		skip, found = skipped[action]
+		if !found {
+			skip = skipDestructiveChoose(ctx, subject, action)
+		}
+	default:
+		return false
+	}
+	if skip {
+		fs.Logf(subject, "Skipped %s as %s is set", action, flag)
+	}
+	return skip
 }

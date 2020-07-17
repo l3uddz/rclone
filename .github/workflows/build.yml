@@ -197,8 +197,9 @@ jobs:
       - name: Deploy built binaries
         shell: bash
         run: |
-          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep ; fi
-          make travis_beta
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep_linux ; fi
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then make release_dep_windows ; fi
+          make ci_beta
         env:
           RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
         # working-directory: '$(modulePath)'
@@ -228,12 +229,12 @@ jobs:
         run: |
           docker pull billziss/xgo-cgofuse
           GO111MODULE=off go get -v github.com/karalabe/xgo # don't add to go.mod
-          xgo \
-              -image=billziss/xgo-cgofuse \
-              -targets=darwin/386,darwin/amd64,linux/386,linux/amd64,windows/386,windows/amd64 \
-              -tags cmount \
-              -dest build \
-              .
+          # xgo \
+          #     -image=billziss/xgo-cgofuse \
+          #     -targets=darwin/386,darwin/amd64,linux/386,linux/amd64,windows/386,windows/amd64 \
+          #     -tags cmount \
+          #     -dest build \
+          #     .
           xgo \
               -image=billziss/xgo-cgofuse \
               -targets=android/*,ios/* \
@@ -247,7 +248,7 @@ jobs:
 
       - name: Upload artifacts
         run: |
-          make circleci_upload
+          make ci_upload
         env:
           RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
         # Upload artifacts if not a PR && not a fork

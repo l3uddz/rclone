@@ -40,6 +40,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -52,7 +53,9 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/bucket"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
@@ -69,6 +72,7 @@ func init() {
 		Name:        "s3",
 		Description: "Amazon S3 Compliant Storage Provider (AWS, Alibaba, Ceph, Digital Ocean, Dreamhost, IBM COS, Minio, etc)",
 		NewFs:       NewFs,
+		CommandHelp: commandHelp,
 		Options: []fs.Option{{
 			Name: fs.ConfigProvider,
 			Help: "Choose your S3 provider.",
@@ -96,6 +100,9 @@ func init() {
 			}, {
 				Value: "Netease",
 				Help:  "Netease Object Storage (NOS)",
+			}, {
+				Value: "Scaleway",
+				Help:  "Scaleway Object Storage",
 			}, {
 				Value: "StackPath",
 				Help:  "StackPath Object Storage",
@@ -178,8 +185,19 @@ func init() {
 			}},
 		}, {
 			Name:     "region",
+			Help:     "Region to connect to.",
+			Provider: "Scaleway",
+			Examples: []fs.OptionExample{{
+				Value: "nl-ams",
+				Help:  "Amsterdam, The Netherlands",
+			}, {
+				Value: "fr-par",
+				Help:  "Paris, France",
+			}},
+		}, {
+			Name:     "region",
 			Help:     "Region to connect to.\nLeave blank if you are using an S3 clone and you don't have a region.",
-			Provider: "!AWS,Alibaba",
+			Provider: "!AWS,Alibaba,Scaleway",
 			Examples: []fs.OptionExample{{
 				Value: "",
 				Help:  "Use this if unsure. Will use v4 signatures and an empty region.",
@@ -363,6 +381,17 @@ func init() {
 			}},
 		}, {
 			Name:     "endpoint",
+			Help:     "Endpoint for Scaleway Object Storage.",
+			Provider: "Scaleway",
+			Examples: []fs.OptionExample{{
+				Value: "s3.nl-ams.scw.cloud",
+				Help:  "Amsterdam Endpoint",
+			}, {
+				Value: "s3.fr-par.scw.cloud",
+				Help:  "Paris Endpoint",
+			}},
+		}, {
+			Name:     "endpoint",
 			Help:     "Endpoint for StackPath Object Storage.",
 			Provider: "StackPath",
 			Examples: []fs.OptionExample{{
@@ -378,7 +407,7 @@ func init() {
 		}, {
 			Name:     "endpoint",
 			Help:     "Endpoint for S3 API.\nRequired when using an S3 clone.",
-			Provider: "!AWS,IBMCOS,Alibaba,StackPath",
+			Provider: "!AWS,IBMCOS,Alibaba,Scaleway,StackPath",
 			Examples: []fs.OptionExample{{
 				Value:    "objects-us-east-1.dream.io",
 				Help:     "Dream Objects endpoint",
@@ -565,7 +594,7 @@ func init() {
 		}, {
 			Name:     "location_constraint",
 			Help:     "Location constraint - must be set to match the Region.\nLeave blank if not sure. Used when creating buckets only.",
-			Provider: "!AWS,IBMCOS,Alibaba,StackPath",
+			Provider: "!AWS,IBMCOS,Alibaba,Scaleway,StackPath",
 		}, {
 			Name: "acl",
 			Help: `Canned ACL used when creating buckets and storing or copying objects.
@@ -742,6 +771,21 @@ isn't set then "acl" is used instead.`,
 				Help:  "Infrequent access storage mode.",
 			}},
 		}, {
+			// Mapping from here: https://www.scaleway.com/en/docs/object-storage-glacier/#-Scaleway-Storage-Classes
+			Name:     "storage_class",
+			Help:     "The storage class to use when storing new objects in S3.",
+			Provider: "Scaleway",
+			Examples: []fs.OptionExample{{
+				Value: "",
+				Help:  "Default",
+			}, {
+				Value: "STANDARD",
+				Help:  "The Standard class for any upload; suitable for on-demand content like streaming or CDN.",
+			}, {
+				Value: "GLACIER",
+				Help:  "Archived storage; prices are lower, but it needs to be restored first to be accessed.",
+			}},
+		}, {
 			Name: "upload_cutoff",
 			Help: `Cutoff for switching to chunked upload
 
@@ -773,6 +817,21 @@ most 10,000 chunks, this means that by default the maximum size of
 file you can stream upload is 48GB.  If you wish to stream upload
 larger files then you will need to increase chunk_size.`,
 			Default:  minChunkSize,
+			Advanced: true,
+		}, {
+			Name: "max_upload_parts",
+			Help: `Maximum number of parts in a multipart upload.
+
+This option defines the maximum number of multipart chunks to use
+when doing a multipart upload.
+
+This can be useful if a service does not support the AWS S3
+specification of 10,000 chunks.
+
+Rclone will automatically increase the chunk size when uploading a
+large file of a known size to stay below this number of chunks limit.
+`,
+			Default:  maxUploadParts,
 			Advanced: true,
 		}, {
 			Name: "copy_cutoff",
@@ -910,6 +969,7 @@ const (
 
 	memoryPoolFlushTime = fs.Duration(time.Minute) // flush the cached buffers after this long
 	memoryPoolUseMmap   = false
+	maxExpireDuration   = fs.Duration(7 * 24 * time.Hour) // max expiry is 1 week
 )
 
 // Options defines the configuration for this backend
@@ -932,6 +992,7 @@ type Options struct {
 	UploadCutoff          fs.SizeSuffix        `config:"upload_cutoff"`
 	CopyCutoff            fs.SizeSuffix        `config:"copy_cutoff"`
 	ChunkSize             fs.SizeSuffix        `config:"chunk_size"`
+	MaxUploadParts        int64                `config:"max_upload_parts"`
 	DisableChecksum       bool                 `config:"disable_checksum"`
 	SessionToken          string               `config:"session_token"`
 	UploadConcurrency     int                  `config:"upload_concurrency"`
@@ -1127,21 +1188,23 @@ func s3Connection(opt *Options) (*s3.S3, *session.Session, error) {
 		return nil, nil, errors.New("secret_access_key not found")
 	}
 
-	if opt.Region == "" && opt.Endpoint == "" {
-		opt.Endpoint = "https://s3.amazonaws.com/"
-	}
 	if opt.Region == "" {
 		opt.Region = "us-east-1"
 	}
-	if opt.Provider == "AWS" || opt.Provider == "Alibaba" || opt.Provider == "Netease" || opt.UseAccelerateEndpoint {
+	if opt.Provider == "AWS" || opt.Provider == "Alibaba" || opt.Provider == "Netease" || opt.Provider == "Scaleway" || opt.UseAccelerateEndpoint {
 		opt.ForcePathStyle = false
+	}
+	if opt.Provider == "Scaleway" && opt.MaxUploadParts > 1000 {
+		opt.MaxUploadParts = 1000
 	}
 	awsConfig := aws.NewConfig().
 		WithMaxRetries(0). // Rely on rclone's retry logic
 		WithCredentials(cred).
 		WithHTTPClient(fshttp.NewClient(fs.Config)).
 		WithS3ForcePathStyle(opt.ForcePathStyle).
-		WithS3UseAccelerate(opt.UseAccelerateEndpoint)
+		WithS3UseAccelerate(opt.UseAccelerateEndpoint).
+		WithS3UsEast1RegionalEndpoint(endpoints.RegionalS3UsEast1Endpoint)
+
 	if opt.Region != "" {
 		awsConfig.WithRegion(opt.Region)
 	}
@@ -1268,6 +1331,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		BucketBasedRootOK: true,
 		SetTier:           true,
 		GetTier:           true,
+		SlowModTime:       true,
 	}).Fill(f)
 	if f.rootBucket != "" && f.rootDirectory != "" {
 		// Check to see if the object exists
@@ -1840,21 +1904,19 @@ func (f *Fs) copyMultipart(ctx context.Context, req *s3.CopyObjectInput, dstBuck
 	}
 	uid := cout.UploadId
 
-	defer func() {
-		if err != nil {
-			// We can try to abort the upload, but ignore the error.
-			fs.Debugf(nil, "Cancelling multipart copy")
-			_ = f.pacer.Call(func() (bool, error) {
-				_, err := f.c.AbortMultipartUploadWithContext(context.Background(), &s3.AbortMultipartUploadInput{
-					Bucket:       &dstBucket,
-					Key:          &dstPath,
-					UploadId:     uid,
-					RequestPayer: req.RequestPayer,
-				})
-				return f.shouldRetry(err)
+	defer atexit.OnError(&err, func() {
+		// Try to abort the upload, but ignore the error.
+		fs.Debugf(nil, "Cancelling multipart copy")
+		_ = f.pacer.Call(func() (bool, error) {
+			_, err := f.c.AbortMultipartUploadWithContext(context.Background(), &s3.AbortMultipartUploadInput{
+				Bucket:       &dstBucket,
+				Key:          &dstPath,
+				UploadId:     uid,
+				RequestPayer: req.RequestPayer,
 			})
-		}
-	}()
+			return f.shouldRetry(err)
+		})
+	})()
 
 	partSize := int64(f.opt.CopyCutoff)
 	numParts := (srcSize-1)/partSize + 1
@@ -1958,6 +2020,147 @@ func (f *Fs) getMemoryPool(size int64) *pool.Pool {
 		f.opt.UploadConcurrency*fs.Config.Transfers,
 		f.opt.MemoryPoolUseMmap,
 	)
+}
+
+// PublicLink generates a public link to the remote path (usually readable by anyone)
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error) {
+	if strings.HasSuffix(remote, "/") {
+		return "", fs.ErrorCantShareDirectories
+	}
+	if _, err := f.NewObject(ctx, remote); err != nil {
+		return "", err
+	}
+	if expire > maxExpireDuration {
+		fs.Logf(f, "Public Link: Reducing expiry to %v as %v is greater than the max time allowed", maxExpireDuration, expire)
+		expire = maxExpireDuration
+	}
+	bucket, bucketPath := f.split(remote)
+	httpReq, _ := f.c.GetObjectRequest(&s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &bucketPath,
+	})
+
+	return httpReq.Presign(time.Duration(expire))
+}
+
+var commandHelp = []fs.CommandHelp{{
+	Name:  "restore",
+	Short: "Restore objects from GLACIER to normal storage",
+	Long: `This command can be used to restore one or more objects from GLACIER
+to normal storage.
+
+Usage Examples:
+
+    rclone backend restore s3:bucket/path/to/object [-o priority=PRIORITY] [-o lifetime=DAYS]
+    rclone backend restore s3:bucket/path/to/directory [-o priority=PRIORITY] [-o lifetime=DAYS]
+    rclone backend restore s3:bucket [-o priority=PRIORITY] [-o lifetime=DAYS]
+
+This flag also obeys the filters. Test first with -i/--interactive or --dry-run flags
+
+    rclone -i backend restore --include "*.txt" s3:bucket/path -o priority=Standard
+
+All the objects shown will be marked for restore, then
+
+    rclone backend restore --include "*.txt" s3:bucket/path -o priority=Standard
+
+It returns a list of status dictionaries with Remote and Status
+keys. The Status will be OK if it was successfull or an error message
+if not.
+
+    [
+        {
+            "Status": "OK",
+            "Path": "test.txt"
+        },
+        {
+            "Status": "OK",
+            "Path": "test/file4.txt"
+        }
+    ]
+
+`,
+	Opts: map[string]string{
+		"priority":    "Priority of restore: Standard|Expedited|Bulk",
+		"lifetime":    "Lifetime of the active copy in days",
+		"description": "The optional description for the job.",
+	},
+}}
+
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
+	switch name {
+	case "restore":
+		req := s3.RestoreObjectInput{
+			//Bucket:         &f.rootBucket,
+			//Key:            &encodedDirectory,
+			RestoreRequest: &s3.RestoreRequest{},
+		}
+		if lifetime := opt["lifetime"]; lifetime != "" {
+			ilifetime, err := strconv.ParseInt(lifetime, 10, 64)
+			if err != nil {
+				return nil, errors.Wrap(err, "bad lifetime")
+			}
+			req.RestoreRequest.Days = &ilifetime
+		}
+		if priority := opt["priority"]; priority != "" {
+			req.RestoreRequest.GlacierJobParameters = &s3.GlacierJobParameters{
+				Tier: &priority,
+			}
+		}
+		if description := opt["description"]; description != "" {
+			req.RestoreRequest.Description = &description
+		}
+		type status struct {
+			Status string
+			Remote string
+		}
+		var (
+			outMu sync.Mutex
+			out   = []status{}
+		)
+		err = operations.ListFn(ctx, f, func(obj fs.Object) {
+			// Remember this is run --checkers times concurrently
+			o, ok := obj.(*Object)
+			st := status{Status: "OK", Remote: obj.Remote()}
+			defer func() {
+				outMu.Lock()
+				out = append(out, st)
+				outMu.Unlock()
+			}()
+			if operations.SkipDestructive(ctx, obj, "restore") {
+				return
+			}
+			if !ok {
+				st.Status = "Not an S3 object"
+				return
+			}
+			bucket, bucketPath := o.split()
+			reqCopy := req
+			reqCopy.Bucket = &bucket
+			reqCopy.Key = &bucketPath
+			err = f.pacer.Call(func() (bool, error) {
+				_, err = f.c.RestoreObject(&reqCopy)
+				return f.shouldRetry(err)
+			})
+			if err != nil {
+				st.Status = err.Error()
+			}
+		})
+		if err != nil {
+			return out, err
+		}
+		return out, nil
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
 }
 
 // ------------------------------------------------------------
@@ -2184,6 +2387,13 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 	}
 	tokens := pacer.NewTokenDispenser(concurrency)
 
+	uploadParts := f.opt.MaxUploadParts
+	if uploadParts < 1 {
+		uploadParts = 1
+	} else if uploadParts > maxUploadParts {
+		uploadParts = maxUploadParts
+	}
+
 	// calculate size of parts
 	partSize := int(f.opt.ChunkSize)
 
@@ -2193,13 +2403,13 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 	if size == -1 {
 		warnStreamUpload.Do(func() {
 			fs.Logf(f, "Streaming uploads using chunk size %v will have maximum file size of %v",
-				f.opt.ChunkSize, fs.SizeSuffix(partSize*maxUploadParts))
+				f.opt.ChunkSize, fs.SizeSuffix(int64(partSize)*uploadParts))
 		})
 	} else {
 		// Adjust partSize until the number of parts is small enough.
-		if size/int64(partSize) >= maxUploadParts {
+		if size/int64(partSize) >= uploadParts {
 			// Calculate partition size rounded up to the nearest MB
-			partSize = int((((size / maxUploadParts) >> 20) + 1) << 20)
+			partSize = int((((size / uploadParts) >> 20) + 1) << 20)
 		}
 	}
 
@@ -2218,27 +2428,24 @@ func (o *Object) uploadMultipart(ctx context.Context, req *s3.PutObjectInput, si
 	}
 	uid := cout.UploadId
 
-	defer func() {
+	defer atexit.OnError(&err, func() {
 		if o.fs.opt.LeavePartsOnError {
 			return
 		}
-		if err != nil {
-			// We can try to abort the upload, but ignore the error.
-			fs.Debugf(o, "Cancelling multipart upload")
-			errCancel := f.pacer.Call(func() (bool, error) {
-				_, err := f.c.AbortMultipartUploadWithContext(context.Background(), &s3.AbortMultipartUploadInput{
-					Bucket:       req.Bucket,
-					Key:          req.Key,
-					UploadId:     uid,
-					RequestPayer: req.RequestPayer,
-				})
-				return f.shouldRetry(err)
+		fs.Debugf(o, "Cancelling multipart upload")
+		errCancel := f.pacer.Call(func() (bool, error) {
+			_, err := f.c.AbortMultipartUploadWithContext(context.Background(), &s3.AbortMultipartUploadInput{
+				Bucket:       req.Bucket,
+				Key:          req.Key,
+				UploadId:     uid,
+				RequestPayer: req.RequestPayer,
 			})
-			if errCancel != nil {
-				fs.Debugf(o, "Failed to cancel multipart upload: %v", errCancel)
-			}
+			return f.shouldRetry(err)
+		})
+		if errCancel != nil {
+			fs.Debugf(o, "Failed to cancel multipart upload: %v", errCancel)
 		}
-	}()
+	})()
 
 	var (
 		g, gCtx  = errgroup.WithContext(ctx)
@@ -2573,6 +2780,7 @@ var (
 	_ fs.Copier      = &Fs{}
 	_ fs.PutStreamer = &Fs{}
 	_ fs.ListRer     = &Fs{}
+	_ fs.Commander   = &Fs{}
 	_ fs.Object      = &Object{}
 	_ fs.MimeTyper   = &Object{}
 	_ fs.GetTierer   = &Object{}

@@ -2,6 +2,7 @@
 _junk/
 rclone
 build
+vendor/
 docs/public
 rclone.iml
 .idea

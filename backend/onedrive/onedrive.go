@@ -498,13 +498,13 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 	var dirCacheFoundRoot bool
 	var rootNormalizedID string
 	if f.dirCache != nil {
-		var dirCacheRootIDExists bool
-		rootNormalizedID, dirCacheRootIDExists = f.dirCache.Get("")
+		rootNormalizedID, err = f.dirCache.RootID(ctx, false)
+		dirCacheRootIDExists := err == nil
 		if f.root == "" {
 			// if f.root == "", it means f.root is the absolute root of the drive
 			// and its ID should have been found in NewFs
 			dirCacheFoundRoot = dirCacheRootIDExists
-		} else if _, err := f.dirCache.RootParentID(); err == nil {
+		} else if _, err := f.dirCache.RootParentID(ctx, false); err == nil {
 			// if root is in a folder, it must have a parent folder, and
 			// if dirCache has found root in NewFs, the parent folder's ID
 			// should be present.
@@ -813,10 +813,6 @@ OUTER:
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	err = f.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		return nil, err
-	}
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
@@ -864,7 +860,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // Used to create new objects
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
 	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err = f.dirCache.FindRootAndPath(ctx, remote, true)
+	leaf, directoryID, err = f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return nil, leaf, directoryID, err
 	}
@@ -895,13 +891,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	err := f.dirCache.FindRoot(ctx, true)
-	if err != nil {
-		return err
-	}
-	if dir != "" {
-		_, err = f.dirCache.FindDir(ctx, dir, true)
-	}
+	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
 
@@ -924,10 +914,6 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return errors.New("can't purge root directory")
 	}
 	dc := f.dirCache
-	err := dc.FindRoot(ctx, false)
-	if err != nil {
-		return err
-	}
 	rootID, err := dc.FindDir(ctx, dir, false)
 	if err != nil {
 		return err
@@ -1121,9 +1107,10 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	id, dstDriveID, _ := parseNormalizedID(directoryID)
 	_, srcObjDriveID, _ := parseNormalizedID(srcObj.id)
 
-	if dstDriveID != srcObjDriveID {
+	if f.canonicalDriveID(dstDriveID) != srcObj.fs.canonicalDriveID(srcObjDriveID) {
 		// https://docs.microsoft.com/en-us/graph/api/driveitem-move?view=graph-rest-1.0
 		// "Items cannot be moved between Drives using this request."
+		fs.Debugf(f, "Can't move files between drives (%q != %q)", dstDriveID, srcObjDriveID)
 		return nil, fs.ErrorCantMove
 	}
 
@@ -1173,68 +1160,20 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
 		return fs.ErrorCantDirMove
 	}
-	srcPath := path.Join(srcFs.root, srcRemote)
-	dstPath := path.Join(f.root, dstRemote)
 
-	// Refuse to move to or from the root
-	if srcPath == "" || dstPath == "" {
-		fs.Debugf(src, "DirMove error: Can't move root")
-		return errors.New("can't move root directory")
-	}
-
-	// find the root src directory
-	err := srcFs.dirCache.FindRoot(ctx, false)
+	srcID, _, _, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
 
-	// find the root dst directory
-	if dstRemote != "" {
-		err = f.dirCache.FindRoot(ctx, true)
-		if err != nil {
-			return err
-		}
-	} else {
-		if f.dirCache.FoundRoot() {
-			return fs.ErrorDirExists
-		}
-	}
-
-	// Find ID of dst parent, creating subdirs if necessary
-	var leaf, dstDirectoryID string
-	findPath := dstRemote
-	if dstRemote == "" {
-		findPath = f.root
-	}
-	leaf, dstDirectoryID, err = f.dirCache.FindPath(ctx, findPath, true)
-	if err != nil {
-		return err
-	}
 	parsedDstDirID, dstDriveID, _ := parseNormalizedID(dstDirectoryID)
-
-	// Find ID of src
-	srcID, err := srcFs.dirCache.FindDir(ctx, srcRemote, false)
-	if err != nil {
-		return err
-	}
 	_, srcDriveID, _ := parseNormalizedID(srcID)
 
-	if dstDriveID != srcDriveID {
+	if f.canonicalDriveID(dstDriveID) != srcFs.canonicalDriveID(srcDriveID) {
 		// https://docs.microsoft.com/en-us/graph/api/driveitem-move?view=graph-rest-1.0
 		// "Items cannot be moved between Drives using this request."
+		fs.Debugf(f, "Can't move directories between drives (%q != %q)", dstDriveID, srcDriveID)
 		return fs.ErrorCantDirMove
-	}
-
-	// Check destination does not exist
-	if dstRemote != "" {
-		_, err = f.dirCache.FindDir(ctx, dstRemote, false)
-		if err == fs.ErrorDirNotFound {
-			// OK
-		} else if err != nil {
-			return err
-		} else {
-			return fs.ErrorDirExists
-		}
 	}
 
 	// Get timestamps of src so they can be preserved
@@ -1246,7 +1185,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// Do the move
 	opts := newOptsCall(srcID, "PATCH", "")
 	move := api.MoveItemRequest{
-		Name: f.opt.Enc.FromStandardName(leaf),
+		Name: f.opt.Enc.FromStandardName(dstLeaf),
 		ParentReference: &api.ItemReference{
 			DriveID: dstDriveID,
 			ID:      parsedDstDirID,
@@ -1311,7 +1250,7 @@ func (f *Fs) Hashes() hash.Set {
 }
 
 // PublicLink returns a link for downloading without account.
-func (f *Fs) PublicLink(ctx context.Context, remote string) (link string, err error) {
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error) {
 	info, _, err := f.readMetaDataForPath(ctx, f.rootPath(remote))
 	if err != nil {
 		return "", err
@@ -1688,41 +1627,22 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, size int64, 
 		return nil, errors.New("unknown-sized upload not supported")
 	}
 
-	uploadURLChan := make(chan string, 1)
-	gracefulCancel := func() {
-		uploadURL, ok := <-uploadURLChan
-		// Reading from uploadURLChan blocks the atexit process until
-		// we are able to use uploadURL to cancel the upload
-		if !ok { // createUploadSession failed - no need to cancel upload
-			return
-		}
-
-		fs.Debugf(o, "Cancelling multipart upload")
-		cancelErr := o.cancelUploadSession(ctx, uploadURL)
-		if cancelErr != nil {
-			fs.Logf(o, "Failed to cancel multipart upload: %v", cancelErr)
-		}
-	}
-	cancelFuncHandle := atexit.Register(gracefulCancel)
-
 	// Create upload session
 	fs.Debugf(o, "Starting multipart upload")
 	session, err := o.createUploadSession(ctx, modTime)
 	if err != nil {
-		close(uploadURLChan)
-		atexit.Unregister(cancelFuncHandle)
 		return nil, err
 	}
 	uploadURL := session.UploadURL
-	uploadURLChan <- uploadURL
 
-	defer func() {
-		if err != nil {
-			fs.Debugf(o, "Error encountered during upload: %v", err)
-			gracefulCancel()
+	// Cancel the session if something went wrong
+	defer atexit.OnError(&err, func() {
+		fs.Debugf(o, "Cancelling multipart upload: %v", err)
+		cancelErr := o.cancelUploadSession(ctx, uploadURL)
+		if cancelErr != nil {
+			fs.Logf(o, "Failed to cancel multipart upload: %v", cancelErr)
 		}
-		atexit.Unregister(cancelFuncHandle)
-	}()
+	})()
 
 	// Upload the chunks
 	remaining := size
@@ -1867,6 +1787,17 @@ func parseNormalizedID(ID string) (string, string, string) {
 		return s[1], s[0], graphURL + "/drives"
 	}
 	return ID, "", ""
+}
+
+// Returns the canonical form of the driveID
+func (f *Fs) canonicalDriveID(driveID string) (canonicalDriveID string) {
+	if driveID == "" {
+		canonicalDriveID = f.opt.DriveID
+	} else {
+		canonicalDriveID = driveID
+	}
+	canonicalDriveID = strings.ToLower(canonicalDriveID)
+	return canonicalDriveID
 }
 
 // getRelativePathInsideBase checks if `target` is inside `base`. If so, it

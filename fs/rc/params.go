@@ -6,9 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/rclone/rclone/fs"
 )
 
 // Params is the input and output type for the Func
@@ -85,6 +89,23 @@ func (p Params) Get(key string) (interface{}, error) {
 		return nil, ErrParamNotFound(key)
 	}
 	return value, nil
+}
+
+// GetHTTPRequest gets a http.Request parameter associated with the request with the key "HttpRequest"
+//
+// If the parameter isn't found then error will be of type
+// ErrParamNotFound and the returned value will be nil.
+func (p Params) GetHTTPRequest() (*http.Request, error) {
+	key := "_request"
+	value, err := p.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	request, ok := value.(*http.Request)
+	if !ok {
+		return nil, ErrParamInvalid{errors.Errorf("expecting http.request value for key %q (was %T)", key, value)}
+	}
+	return request, nil
 }
 
 // GetString gets a string parameter from the input
@@ -211,4 +232,17 @@ func (p Params) GetStructMissingOK(key string, out interface{}) error {
 		return nil
 	}
 	return p.GetStruct(key, out)
+}
+
+// GetDuration get the duration parameters from in
+func (p Params) GetDuration(key string) (time.Duration, error) {
+	s, err := p.GetString(key)
+	if err != nil {
+		return 0, err
+	}
+	duration, err := fs.ParseDuration(s)
+	if err != nil {
+		return 0, ErrParamInvalid{errors.Wrap(err, "parse duration")}
+	}
+	return duration, nil
 }

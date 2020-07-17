@@ -165,7 +165,7 @@ List the contents of a bucket
 Sync `/home/local/directory` to the remote bucket, deleting any excess
 files in the bucket.
 
-    rclone sync /home/local/directory remote:bucket
+    rclone sync -i /home/local/directory remote:bucket
 
 ### Service Account support ###
 
@@ -193,6 +193,13 @@ flow. If you'd rather stuff the contents of the credentials file into
 the rclone config file, you can set `service_account_credentials` with
 the actual contents of the file instead, or set the equivalent
 environment variable.
+
+### Anonymous Access ###
+
+For downloads of objects that permit public access you can configure rclone
+to use anonymous access by setting `anonymous` to `true`.
+With unauthorized access you can't write or create files but only read or list
+those buckets and objects that have public read access.
 
 ### Application Default Credentials ###
 
