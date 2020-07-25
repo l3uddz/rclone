@@ -20,30 +20,25 @@ import (
 	"time"
 
 	_ "github.com/rclone/rclone/backend/all" // import all the backends
+	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/rclone/rclone/vfs/vfsflags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-type (
-	// UnmountFn is called to unmount the file system
-	UnmountFn func() error
-	// MountFn is called to mount the file system
-	MountFn func(f fs.Fs, mountpoint string) (vfs *vfs.VFS, unmountResult <-chan error, unmount func() error, err error)
-)
-
 var (
-	mountFn MountFn
+	mountFn mountlib.MountFn
 )
 
 // RunTests runs all the tests against all the VFS cache modes
 //
 // If useVFS is set then it runs the tests against a VFS rather than amount
-func RunTests(t *testing.T, useVFS bool, fn MountFn) {
+func RunTests(t *testing.T, useVFS bool, fn mountlib.MountFn) {
 	mountFn = fn
 	flag.Parse()
 	tests := []struct {
@@ -110,7 +105,7 @@ type Run struct {
 	fremoteName  string
 	cleanRemote  func()
 	umountResult <-chan error
-	umountFn     UnmountFn
+	umountFn     mountlib.UnmountFn
 	skip         bool
 }
 
@@ -176,7 +171,8 @@ found:
 func (r *Run) mount() {
 	log.Printf("mount %q %q", r.fremote, r.mountPath)
 	var err error
-	r.vfs, r.umountResult, r.umountFn, err = mountFn(r.fremote, r.mountPath)
+	r.vfs = vfs.New(r.fremote, &vfsflags.Opt)
+	r.umountResult, r.umountFn, err = mountFn(r.vfs, r.mountPath, &mountlib.Opt)
 	if err != nil {
 		log.Printf("mount FAILED: %v", err)
 		r.skip = true

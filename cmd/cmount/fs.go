@@ -17,7 +17,6 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/vfs"
-	"github.com/rclone/rclone/vfs/vfsflags"
 )
 
 const fhUnset = ^uint64(0)
@@ -32,10 +31,10 @@ type FS struct {
 }
 
 // NewFS makes a new FS
-func NewFS(f fs.Fs) *FS {
+func NewFS(VFS *vfs.VFS) *FS {
 	fsys := &FS{
-		VFS:   vfs.New(f, &vfsflags.Opt),
-		f:     f,
+		VFS:   VFS,
+		f:     VFS.Fs(),
 		ready: make(chan (struct{})),
 	}
 	return fsys
@@ -218,12 +217,18 @@ func (fsys *FS) Readdir(dirPath string,
 	itemsRead := -1
 	defer log.Trace(dirPath, "ofst=%d, fh=0x%X", ofst, fh)("items=%d, errc=%d", &itemsRead, &errc)
 
-	node, errc := fsys.getHandle(fh)
+	dir, errc := fsys.lookupDir(dirPath)
 	if errc != 0 {
 		return errc
 	}
 
-	items, err := node.Readdir(-1)
+	// We can't seek in directories and FUSE should know that so
+	// return an error if ofst is ever set.
+	if ofst > 0 {
+		return -fuse.ESPIPE
+	}
+
+	nodes, err := dir.ReadDirAll()
 	if err != nil {
 		return translateError(err)
 	}
@@ -232,7 +237,7 @@ func (fsys *FS) Readdir(dirPath string,
 	// for getattr (but FUSE only looks at st_ino and the
 	// file-type bits of st_mode).
 	//
-	// FIXME If you call host.SetCapReaddirPlus() then WinFsp will
+	// We have called host.SetCapReaddirPlus() so WinFsp will
 	// use the full stat information - a Useful optimization on
 	// Windows.
 	//
@@ -243,25 +248,19 @@ func (fsys *FS) Readdir(dirPath string,
 	// directory is read in a single readdir operation.
 	fill(".", nil, 0)
 	fill("..", nil, 0)
-	for _, item := range items {
-		node, ok := item.(vfs.Node)
-		if ok {
-			name := node.Name()
-			if len(name) > mountlib.MaxLeafSize {
-				fs.Errorf(dirPath, "Name too long (%d bytes) for FUSE, skipping: %s", len(name), name)
-				continue
-			}
-			if usingReaddirPlus {
-				// We have called host.SetCapReaddirPlus() so supply the stat information
-				var stat fuse.Stat_t
-				_ = fsys.stat(node, &stat) // not capable of returning an error
-				fill(name, &stat, 0)
-			} else {
-				fill(name, nil, 0)
-			}
+	for _, node := range nodes {
+		name := node.Name()
+		if len(name) > mountlib.MaxLeafSize {
+			fs.Errorf(dirPath, "Name too long (%d bytes) for FUSE, skipping: %s", len(name), name)
+			continue
 		}
+		// We have called host.SetCapReaddirPlus() so supply the stat information
+		// It is very cheap at this point so supply it regardless of OS capabilities
+		var stat fuse.Stat_t
+		_ = fsys.stat(node, &stat) // not capable of returning an error
+		fill(name, &stat, 0)
 	}
-	itemsRead = len(items)
+	itemsRead = len(nodes)
 	return 0
 }
 

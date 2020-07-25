@@ -10,6 +10,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/rclone/rclone/vfs/vfsflags"
 )
 
 // MountInfo defines the configuration for a mount
@@ -18,6 +21,8 @@ type MountInfo struct {
 	MountPoint string    `json:"MountPoint"`
 	MountedOn  time.Time `json:"MountedOn"`
 	Fs         string    `json:"Fs"`
+	MountOpt   *Options
+	VFSOpt     *vfscommon.Options
 }
 
 var (
@@ -53,11 +58,19 @@ This takes the following parameters
 - fs - a remote path to be mounted (required)
 - mountPoint: valid path on the local machine (required)
 - mountType: One of the values (mount, cmount, mount2) specifies the mount implementation to use
+- mountOpt: a JSON object with Mount options in.
+- vfsOpt: a JSON object with VFS options in.
 
 Eg
 
     rclone rc mount/mount fs=mydrive: mountPoint=/home/<user>/mountPoint
     rclone rc mount/mount fs=mydrive: mountPoint=/home/<user>/mountPoint mountType=mount
+    rclone rc mount/mount fs=TestDrive: mountPoint=/mnt/tmp vfsOpt='{"CacheMode": 2}' mountOpt='{"AllowOther": true}'
+
+The vfsOpt are as described in options/get and can be seen in the the
+"vfs" section when running and the mountOpt can be seen in the "mount" section.
+
+    rclone rc options/get
 `,
 	})
 }
@@ -65,6 +78,18 @@ Eg
 // mountRc allows the mount command to be run from rc
 func mountRc(_ context.Context, in rc.Params) (out rc.Params, err error) {
 	mountPoint, err := in.GetString("mountPoint")
+	if err != nil {
+		return nil, err
+	}
+
+	vfsOpt := vfsflags.Opt
+	err = in.GetStructMissingOK("vfsOpt", &vfsOpt)
+	if err != nil {
+		return nil, err
+	}
+
+	mountOpt := Opt
+	err = in.GetStructMissingOK("mountOpt", &mountOpt)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +116,8 @@ func mountRc(_ context.Context, in rc.Params) (out rc.Params, err error) {
 	}
 
 	if mountFns[mountType] != nil {
-		_, _, unmountFn, err := mountFns[mountType](fdst, mountPoint)
+		VFS := vfs.New(fdst, &vfsOpt)
+		_, unmountFn, err := mountFns[mountType](VFS, mountPoint, &mountOpt)
 
 		if err != nil {
 			log.Printf("mount FAILED: %v", err)
@@ -103,6 +129,8 @@ func mountRc(_ context.Context, in rc.Params) (out rc.Params, err error) {
 			MountedOn:  time.Now(),
 			Fs:         fdst.Name(),
 			MountPoint: mountPoint,
+			VFSOpt:     &vfsOpt,
+			MountOpt:   &mountOpt,
 		}
 
 		fs.Debugf(nil, "Mount for %s created at %s using %s", fdst.String(), mountPoint, mountType)
