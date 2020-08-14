@@ -39,6 +39,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
@@ -71,7 +72,7 @@ const (
 	// 1<<18 is the minimum size supported by the Google uploader, and there is no maximum.
 	minChunkSize     = 256 * fs.KibiByte
 	defaultChunkSize = 8 * fs.MebiByte
-	partialFields    = "id,name,size,md5Checksum,trashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails"
+	partialFields    = "id,name,size,md5Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails"
 	listRGrouping    = 50   // number of IDs to search at once when using ListR
 	listRInputBuffer = 1000 // size of input buffer when using ListR
 )
@@ -194,13 +195,7 @@ func init() {
 				log.Fatalf("Failed to configure team drive: %v", err)
 			}
 		},
-		Options: []fs.Option{{
-			Name: config.ConfigClientID,
-			Help: "Google Application Client Id\nSetting your own is recommended.\nSee https://rclone.org/drive/#making-your-own-client-id for how to create your own.\nIf you leave this blank, it will use an internal key which is low performance.",
-		}, {
-			Name: config.ConfigClientSecret,
-			Help: "Google Application Client Secret\nSetting your own is recommended.",
-		}, {
+		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name: "scope",
 			Help: "Scope that rclone should use when requesting access from drive.",
 			Examples: []fs.OptionExample{{
@@ -226,9 +221,6 @@ Leave blank normally.
 
 Fill in to access "Computers" folders (see docs), or for rclone to use
 a non root folder as its starting point.
-
-Note that if this is blank, the first time rclone runs it will fill it
-in with the ID of the root folder.
 `,
 		}, {
 			Name: "service_account_file",
@@ -358,12 +350,9 @@ date is used.`,
 			Help:     "Size of listing chunk 100-1000. 0 to disable.",
 			Advanced: true,
 		}, {
-			Name:    "impersonate",
-			Default: "",
-			Help: `Impersonate this user when using a service account.
-
-Note that if this is used then "root_folder_id" will be ignored.
-`,
+			Name:     "impersonate",
+			Default:  "",
+			Help:     `Impersonate this user when using a service account.`,
 			Advanced: true,
 		}, {
 			Name:    "alternate_export",
@@ -517,7 +506,7 @@ If this flag is set then rclone will ignore shortcut files completely.
 			// Encode invalid UTF-8 bytes as json doesn't handle them properly.
 			// Don't encode / as it's a valid name character in drive.
 			Default: encoder.EncodeInvalidUtf8,
-		}},
+		}}...),
 	})
 
 	// register duplicate MIME types first
@@ -1219,25 +1208,15 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, err
 	}
 
-	// If impersonating warn about root_folder_id if set and unset it
-	//
-	// This is because rclone v1.51 and v1.52 cached root_folder_id when
-	// using impersonate which they shouldn't have done. It is possible
-	// someone is using impersonate and root_folder_id in which case this
-	// breaks their workflow. There isn't an easy way around that.
-	if f.opt.RootFolderID != "" && f.opt.RootFolderID != "appDataFolder" && f.opt.Impersonate != "" {
-		fs.Logf(f, "Ignoring cached root_folder_id when using --drive-impersonate")
-		f.opt.RootFolderID = ""
-	}
-
-	// set root folder for a team drive or query the user root folder
+	// Set the root folder ID
 	if f.opt.RootFolderID != "" {
-		// override root folder if set or cached in the config and not impersonating
+		// use root_folder ID if set
 		f.rootFolderID = f.opt.RootFolderID
 	} else if f.isTeamDrive {
+		// otherwise use team_drive if set
 		f.rootFolderID = f.opt.TeamDriveID
 	} else {
-		// Look up the root ID and cache it in the config
+		// otherwise look up the actual root ID
 		rootID, err := f.getRootID()
 		if err != nil {
 			if gerr, ok := errors.Cause(err).(*googleapi.Error); ok && gerr.Code == 404 {
@@ -1249,10 +1228,7 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 			}
 		}
 		f.rootFolderID = rootID
-		// Don't cache the root folder ID if impersonating
-		if f.opt.Impersonate == "" {
-			m.Set("root_folder_id", rootID)
-		}
+		fs.Debugf(f, "root_folder_id = %q - save this in the config to speed up startup", rootID)
 	}
 
 	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
@@ -2323,10 +2299,9 @@ func (f *Fs) delete(ctx context.Context, id string, useTrash bool) error {
 	})
 }
 
-// Rmdir deletes a directory
-//
-// Returns an error if it isn't empty
-func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+// purgeCheck removes the dir directory, if check is set then it
+// refuses to do so if it has anything in
+func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	root := path.Join(f.root, dir)
 	dc := f.dirCache
 	directoryID, err := dc.FindDir(ctx, dir, false)
@@ -2339,20 +2314,22 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return f.delete(ctx, shortcutID, f.opt.UseTrash)
 	}
 	var trashedFiles = false
-	found, err := f.list(ctx, []string{directoryID}, "", false, false, true, func(item *drive.File) bool {
-		if !item.Trashed {
-			fs.Debugf(dir, "Rmdir: contains file: %q", item.Name)
-			return true
+	if check {
+		found, err := f.list(ctx, []string{directoryID}, "", false, false, true, func(item *drive.File) bool {
+			if !item.Trashed {
+				fs.Debugf(dir, "Rmdir: contains file: %q", item.Name)
+				return true
+			}
+			fs.Debugf(dir, "Rmdir: contains trashed file: %q", item.Name)
+			trashedFiles = true
+			return false
+		})
+		if err != nil {
+			return err
 		}
-		fs.Debugf(dir, "Rmdir: contains trashed file: %q", item.Name)
-		trashedFiles = true
-		return false
-	})
-	if err != nil {
-		return err
-	}
-	if found {
-		return errors.Errorf("directory not empty")
+		if found {
+			return errors.Errorf("directory not empty")
+		}
 	}
 	if root != "" {
 		// trash the directory if it had trashed files
@@ -2362,12 +2339,21 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		if err != nil {
 			return err
 		}
+	} else if check {
+		return errors.New("can't purge root directory")
 	}
 	f.dirCache.FlushDir(dir)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+// Rmdir deletes a directory
+//
+// Returns an error if it isn't empty
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, true)
 }
 
 // Precision of the object storage system
@@ -2465,23 +2451,11 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	if f.root == "" {
-		return errors.New("can't purge root directory")
-	}
+func (f *Fs) Purge(ctx context.Context, dir string) error {
 	if f.opt.TrashedOnly {
 		return errors.New("Can't purge with --drive-trashed-only. Use delete if you want to selectively delete files")
 	}
-	rootID, err := f.dirCache.RootID(ctx, false)
-	if err != nil {
-		return err
-	}
-	err = f.delete(ctx, shortcutID(rootID), f.opt.UseTrash)
-	f.dirCache.ResetRoot()
-	if err != nil {
-		return err
-	}
-	return nil
+	return f.purgeCheck(ctx, dir, false)
 }
 
 // CleanUp empties the trash
@@ -3114,6 +3088,75 @@ func (f *Fs) listTeamDrives(ctx context.Context) (drives []*drive.TeamDrive, err
 	return drives, nil
 }
 
+type unTrashResult struct {
+	Untrashed int
+	Errors    int
+}
+
+func (r unTrashResult) Error() string {
+	return fmt.Sprintf("%d errors while untrashing - see log", r.Errors)
+}
+
+// Restore the trashed files from dir, directoryID recursing if needed
+func (f *Fs) unTrash(ctx context.Context, dir string, directoryID string, recurse bool) (r unTrashResult, err error) {
+	directoryID = actualID(directoryID)
+	fs.Debugf(dir, "finding trash to restore in directory %q", directoryID)
+	_, err = f.list(ctx, []string{directoryID}, "", false, false, true, func(item *drive.File) bool {
+		remote := path.Join(dir, item.Name)
+		if item.ExplicitlyTrashed {
+			fs.Infof(remote, "restoring %q", item.Id)
+			if operations.SkipDestructive(ctx, remote, "restore") {
+				return false
+			}
+			update := drive.File{
+				ForceSendFields: []string{"Trashed"}, // necessary to set false value
+				Trashed:         false,
+			}
+			err := f.pacer.Call(func() (bool, error) {
+				_, err := f.svc.Files.Update(item.Id, &update).
+					SupportsAllDrives(true).
+					Fields("trashed").
+					Do()
+				return f.shouldRetry(err)
+			})
+			if err != nil {
+				err = errors.Wrap(err, "failed to restore")
+				r.Errors++
+				fs.Errorf(remote, "%v", err)
+			} else {
+				r.Untrashed++
+			}
+		}
+		if recurse && item.MimeType == "application/vnd.google-apps.folder" {
+			if !isShortcutID(item.Id) {
+				rNew, _ := f.unTrash(ctx, remote, item.Id, recurse)
+				r.Untrashed += rNew.Untrashed
+				r.Errors += rNew.Errors
+			}
+		}
+		return false
+	})
+	if err != nil {
+		err = errors.Wrap(err, "failed to list directory")
+		r.Errors++
+		fs.Errorf(dir, "%v", err)
+	}
+	if r.Errors != 0 {
+		return r, r
+	}
+	return r, nil
+}
+
+// Untrash dir
+func (f *Fs) unTrashDir(ctx context.Context, dir string, recurse bool) (r unTrashResult, err error) {
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		r.Errors++
+		return r, err
+	}
+	return f.unTrash(ctx, dir, directoryID, true)
+}
+
 var commandHelp = []fs.CommandHelp{{
 	Name:  "get",
 	Short: "Get command for fetching the drive config parameters",
@@ -3191,6 +3234,29 @@ This will return a JSON list of objects like this
     ]
 
 `,
+}, {
+	Name:  "untrash",
+	Short: "Untrash files and directories",
+	Long: `This command untrashes all the files and directories in the directory
+passed in recursively.
+
+Usage:
+
+This takes an optional directory to trash which make this easier to
+use via the API.
+
+    rclone backend untrash drive:directory
+    rclone backend -i untrash drive:directory subdir
+
+Use the -i flag to see what would be restored before restoring it.
+
+Result:
+
+    {
+        "Untrashed": 17,
+        "Errors": 0
+    }
+`,
 }}
 
 // Command the backend to run a named command
@@ -3256,6 +3322,12 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		return f.makeShortcut(ctx, arg[0], dstFs, arg[1])
 	case "drives":
 		return f.listTeamDrives(ctx)
+	case "untrash":
+		dir := ""
+		if len(arg) > 0 {
+			dir = arg[0]
+		}
+		return f.unTrashDir(ctx, dir, true)
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}

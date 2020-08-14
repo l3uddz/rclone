@@ -76,23 +76,7 @@ func init() {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
 		},
-		Options: []fs.Option{{
-			Name:     config.ConfigClientID,
-			Help:     "Amazon Application Client ID.",
-			Required: true,
-		}, {
-			Name:     config.ConfigClientSecret,
-			Help:     "Amazon Application Client Secret.",
-			Required: true,
-		}, {
-			Name:     config.ConfigAuthURL,
-			Help:     "Auth server URL.\nLeave blank to use Amazon's.",
-			Advanced: true,
-		}, {
-			Name:     config.ConfigTokenURL,
-			Help:     "Token server url.\nleave blank to use Amazon's.",
-			Advanced: true,
-		}, {
+		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name:     "checkpoint",
 			Help:     "Checkpoint for internal polling (debug).",
 			Hide:     fs.OptionHideBoth,
@@ -143,7 +127,7 @@ underlying S3 storage.`,
 			// Encode invalid UTF-8 bytes as json doesn't handle them properly.
 			Default: (encoder.Base |
 				encoder.EncodeInvalidUtf8),
-		}},
+		}}...),
 	})
 }
 
@@ -937,8 +921,8 @@ func (f *Fs) Hashes() hash.Set {
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	return f.purgeCheck(ctx, "", false)
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
 }
 
 // ------------------------------------------------------------

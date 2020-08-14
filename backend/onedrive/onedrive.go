@@ -14,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -26,6 +27,8 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
@@ -238,13 +241,7 @@ func init() {
 			m.Set(configDriveType, rootItem.ParentReference.DriveType)
 			config.SaveConfig()
 		},
-		Options: []fs.Option{{
-			Name: config.ConfigClientID,
-			Help: "Microsoft App Client Id\nLeave blank normally.",
-		}, {
-			Name: config.ConfigClientSecret,
-			Help: "Microsoft App Client Secret\nLeave blank normally.",
-		}, {
+		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name: "chunk_size",
 			Help: `Chunk size to upload files with - must be multiple of 320k (327,680 bytes).
 
@@ -283,6 +280,23 @@ This can be useful if you wish to do a server side copy between two
 different Onedrives.  Note that this isn't enabled by default
 because it isn't easy to tell if it will work between any two
 configurations.`,
+			Advanced: true,
+		}, {
+			Name:    "no_versions",
+			Default: false,
+			Help: `Remove all versions on modifying operations
+
+Onedrive for business creates versions when rclone uploads new files
+overwriting an existing one and when it sets the modification time.
+
+These versions take up space out of the quota.
+
+This flag checks for versions after file upload and setting
+modification time and removes all but the last version.
+
+**NB** Onedrive personal can't currently delete versions so don't use
+this flag there.
+`,
 			Advanced: true,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -330,7 +344,7 @@ configurations.`,
 				encoder.EncodeRightSpace |
 				encoder.EncodeWin |
 				encoder.EncodeInvalidUtf8),
-		}},
+		}}...),
 	})
 }
 
@@ -341,6 +355,7 @@ type Options struct {
 	DriveType               string               `config:"drive_type"`
 	ExposeOneNoteFiles      bool                 `config:"expose_onenote_files"`
 	ServerSideAcrossConfigs bool                 `config:"server_side_across_configs"`
+	NoVersions              bool                 `config:"no_versions"`
 	Enc                     encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -1073,13 +1088,13 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return dstObj, nil
 }
 
-// Purge deletes all the files and the container
+// Purge deletes all the files in the directory
 //
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	return f.purgeCheck(ctx, "", false)
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
 }
 
 // Move src to this remote using server side move operations.
@@ -1275,6 +1290,73 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	return result.Link.WebURL, nil
 }
 
+// CleanUp deletes all the hidden files.
+func (f *Fs) CleanUp(ctx context.Context) error {
+	token := make(chan struct{}, fs.Config.Checkers)
+	var wg sync.WaitGroup
+	err := walk.Walk(ctx, f, "", true, -1, func(path string, entries fs.DirEntries, err error) error {
+		err = entries.ForObjectError(func(obj fs.Object) error {
+			o, ok := obj.(*Object)
+			if !ok {
+				return errors.New("internal error: not a onedrive object")
+			}
+			wg.Add(1)
+			token <- struct{}{}
+			go func() {
+				defer func() {
+					<-token
+					wg.Done()
+				}()
+				err := o.deleteVersions(ctx)
+				if err != nil {
+					fs.Errorf(o, "Failed to remove versions: %v", err)
+				}
+			}()
+			return nil
+		})
+		wg.Wait()
+		return err
+	})
+	return err
+}
+
+// Finds and removes any old versions for o
+func (o *Object) deleteVersions(ctx context.Context) error {
+	opts := newOptsCall(o.id, "GET", "/versions")
+	var versions api.VersionsResponse
+	err := o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &versions)
+		return shouldRetry(resp, err)
+	})
+	if err != nil {
+		return err
+	}
+	if len(versions.Versions) < 2 {
+		return nil
+	}
+	for _, version := range versions.Versions[1:] {
+		err = o.deleteVersion(ctx, version.ID)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Finds and removes any old versions for o
+func (o *Object) deleteVersion(ctx context.Context, ID string) error {
+	if operations.SkipDestructive(ctx, fmt.Sprintf("%s of %s", ID, o.remote), "delete version") {
+		return nil
+	}
+	fs.Infof(o, "removing version %q", ID)
+	opts := newOptsCall(o.id, "DELETE", "/versions/"+ID)
+	opts.NoResponse = true
+	return o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.Call(ctx, &opts)
+		return shouldRetry(resp, err)
+	})
+}
+
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
@@ -1438,6 +1520,13 @@ func (o *Object) setModTime(ctx context.Context, modTime time.Time) (*api.Item, 
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, &update, &info)
 		return shouldRetry(resp, err)
 	})
+	// Remove versions if required
+	if o.fs.opt.NoVersions {
+		err := o.deleteVersions(ctx)
+		if err != nil {
+			fs.Errorf(o, "Failed to remove versions: %v", err)
+		}
+	}
 	return info, err
 }
 
@@ -1744,6 +1833,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
+	// If updating the file then remove versions
+	if o.fs.opt.NoVersions && o.hasMetaData {
+		err = o.deleteVersions(ctx)
+		if err != nil {
+			fs.Errorf(o, "Failed to remove versions: %v", err)
+		}
+	}
+
 	return o.setMetaData(info)
 }
 
@@ -1840,6 +1937,7 @@ var (
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.PublicLinker    = (*Fs)(nil)
+	_ fs.CleanUpper      = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.MimeTyper       = &Object{}
 	_ fs.IDer            = &Object{}

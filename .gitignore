@@ -10,3 +10,4 @@ rclone.iml
 *.test
 *.log
 *.iml
+fuzz-build.zip

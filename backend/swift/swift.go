@@ -840,17 +840,21 @@ func (f *Fs) Precision() time.Duration {
 	return time.Nanosecond
 }
 
-// Purge deletes all the files and directories
+// Purge deletes all the files in the directory
 //
 // Implemented here so we can make sure we delete directory markers
-func (f *Fs) Purge(ctx context.Context) error {
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	container, directory := f.split(dir)
+	if container == "" {
+		return fs.ErrorListBucketRequired
+	}
 	// Delete all the files including the directory markers
 	toBeDeleted := make(chan fs.Object, fs.Config.Transfers)
 	delErr := make(chan error, 1)
 	go func() {
 		delErr <- operations.DeleteFiles(ctx, toBeDeleted)
 	}()
-	err := f.list(f.rootContainer, f.rootDirectory, f.rootDirectory, f.rootContainer == "", true, true, func(entry fs.DirEntry) error {
+	err := f.list(container, directory, f.rootDirectory, false, true, true, func(entry fs.DirEntry) error {
 		if o, ok := entry.(*Object); ok {
 			toBeDeleted <- o
 		}
@@ -864,7 +868,7 @@ func (f *Fs) Purge(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return f.Rmdir(ctx, "")
+	return f.Rmdir(ctx, dir)
 }
 
 // Copy src to this remote using server side copy operations.
@@ -1111,13 +1115,18 @@ func min(x, y int64) int64 {
 //
 // if except is passed in then segments with that prefix won't be deleted
 func (o *Object) removeSegments(except string) error {
-	segmentsContainer, prefix, err := o.getSegmentsDlo()
-	err = o.fs.listContainerRoot(segmentsContainer, prefix, "", false, true, true, func(remote string, object *swift.Object, isDirectory bool) error {
+	segmentsContainer, _, err := o.getSegmentsDlo()
+	if err != nil {
+		return err
+	}
+	except = path.Join(o.remote, except)
+	// fs.Debugf(o, "segmentsContainer %q prefix %q", segmentsContainer, prefix)
+	err = o.fs.listContainerRoot(segmentsContainer, o.remote, "", false, true, true, func(remote string, object *swift.Object, isDirectory bool) error {
 		if isDirectory {
 			return nil
 		}
 		if except != "" && strings.HasPrefix(remote, except) {
-			// fs.Debugf(o, "Ignoring current segment file %q in container %q", segmentsRoot+remote, segmentsContainer)
+			// fs.Debugf(o, "Ignoring current segment file %q in container %q", remote, segmentsContainer)
 			return nil
 		}
 		fs.Debugf(o, "Removing segment file %q in container %q", remote, segmentsContainer)
