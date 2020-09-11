@@ -18,7 +18,6 @@ import (
 	"log"
 	"mime"
 	"net/http"
-	"net/url"
 	"path"
 	"path/filepath"
 	"sort"
@@ -72,7 +71,7 @@ const (
 	// 1<<18 is the minimum size supported by the Google uploader, and there is no maximum.
 	minChunkSize     = 256 * fs.KibiByte
 	defaultChunkSize = 8 * fs.MebiByte
-	partialFields    = "id,name,size,md5Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails"
+	partialFields    = "id,name,size,md5Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks"
 	listRGrouping    = 50   // number of IDs to search at once when using ListR
 	listRInputBuffer = 1000 // size of input buffer when using ListR
 )
@@ -160,6 +159,17 @@ func driveScopesContainsAppFolder(scopes []string) bool {
 	return false
 }
 
+func driveOAuthOptions() []fs.Option {
+	opts := []fs.Option{}
+	for _, opt := range oauthutil.SharedOptions {
+		if opt.Name == config.ConfigClientID {
+			opt.Help = "Google Application Client Id\nSetting your own is recommended.\nSee https://rclone.org/drive/#making-your-own-client-id for how to create your own.\nIf you leave this blank, it will use an internal key which is low performance."
+		}
+		opts = append(opts, opt)
+	}
+	return opts
+}
+
 // Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
@@ -195,7 +205,7 @@ func init() {
 				log.Fatalf("Failed to configure team drive: %v", err)
 			}
 		},
-		Options: append(oauthutil.SharedOptions, []fs.Option{{
+		Options: append(driveOAuthOptions(), []fs.Option{{
 			Name: "scope",
 			Help: "Scope that rclone should use when requesting access from drive.",
 			Examples: []fs.OptionExample{{
@@ -290,6 +300,11 @@ commands (copy, sync, etc), and with all other commands too.`,
 			Help:     "Only show files that are in the trash.\nThis will show trashed files in their original directory structure.",
 			Advanced: true,
 		}, {
+			Name:     "starred_only",
+			Default:  false,
+			Help:     "Only show files that are starred.",
+			Advanced: true,
+		}, {
 			Name:     "formats",
 			Default:  "",
 			Help:     "Deprecated: see export_formats",
@@ -357,17 +372,8 @@ date is used.`,
 		}, {
 			Name:    "alternate_export",
 			Default: false,
-			Help: `Use alternate export URLs for google documents export.,
-
-If this option is set this instructs rclone to use an alternate set of
-export URLs for drive documents.  Users have reported that the
-official export URLs can't export large documents, whereas these
-unofficial ones can.
-
-See rclone issue [#2243](https://github.com/rclone/rclone/issues/2243) for background,
-[this google drive issue](https://issuetracker.google.com/issues/36761333) and
-[this helpful post](https://www.labnol.org/internet/direct-links-for-google-drive/28356/).`,
-			Advanced: true,
+			Help:    "Deprecated: no longer needed",
+			Hide:    fs.OptionHideBoth,
 		}, {
 			Name:     "upload_cutoff",
 			Default:  defaultChunkSize,
@@ -538,6 +544,7 @@ type Options struct {
 	SkipChecksumGphotos       bool                 `config:"skip_checksum_gphotos"`
 	SharedWithMe              bool                 `config:"shared_with_me"`
 	TrashedOnly               bool                 `config:"trashed_only"`
+	StarredOnly               bool                 `config:"starred_only"`
 	Extensions                string               `config:"formats"`
 	ExportExtensions          string               `config:"export_formats"`
 	ImportExtensions          string               `config:"import_formats"`
@@ -546,7 +553,6 @@ type Options struct {
 	UseSharedDate             bool                 `config:"use_shared_date"`
 	ListChunk                 int64                `config:"list_chunk"`
 	Impersonate               string               `config:"impersonate"`
-	AlternateExport           bool                 `config:"alternate_export"`
 	UploadCutoff              fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize                 fs.SizeSuffix        `config:"chunk_size"`
 	AcknowledgeAbuse          bool                 `config:"acknowledge_abuse"`
@@ -803,6 +809,7 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 		}
 		query = append(query, q)
 	}
+
 	// Search with sharedWithMe will always return things listed in "Shared With Me" (without any parents)
 	// We must not filter with parent when we try list "ROOT" with drive-shared-with-me
 	// If we need to list file inside those shared folders, we must search it without sharedWithMe
@@ -814,8 +821,16 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 		if parentsQuery.Len() > 1 {
 			_, _ = parentsQuery.WriteString(" or ")
 		}
-		if f.opt.SharedWithMe && dirID == f.rootFolderID {
-			_, _ = parentsQuery.WriteString("sharedWithMe=true")
+		if (f.opt.SharedWithMe || f.opt.StarredOnly) && dirID == f.rootFolderID {
+			if f.opt.SharedWithMe {
+				_, _ = parentsQuery.WriteString("sharedWithMe=true")
+			}
+			if f.opt.StarredOnly {
+				if f.opt.SharedWithMe {
+					_, _ = parentsQuery.WriteString(" and ")
+				}
+				_, _ = parentsQuery.WriteString("starred=true")
+			}
 		} else {
 			_, _ = fmt.Fprintf(parentsQuery, "'%s' in parents", dirID)
 		}
@@ -1353,20 +1368,7 @@ func (f *Fs) newDocumentObject(remote string, info *drive.File, extension, expor
 	if err != nil {
 		return nil, err
 	}
-	id := actualID(info.Id)
-	url := fmt.Sprintf("%sfiles/%s/export?mimeType=%s", f.svc.BasePath, id, url.QueryEscape(mediaType))
-	if f.opt.AlternateExport {
-		switch info.MimeType {
-		case "application/vnd.google-apps.drawing":
-			url = fmt.Sprintf("https://docs.google.com/drawings/d/%s/export/%s", id, extension[1:])
-		case "application/vnd.google-apps.document":
-			url = fmt.Sprintf("https://docs.google.com/document/d/%s/export?format=%s", id, extension[1:])
-		case "application/vnd.google-apps.spreadsheet":
-			url = fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/export?format=%s", id, extension[1:])
-		case "application/vnd.google-apps.presentation":
-			url = fmt.Sprintf("https://docs.google.com/presentation/d/%s/export/%s", id, extension[1:])
-		}
-	}
+	url := info.ExportLinks[mediaType]
 	baseObject := f.newBaseObject(remote+extension, info)
 	baseObject.bytes = -1
 	baseObject.mimeType = exportMimeType
@@ -1743,7 +1745,7 @@ func (s listRSlices) Less(i, j int) bool {
 // In each cycle it will read up to grouping entries from the in channel without blocking.
 // If an error occurs it will be send to the out channel and then return. Once the in channel is closed,
 // nil is send to the out channel and the function returns.
-func (f *Fs) listRRunner(ctx context.Context, wg *sync.WaitGroup, in chan listREntry, out chan<- error, cb func(fs.DirEntry) error) {
+func (f *Fs) listRRunner(ctx context.Context, wg *sync.WaitGroup, in chan listREntry, out chan<- error, cb func(fs.DirEntry) error, sendJob func(listREntry)) {
 	var dirs []string
 	var paths []string
 	var grouping int32
@@ -1824,24 +1826,17 @@ func (f *Fs) listRRunner(ctx context.Context, wg *sync.WaitGroup, in chan listRE
 			if atomic.SwapInt32(&f.grouping, 1) != 1 {
 				fs.Debugf(f, "Disabling ListR to work around bug in drive as multi listing (%d) returned no entries", len(dirs))
 			}
-			var recycled = make([]listREntry, len(dirs))
 			f.listRmu.Lock()
 			for i := range dirs {
-				recycled[i] = listREntry{id: dirs[i], path: paths[i]}
+				// Requeue the jobs
+				job := listREntry{id: dirs[i], path: paths[i]}
+				sendJob(job)
 				// Make a note of these dirs - if they all turn
 				// out to be empty then we can re-enable grouping
 				f.listRempties[dirs[i]] = struct{}{}
 			}
 			f.listRmu.Unlock()
-			// recycle these in the background so we don't deadlock
-			// the listR runners if they all get here
-			wg.Add(len(recycled))
-			go func() {
-				for _, entry := range recycled {
-					in <- entry
-				}
-				fs.Debugf(f, "Recycled %d entries", len(recycled))
-			}()
+			fs.Debugf(f, "Recycled %d entries", len(dirs))
 		}
 		// If using a grouping of 1 and dir was empty then check to see if it
 		// is part of the group that caused grouping to be disabled.
@@ -1910,21 +1905,33 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	overflow := []listREntry{}
 	listed := 0
 
-	cb := func(entry fs.DirEntry) error {
+	// Send a job to the input channel if not closed. If the job
+	// won't fit then queue it in the overflow slice.
+	//
+	// This will not block if the channel is full.
+	sendJob := func(job listREntry) {
 		mu.Lock()
 		defer mu.Unlock()
-		if d, isDir := entry.(*fs.Dir); isDir && in != nil {
-			job := listREntry{actualID(d.ID()), d.Remote()}
-			select {
-			case in <- job:
-				// Adding the wg after we've entered the item is
-				// safe here because we know when the callback
-				// is called we are holding a waitgroup.
-				wg.Add(1)
-			default:
-				overflow = append(overflow, job)
-			}
+		if in == nil {
+			return
 		}
+		wg.Add(1)
+		select {
+		case in <- job:
+		default:
+			overflow = append(overflow, job)
+			wg.Add(-1)
+		}
+	}
+
+	// Send the entry to the caller, queueing any directories as new jobs
+	cb := func(entry fs.DirEntry) error {
+		if d, isDir := entry.(*fs.Dir); isDir {
+			job := listREntry{actualID(d.ID()), d.Remote()}
+			sendJob(job)
+		}
+		mu.Lock()
+		defer mu.Unlock()
 		listed++
 		return list.Add(entry)
 	}
@@ -1933,7 +1940,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	in <- listREntry{directoryID, dir}
 
 	for i := 0; i < fs.Config.Checkers; i++ {
-		go f.listRRunner(ctx, &wg, in, out, cb)
+		go f.listRRunner(ctx, &wg, in, out, cb, sendJob)
 	}
 	go func() {
 		// wait until the all directories are processed
@@ -2373,13 +2380,13 @@ func (f *Fs) Precision() time.Duration {
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	var srcObj *baseObject
 	ext := ""
-	readDescription := false
+	isDoc := false
 	switch src := src.(type) {
 	case *Object:
 		srcObj = &src.baseObject
 	case *documentObject:
 		srcObj, ext = &src.baseObject, src.ext()
-		readDescription = true
+		isDoc = true
 	case *linkObject:
 		srcObj, ext = &src.baseObject, src.ext()
 	default:
@@ -2387,6 +2394,12 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantCopy
 	}
 
+	// Look to see if there is an existing object before we remove
+	// the extension from the remote
+	existingObject, _ := f.NewObject(ctx, remote)
+
+	// Adjust the remote name to be without the extension if we
+	// are about to create a doc.
 	if ext != "" {
 		if !strings.HasSuffix(remote, ext) {
 			fs.Debugf(src, "Can't copy - not same document type")
@@ -2395,15 +2408,12 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		remote = remote[:len(remote)-len(ext)]
 	}
 
-	// Look to see if there is an existing object
-	existingObject, _ := f.NewObject(ctx, remote)
-
 	createInfo, err := f.createFileInfo(ctx, remote, src.ModTime(ctx))
 	if err != nil {
 		return nil, err
 	}
 
-	if readDescription {
+	if isDoc {
 		// preserve the description on copy for docs
 		info, err := f.getFile(actualID(srcObj.id), "description")
 		if err != nil {
@@ -2436,6 +2446,22 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	newObject, err := f.newObjectWithInfo(remote, info)
 	if err != nil {
 		return nil, err
+	}
+	// Google docs aren't preserving their mod time after copy, so set them explicitly
+	// See: https://github.com/rclone/rclone/issues/4517
+	//
+	// FIXME remove this when google fixes the problem!
+	if isDoc {
+		// A short sleep is needed here in order to make the
+		// change effective, without it is is ignored. This is
+		// probably some eventual consistency nastiness.
+		sleepTime := 2 * time.Second
+		fs.Debugf(f, "Sleeping for %v before setting the modtime to work around drive bug - see #4517", sleepTime)
+		time.Sleep(sleepTime)
+		err = newObject.SetModTime(ctx, src.ModTime(ctx))
+		if err != nil {
+			return nil, err
+		}
 	}
 	if existingObject != nil {
 		err = existingObject.Remove(ctx)

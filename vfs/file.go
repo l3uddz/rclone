@@ -186,6 +186,7 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 
 		f.mu.RLock()
 		o := f.o
+		d := f.d
 		f.mu.RUnlock()
 		var newObject fs.Object
 		// if o is nil then are writing the file so no need to rename the object
@@ -210,8 +211,8 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 			}
 		}
 		// Rename in the cache
-		if f.d.vfs.cache != nil {
-			if err := f.d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
+		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
+			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
 				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
 			}
 		}
@@ -241,7 +242,7 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 	CacheMode := d.vfs.Opt.CacheMode
 	if writing &&
 		(CacheMode < vfscommon.CacheModeMinimal ||
-			(CacheMode == vfscommon.CacheModeMinimal && !f.d.vfs.cache.Exists(oldPath))) {
+			(CacheMode == vfscommon.CacheModeMinimal && !destDir.vfs.cache.Exists(oldPath))) {
 		fs.Debugf(oldPath, "File is currently open, delaying rename %p", f)
 		f.mu.Lock()
 		f.pendingRenameFun = renameCall
@@ -342,13 +343,18 @@ func (f *File) Size() int64 {
 
 // SetModTime sets the modtime for the file
 func (f *File) SetModTime(modTime time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	f.pendingModTime = modTime
+
+	// set the time of the file in the cache
+	if f.d.vfs.cache != nil && f.d.vfs.cache.Exists(f._path()) {
+		f.d.vfs.cache.SetModTime(f._path(), f.pendingModTime)
+	}
 
 	// Only update the ModTime when there are no writers, setObject will do it
 	if !f._writingInProgress() {
@@ -365,7 +371,6 @@ func (f *File) _applyPendingModTime() error {
 	if f.pendingModTime.IsZero() {
 		return nil
 	}
-
 	defer func() { f.pendingModTime = time.Time{} }()
 
 	if f.o == nil {
@@ -376,17 +381,12 @@ func (f *File) _applyPendingModTime() error {
 	err := f.o.SetModTime(context.TODO(), f.pendingModTime)
 	switch err {
 	case nil:
-		fs.Debugf(f._path(), "File._applyPendingModTime OK")
+		fs.Debugf(f.o, "Applied pending mod time %v OK", f.pendingModTime)
 	case fs.ErrorCantSetModTime, fs.ErrorCantSetModTimeWithoutDelete:
 		// do nothing, in order to not break "touch somefile" if it exists already
 	default:
-		fs.Debugf(f._path(), "File._applyPendingModTime error: %v", err)
+		fs.Errorf(f.o, "Failed to apply pending mod time %v: %v", f.pendingModTime, err)
 		return err
-	}
-
-	// set the time of the file in the cache
-	if f.d.vfs.cache != nil {
-		f.d.vfs.cache.SetModTime(f._path(), f.pendingModTime)
 	}
 
 	return nil
@@ -408,10 +408,11 @@ func (f *File) setObject(o fs.Object) {
 	f.mu.Lock()
 	f.o = o
 	_ = f._applyPendingModTime()
+	d := f.d
 	f.mu.Unlock()
 
 	// Release File.mu before calling Dir method
-	f.d.addObject(f)
+	d.addObject(f)
 }
 
 // Update the object but don't update the directory cache - for use by
@@ -535,7 +536,7 @@ func (f *File) Remove() (err error) {
 
 	// Remove the object from the cache
 	wasWriting := false
-	if d.vfs.cache != nil {
+	if d.vfs.cache != nil && d.vfs.cache.Exists(f.Path()) {
 		wasWriting = d.vfs.cache.Remove(f.Path())
 	}
 

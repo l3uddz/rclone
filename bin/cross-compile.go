@@ -280,7 +280,7 @@ func stripVersion(goarch string) string {
 
 // build the binary in dir returning success or failure
 func compileArch(version, goos, goarch, dir string) bool {
-	log.Printf("Compiling %s/%s", goos, goarch)
+	log.Printf("Compiling %s/%s into %s", goos, goarch, dir)
 	output := filepath.Join(dir, "rclone")
 	if goos == "windows" {
 		output += ".exe"
@@ -298,7 +298,6 @@ func compileArch(version, goos, goarch, dir string) bool {
 		"go", "build",
 		"--ldflags", "-s -X github.com/rclone/rclone/fs.Version=" + version,
 		"-trimpath",
-		"-i",
 		"-o", output,
 		"-tags", *tags,
 		"..",
@@ -325,7 +324,7 @@ func compileArch(version, goos, goarch, dir string) bool {
 			artifacts := []string{buildZip(dir)}
 			// build a .deb and .rpm if appropriate
 			if goos == "linux" {
-				artifacts = append(artifacts, buildDebAndRpm(dir, version, goarch)...)
+				artifacts = append(artifacts, buildDebAndRpm(dir, version, stripVersion(goarch))...)
 			}
 			if *copyAs != "" {
 				for _, artifact := range artifacts {

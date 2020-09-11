@@ -58,7 +58,7 @@ import (
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "s3",
-		Description: "Amazon S3 Compliant Storage Provider (AWS, Alibaba, Ceph, Digital Ocean, Dreamhost, IBM COS, Minio, etc)",
+		Description: "Amazon S3 Compliant Storage Provider (AWS, Alibaba, Ceph, Digital Ocean, Dreamhost, IBM COS, Minio, Tencent COS, etc)",
 		NewFs:       NewFs,
 		CommandHelp: commandHelp,
 		Options: []fs.Option{{
@@ -94,6 +94,9 @@ func init() {
 			}, {
 				Value: "StackPath",
 				Help:  "StackPath Object Storage",
+			}, {
+				Value: "TencentCOS",
+				Help:  "Tencent Cloud Object Storage (COS)",
 			}, {
 				Value: "Wasabi",
 				Help:  "Wasabi Object Storage",
@@ -185,7 +188,7 @@ func init() {
 		}, {
 			Name:     "region",
 			Help:     "Region to connect to.\nLeave blank if you are using an S3 clone and you don't have a region.",
-			Provider: "!AWS,Alibaba,Scaleway",
+			Provider: "!AWS,Alibaba,Scaleway,TencentCOS",
 			Examples: []fs.OptionExample{{
 				Value: "",
 				Help:  "Use this if unsure. Will use v4 signatures and an empty region.",
@@ -202,107 +205,191 @@ func init() {
 			Help:     "Endpoint for IBM COS S3 API.\nSpecify if using an IBM COS On Premise.",
 			Provider: "IBMCOS",
 			Examples: []fs.OptionExample{{
-				Value: "s3-api.us-geo.objectstorage.softlayer.net",
+				Value: "s3.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region Endpoint",
 			}, {
-				Value: "s3-api.dal.us-geo.objectstorage.softlayer.net",
+				Value: "s3.dal.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region Dallas Endpoint",
 			}, {
-				Value: "s3-api.wdc-us-geo.objectstorage.softlayer.net",
+				Value: "s3.wdc.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region Washington DC Endpoint",
 			}, {
-				Value: "s3-api.sjc-us-geo.objectstorage.softlayer.net",
+				Value: "s3.sjc.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region San Jose Endpoint",
 			}, {
-				Value: "s3-api.us-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region Private Endpoint",
 			}, {
-				Value: "s3-api.dal-us-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.dal.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region Dallas Private Endpoint",
 			}, {
-				Value: "s3-api.wdc-us-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.wdc.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region Washington DC Private Endpoint",
 			}, {
-				Value: "s3-api.sjc-us-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.sjc.us.cloud-object-storage.appdomain.cloud",
 				Help:  "US Cross Region San Jose Private Endpoint",
 			}, {
-				Value: "s3.us-east.objectstorage.softlayer.net",
+				Value: "s3.us-east.cloud-object-storage.appdomain.cloud",
 				Help:  "US Region East Endpoint",
 			}, {
-				Value: "s3.us-east.objectstorage.service.networklayer.com",
+				Value: "s3.private.us-east.cloud-object-storage.appdomain.cloud",
 				Help:  "US Region East Private Endpoint",
 			}, {
-				Value: "s3.us-south.objectstorage.softlayer.net",
+				Value: "s3.us-south.cloud-object-storage.appdomain.cloud",
 				Help:  "US Region South Endpoint",
 			}, {
-				Value: "s3.us-south.objectstorage.service.networklayer.com",
+				Value: "s3.private.us-south.cloud-object-storage.appdomain.cloud",
 				Help:  "US Region South Private Endpoint",
 			}, {
-				Value: "s3.eu-geo.objectstorage.softlayer.net",
+				Value: "s3.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Endpoint",
 			}, {
-				Value: "s3.fra-eu-geo.objectstorage.softlayer.net",
+				Value: "s3.fra.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Frankfurt Endpoint",
 			}, {
-				Value: "s3.mil-eu-geo.objectstorage.softlayer.net",
+				Value: "s3.mil.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Milan Endpoint",
 			}, {
-				Value: "s3.ams-eu-geo.objectstorage.softlayer.net",
+				Value: "s3.ams.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Amsterdam Endpoint",
 			}, {
-				Value: "s3.eu-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Private Endpoint",
 			}, {
-				Value: "s3.fra-eu-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.fra.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Frankfurt Private Endpoint",
 			}, {
-				Value: "s3.mil-eu-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.mil.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Milan Private Endpoint",
 			}, {
-				Value: "s3.ams-eu-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.ams.eu.cloud-object-storage.appdomain.cloud",
 				Help:  "EU Cross Region Amsterdam Private Endpoint",
 			}, {
-				Value: "s3.eu-gb.objectstorage.softlayer.net",
+				Value: "s3.eu-gb.cloud-object-storage.appdomain.cloud",
 				Help:  "Great Britain Endpoint",
 			}, {
-				Value: "s3.eu-gb.objectstorage.service.networklayer.com",
+				Value: "s3.private.eu-gb.cloud-object-storage.appdomain.cloud",
 				Help:  "Great Britain Private Endpoint",
 			}, {
-				Value: "s3.ap-geo.objectstorage.softlayer.net",
+				Value: "s3.eu-de.cloud-object-storage.appdomain.cloud",
+				Help:  "EU Region DE Endpoint",
+			}, {
+				Value: "s3.private.eu-de.cloud-object-storage.appdomain.cloud",
+				Help:  "EU Region DE Private Endpoint",
+			}, {
+				Value: "s3.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional Endpoint",
 			}, {
-				Value: "s3.tok-ap-geo.objectstorage.softlayer.net",
+				Value: "s3.tok.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional Tokyo Endpoint",
 			}, {
-				Value: "s3.hkg-ap-geo.objectstorage.softlayer.net",
+				Value: "s3.hkg.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional HongKong Endpoint",
 			}, {
-				Value: "s3.seo-ap-geo.objectstorage.softlayer.net",
+				Value: "s3.seo.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional Seoul Endpoint",
 			}, {
-				Value: "s3.ap-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional Private Endpoint",
 			}, {
-				Value: "s3.tok-ap-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.tok.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional Tokyo Private Endpoint",
 			}, {
-				Value: "s3.hkg-ap-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.hkg.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional HongKong Private Endpoint",
 			}, {
-				Value: "s3.seo-ap-geo.objectstorage.service.networklayer.com",
+				Value: "s3.private.seo.ap.cloud-object-storage.appdomain.cloud",
 				Help:  "APAC Cross Regional Seoul Private Endpoint",
 			}, {
-				Value: "s3.mel01.objectstorage.softlayer.net",
+				Value: "s3.jp-tok.cloud-object-storage.appdomain.cloud",
+				Help:  "APAC Region Japan Endpoint",
+			}, {
+				Value: "s3.private.jp-tok.cloud-object-storage.appdomain.cloud",
+				Help:  "APAC Region Japan Private Endpoint",
+			}, {
+				Value: "s3.au-syd.cloud-object-storage.appdomain.cloud",
+				Help:  "APAC Region Australia Endpoint",
+			}, {
+				Value: "s3.private.au-syd.cloud-object-storage.appdomain.cloud",
+				Help:  "APAC Region Australia Private Endpoint",
+			}, {
+				Value: "s3.ams03.cloud-object-storage.appdomain.cloud",
+				Help:  "Amsterdam Single Site Endpoint",
+			}, {
+				Value: "s3.private.ams03.cloud-object-storage.appdomain.cloud",
+				Help:  "Amsterdam Single Site Private Endpoint",
+			}, {
+				Value: "s3.che01.cloud-object-storage.appdomain.cloud",
+				Help:  "Chennai Single Site Endpoint",
+			}, {
+				Value: "s3.private.che01.cloud-object-storage.appdomain.cloud",
+				Help:  "Chennai Single Site Private Endpoint",
+			}, {
+				Value: "s3.mel01.cloud-object-storage.appdomain.cloud",
 				Help:  "Melbourne Single Site Endpoint",
 			}, {
-				Value: "s3.mel01.objectstorage.service.networklayer.com",
+				Value: "s3.private.mel01.cloud-object-storage.appdomain.cloud",
 				Help:  "Melbourne Single Site Private Endpoint",
 			}, {
-				Value: "s3.tor01.objectstorage.softlayer.net",
+				Value: "s3.osl01.cloud-object-storage.appdomain.cloud",
+				Help:  "Oslo Single Site Endpoint",
+			}, {
+				Value: "s3.private.osl01.cloud-object-storage.appdomain.cloud",
+				Help:  "Oslo Single Site Private Endpoint",
+			}, {
+				Value: "s3.tor01.cloud-object-storage.appdomain.cloud",
 				Help:  "Toronto Single Site Endpoint",
 			}, {
-				Value: "s3.tor01.objectstorage.service.networklayer.com",
+				Value: "s3.private.tor01.cloud-object-storage.appdomain.cloud",
 				Help:  "Toronto Single Site Private Endpoint",
+			}, {
+				Value: "s3.seo01.cloud-object-storage.appdomain.cloud",
+				Help:  "Seoul Single Site Endpoint",
+			}, {
+				Value: "s3.private.seo01.cloud-object-storage.appdomain.cloud",
+				Help:  "Seoul Single Site Private Endpoint",
+			}, {
+				Value: "s3.mon01.cloud-object-storage.appdomain.cloud",
+				Help:  "Montreal Single Site Endpoint",
+			}, {
+				Value: "s3.private.mon01.cloud-object-storage.appdomain.cloud",
+				Help:  "Montreal Single Site Private Endpoint",
+			}, {
+				Value: "s3.mex01.cloud-object-storage.appdomain.cloud",
+				Help:  "Mexico Single Site Endpoint",
+			}, {
+				Value: "s3.private.mex01.cloud-object-storage.appdomain.cloud",
+				Help:  "Mexico Single Site Private Endpoint",
+			}, {
+				Value: "s3.sjc04.cloud-object-storage.appdomain.cloud",
+				Help:  "San Jose Single Site Endpoint",
+			}, {
+				Value: "s3.private.sjc04.cloud-object-storage.appdomain.cloud",
+				Help:  "San Jose Single Site Private Endpoint",
+			}, {
+				Value: "s3.mil01.cloud-object-storage.appdomain.cloud",
+				Help:  "Milan Single Site Endpoint",
+			}, {
+				Value: "s3.private.mil01.cloud-object-storage.appdomain.cloud",
+				Help:  "Milan Single Site Private Endpoint",
+			}, {
+				Value: "s3.hkg02.cloud-object-storage.appdomain.cloud",
+				Help:  "Hong Kong Single Site Endpoint",
+			}, {
+				Value: "s3.private.hkg02.cloud-object-storage.appdomain.cloud",
+				Help:  "Hong Kong Single Site Private Endpoint",
+			}, {
+				Value: "s3.par01.cloud-object-storage.appdomain.cloud",
+				Help:  "Paris Single Site Endpoint",
+			}, {
+				Value: "s3.private.par01.cloud-object-storage.appdomain.cloud",
+				Help:  "Paris Single Site Private Endpoint",
+			}, {
+				Value: "s3.sng01.cloud-object-storage.appdomain.cloud",
+				Help:  "Singapore Single Site Endpoint",
+			}, {
+				Value: "s3.private.sng01.cloud-object-storage.appdomain.cloud",
+				Help:  "Singapore Single Site Private Endpoint",
 			}},
 		}, {
 			// oss endpoints: https://help.aliyun.com/document_detail/31837.html
@@ -393,9 +480,72 @@ func init() {
 				Help:  "EU Endpoint",
 			}},
 		}, {
+			// cos endpoints: https://intl.cloud.tencent.com/document/product/436/6224
+			Name:     "endpoint",
+			Help:     "Endpoint for Tencent COS API.",
+			Provider: "TencentCOS",
+			Examples: []fs.OptionExample{{
+				Value: "cos.ap-beijing.myqcloud.com",
+				Help:  "Beijing Region.",
+			}, {
+				Value: "cos.ap-nanjing.myqcloud.com",
+				Help:  "Nanjing Region.",
+			}, {
+				Value: "cos.ap-shanghai.myqcloud.com",
+				Help:  "Shanghai Region.",
+			}, {
+				Value: "cos.ap-guangzhou.myqcloud.com",
+				Help:  "Guangzhou Region.",
+			}, {
+				Value: "cos.ap-nanjing.myqcloud.com",
+				Help:  "Nanjing Region.",
+			}, {
+				Value: "cos.ap-chengdu.myqcloud.com",
+				Help:  "Chengdu Region.",
+			}, {
+				Value: "cos.ap-chongqing.myqcloud.com",
+				Help:  "Chongqing Region.",
+			}, {
+				Value: "cos.ap-hongkong.myqcloud.com",
+				Help:  "Hong Kong (China) Region.",
+			}, {
+				Value: "cos.ap-singapore.myqcloud.com",
+				Help:  "Singapore Region.",
+			}, {
+				Value: "cos.ap-mumbai.myqcloud.com",
+				Help:  "Mumbai Region.",
+			}, {
+				Value: "cos.ap-seoul.myqcloud.com",
+				Help:  "Seoul Region.",
+			}, {
+				Value: "cos.ap-bangkok.myqcloud.com",
+				Help:  "Bangkok Region.",
+			}, {
+				Value: "cos.ap-tokyo.myqcloud.com",
+				Help:  "Tokyo Region.",
+			}, {
+				Value: "cos.na-siliconvalley.myqcloud.com",
+				Help:  "Silicon Valley Region.",
+			}, {
+				Value: "cos.na-ashburn.myqcloud.com",
+				Help:  "Virginia Region.",
+			}, {
+				Value: "cos.na-toronto.myqcloud.com",
+				Help:  "Toronto Region.",
+			}, {
+				Value: "cos.eu-frankfurt.myqcloud.com",
+				Help:  "Frankfurt Region.",
+			}, {
+				Value: "cos.eu-moscow.myqcloud.com",
+				Help:  "Moscow Region.",
+			}, {
+				Value: "cos.accelerate.myqcloud.com",
+				Help:  "Use Tencent COS Accelerate Endpoint.",
+			}},
+		}, {
 			Name:     "endpoint",
 			Help:     "Endpoint for S3 API.\nRequired when using an S3 clone.",
-			Provider: "!AWS,IBMCOS,Alibaba,Scaleway,StackPath",
+			Provider: "!AWS,IBMCOS,TencentCOS,Alibaba,Scaleway,StackPath",
 			Examples: []fs.OptionExample{{
 				Value:    "objects-us-east-1.dream.io",
 				Help:     "Dream Objects endpoint",
@@ -582,7 +732,7 @@ func init() {
 		}, {
 			Name:     "location_constraint",
 			Help:     "Location constraint - must be set to match the Region.\nLeave blank if not sure. Used when creating buckets only.",
-			Provider: "!AWS,IBMCOS,Alibaba,Scaleway,StackPath",
+			Provider: "!AWS,IBMCOS,Alibaba,Scaleway,StackPath,TencentCOS",
 		}, {
 			Name: "acl",
 			Help: `Canned ACL used when creating buckets and storing or copying objects.
@@ -594,9 +744,13 @@ For more info visit https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview
 Note that this ACL is applied when server side copying objects as S3
 doesn't copy the ACL from the source but rather writes a fresh one.`,
 			Examples: []fs.OptionExample{{
+				Value:    "default",
+				Help:     "Owner gets Full_CONTROL. No one else has access rights (default).",
+				Provider: "TencentCOS",
+			}, {
 				Value:    "private",
 				Help:     "Owner gets FULL_CONTROL. No one else has access rights (default).",
-				Provider: "!IBMCOS",
+				Provider: "!IBMCOS,TencentCOS",
 			}, {
 				Value:    "public-read",
 				Help:     "Owner gets FULL_CONTROL. The AllUsers group gets READ access.",
@@ -759,6 +913,24 @@ isn't set then "acl" is used instead.`,
 				Help:  "Infrequent access storage mode.",
 			}},
 		}, {
+			// Mapping from here: https://intl.cloud.tencent.com/document/product/436/30925
+			Name:     "storage_class",
+			Help:     "The storage class to use when storing new objects in Tencent COS.",
+			Provider: "TencentCOS",
+			Examples: []fs.OptionExample{{
+				Value: "",
+				Help:  "Default",
+			}, {
+				Value: "STANDARD",
+				Help:  "Standard storage class",
+			}, {
+				Value: "ARCHIVE",
+				Help:  "Archive storage mode.",
+			}, {
+				Value: "STANDARD_IA",
+				Help:  "Infrequent access storage mode.",
+			}},
+		}, {
 			// Mapping from here: https://www.scaleway.com/en/docs/object-storage-glacier/#-Scaleway-Storage-Classes
 			Name:     "storage_class",
 			Help:     "The storage class to use when storing new objects in S3.",
@@ -891,7 +1063,7 @@ if false then rclone will use virtual path style. See [the AWS S3
 docs](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingBucket.html#access-bucket-intro)
 for more info.
 
-Some providers (eg AWS, Aliyun OSS or Netease COS) require this set to
+Some providers (eg AWS, Aliyun OSS, Netease COS or Tencent COS) require this set to
 false - rclone will do this automatically based on the provider
 setting.`,
 			Default:  true,
@@ -980,10 +1152,12 @@ This option controls how often unused buffers will be removed from the pool.`,
 
 // Constants
 const (
-	metaMtime           = "Mtime"                // the meta key to store mtime in - eg X-Amz-Meta-Mtime
-	metaMD5Hash         = "Md5chksum"            // the meta key to store md5hash in
-	maxSizeForCopy      = 5 * 1024 * 1024 * 1024 // The maximum size of object we can COPY
-	maxUploadParts      = 10000                  // maximum allowed number of parts in a multi-part upload
+	metaMtime   = "Mtime"     // the meta key to store mtime in - eg X-Amz-Meta-Mtime
+	metaMD5Hash = "Md5chksum" // the meta key to store md5hash in
+	// The maximum size of object we can COPY - this should be 5GiB but is < 5GB for b2 compatibility
+	// See https://forum.rclone.org/t/copying-files-within-a-b2-bucket/16680/76
+	maxSizeForCopy      = 4768 * 1024 * 1024
+	maxUploadParts      = 10000 // maximum allowed number of parts in a multi-part upload
 	minChunkSize        = fs.SizeSuffix(1024 * 1024 * 5)
 	defaultUploadCutoff = fs.SizeSuffix(200 * 1024 * 1024)
 	maxUploadCutoff     = fs.SizeSuffix(5 * 1024 * 1024 * 1024)
@@ -1219,7 +1393,7 @@ func s3Connection(opt *Options) (*s3.S3, *session.Session, error) {
 	if opt.Region == "" {
 		opt.Region = "us-east-1"
 	}
-	if opt.Provider == "AWS" || opt.Provider == "Alibaba" || opt.Provider == "Netease" || opt.Provider == "Scaleway" || opt.UseAccelerateEndpoint {
+	if opt.Provider == "AWS" || opt.Provider == "Alibaba" || opt.Provider == "Netease" || opt.Provider == "Scaleway" || opt.Provider == "TencentCOS" || opt.UseAccelerateEndpoint {
 		opt.ForcePathStyle = false
 	}
 	if opt.Provider == "Scaleway" && opt.MaxUploadParts > 1000 {
@@ -1501,7 +1675,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 	//
 	// So we enable only on providers we know supports it properly, all others can retry when a
 	// XML Syntax error is detected.
-	var urlEncodeListings = (f.opt.Provider == "AWS" || f.opt.Provider == "Wasabi" || f.opt.Provider == "Alibaba" || f.opt.Provider == "Minio")
+	var urlEncodeListings = (f.opt.Provider == "AWS" || f.opt.Provider == "Wasabi" || f.opt.Provider == "Alibaba" || f.opt.Provider == "Minio" || f.opt.Provider == "TencentCOS")
 	for {
 		// FIXME need to implement ALL loop
 		req := s3.ListObjectsInput{
@@ -1883,7 +2057,7 @@ func pathEscape(s string) string {
 //
 // It adds the boiler plate to the req passed in and calls the s3
 // method
-func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPath, srcBucket, srcPath string, srcSize int64) error {
+func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPath, srcBucket, srcPath string, src *Object) error {
 	req.Bucket = &dstBucket
 	req.ACL = &f.opt.ACL
 	req.Key = &dstPath
@@ -1899,8 +2073,8 @@ func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPa
 		req.StorageClass = &f.opt.StorageClass
 	}
 
-	if srcSize >= int64(f.opt.CopyCutoff) {
-		return f.copyMultipart(ctx, req, dstBucket, dstPath, srcBucket, srcPath, srcSize)
+	if src.bytes >= int64(f.opt.CopyCutoff) {
+		return f.copyMultipart(ctx, req, dstBucket, dstPath, srcBucket, srcPath, src)
 	}
 	return f.pacer.Call(func() (bool, error) {
 		_, err := f.c.CopyObjectWithContext(ctx, req)
@@ -1921,14 +2095,33 @@ func calculateRange(partSize, partIndex, numParts, totalSize int64) string {
 	return fmt.Sprintf("bytes=%v-%v", start, ends)
 }
 
-func (f *Fs) copyMultipart(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPath, srcBucket, srcPath string, srcSize int64) (err error) {
+func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dstBucket, dstPath, srcBucket, srcPath string, src *Object) (err error) {
+	info, err := src.headObject(ctx)
+	if err != nil {
+		return err
+	}
+
+	req := &s3.CreateMultipartUploadInput{}
+
+	// Fill in the request from the head info
+	structs.SetFrom(req, info)
+
+	// If copy metadata was set then set the Metadata to that read
+	// from the head request
+	if aws.StringValue(copyReq.MetadataDirective) == s3.MetadataDirectiveCopy {
+		copyReq.Metadata = info.Metadata
+	}
+
+	// Overwrite any from the copyReq
+	structs.SetFrom(req, copyReq)
+
+	req.Bucket = &dstBucket
+	req.Key = &dstPath
+
 	var cout *s3.CreateMultipartUploadOutput
 	if err := f.pacer.Call(func() (bool, error) {
 		var err error
-		cout, err = f.c.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
-			Bucket: &dstBucket,
-			Key:    &dstPath,
-		})
+		cout, err = f.c.CreateMultipartUploadWithContext(ctx, req)
 		return f.shouldRetry(err)
 	}); err != nil {
 		return err
@@ -1937,7 +2130,7 @@ func (f *Fs) copyMultipart(ctx context.Context, req *s3.CopyObjectInput, dstBuck
 
 	defer atexit.OnError(&err, func() {
 		// Try to abort the upload, but ignore the error.
-		fs.Debugf(nil, "Cancelling multipart copy")
+		fs.Debugf(src, "Cancelling multipart copy")
 		_ = f.pacer.Call(func() (bool, error) {
 			_, err := f.c.AbortMultipartUploadWithContext(context.Background(), &s3.AbortMultipartUploadInput{
 				Bucket:       &dstBucket,
@@ -1949,33 +2142,23 @@ func (f *Fs) copyMultipart(ctx context.Context, req *s3.CopyObjectInput, dstBuck
 		})
 	})()
 
+	srcSize := src.bytes
 	partSize := int64(f.opt.CopyCutoff)
 	numParts := (srcSize-1)/partSize + 1
+
+	fs.Debugf(src, "Starting  multipart copy with %d parts", numParts)
 
 	var parts []*s3.CompletedPart
 	for partNum := int64(1); partNum <= numParts; partNum++ {
 		if err := f.pacer.Call(func() (bool, error) {
 			partNum := partNum
-			uploadPartReq := &s3.UploadPartCopyInput{
-				Bucket:          &dstBucket,
-				Key:             &dstPath,
-				PartNumber:      &partNum,
-				UploadId:        uid,
-				CopySourceRange: aws.String(calculateRange(partSize, partNum-1, numParts, srcSize)),
-				// Args copy from req
-				CopySource:                     req.CopySource,
-				CopySourceIfMatch:              req.CopySourceIfMatch,
-				CopySourceIfModifiedSince:      req.CopySourceIfModifiedSince,
-				CopySourceIfNoneMatch:          req.CopySourceIfNoneMatch,
-				CopySourceIfUnmodifiedSince:    req.CopySourceIfUnmodifiedSince,
-				CopySourceSSECustomerAlgorithm: req.CopySourceSSECustomerAlgorithm,
-				CopySourceSSECustomerKey:       req.CopySourceSSECustomerKey,
-				CopySourceSSECustomerKeyMD5:    req.CopySourceSSECustomerKeyMD5,
-				RequestPayer:                   req.RequestPayer,
-				SSECustomerAlgorithm:           req.SSECustomerAlgorithm,
-				SSECustomerKey:                 req.SSECustomerKey,
-				SSECustomerKeyMD5:              req.SSECustomerKeyMD5,
-			}
+			uploadPartReq := &s3.UploadPartCopyInput{}
+			structs.SetFrom(uploadPartReq, copyReq)
+			uploadPartReq.Bucket = &dstBucket
+			uploadPartReq.Key = &dstPath
+			uploadPartReq.PartNumber = &partNum
+			uploadPartReq.UploadId = uid
+			uploadPartReq.CopySourceRange = aws.String(calculateRange(partSize, partNum-1, numParts, srcSize))
 			uout, err := f.c.UploadPartCopyWithContext(ctx, uploadPartReq)
 			if err != nil {
 				return f.shouldRetry(err)
@@ -2028,7 +2211,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	req := s3.CopyObjectInput{
 		MetadataDirective: aws.String(s3.MetadataDirectiveCopy),
 	}
-	err = f.copy(ctx, &req, dstBucket, dstPath, srcBucket, srcPath, srcObj.Size())
+	err = f.copy(ctx, &req, dstBucket, dstPath, srcBucket, srcPath, srcObj)
 	if err != nil {
 		return nil, err
 	}
@@ -2425,19 +2608,12 @@ func (o *Object) Size() int64 {
 	return o.bytes
 }
 
-// readMetaData gets the metadata if it hasn't already been fetched
-//
-// it also sets the info
-func (o *Object) readMetaData(ctx context.Context) (err error) {
-	if o.meta != nil {
-		return nil
-	}
+func (o *Object) headObject(ctx context.Context) (resp *s3.HeadObjectOutput, err error) {
 	bucket, bucketPath := o.split()
 	req := s3.HeadObjectInput{
 		Bucket: &bucket,
 		Key:    &bucketPath,
 	}
-	var resp *s3.HeadObjectOutput
 	err = o.fs.pacer.Call(func() (bool, error) {
 		var err error
 		resp, err = o.fs.c.HeadObjectWithContext(ctx, &req)
@@ -2446,17 +2622,26 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 	if err != nil {
 		if awsErr, ok := err.(awserr.RequestFailure); ok {
 			if awsErr.StatusCode() == http.StatusNotFound {
-				// NotFound indicates bucket was OK
-				// NoSuchBucket would be returned if bucket was bad
-				if awsErr.Code() == "NotFound" {
-					o.fs.cache.MarkOK(bucket)
-				}
-				return fs.ErrorObjectNotFound
+				return nil, fs.ErrorObjectNotFound
 			}
 		}
-		return err
+		return nil, err
 	}
 	o.fs.cache.MarkOK(bucket)
+	return resp, nil
+}
+
+// readMetaData gets the metadata if it hasn't already been fetched
+//
+// it also sets the info
+func (o *Object) readMetaData(ctx context.Context) (err error) {
+	if o.meta != nil {
+		return nil
+	}
+	resp, err := o.headObject(ctx)
+	if err != nil {
+		return err
+	}
 	var size int64
 	// Ignore missing Content-Length assuming it is 0
 	// Some versions of ceph do this due their apache proxies
@@ -2527,7 +2712,7 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		Metadata:          o.meta,
 		MetadataDirective: aws.String(s3.MetadataDirectiveReplace), // replace metadata with that passed in
 	}
-	return o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o.bytes)
+	return o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o)
 }
 
 // Storable raturns a boolean indicating if this object is storable
@@ -2967,7 +3152,7 @@ func (o *Object) SetTier(tier string) (err error) {
 		MetadataDirective: aws.String(s3.MetadataDirectiveCopy),
 		StorageClass:      aws.String(tier),
 	}
-	err = o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o.bytes)
+	err = o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o)
 	if err != nil {
 		return err
 	}

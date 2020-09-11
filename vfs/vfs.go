@@ -216,7 +216,8 @@ func New(f fs.Fs, opt *vfscommon.Options) *VFS {
 	vfs.root = newDir(vfs, f, nil, fsDir)
 
 	// Start polling function
-	if do := vfs.f.Features().ChangeNotify; do != nil {
+	features := vfs.f.Features()
+	if do := features.ChangeNotify; do != nil {
 		vfs.pollChan = make(chan time.Duration)
 		do(context.TODO(), vfs.root.changeNotify, vfs.pollChan)
 		vfs.pollChan <- vfs.Opt.PollInterval
@@ -224,12 +225,17 @@ func New(f fs.Fs, opt *vfscommon.Options) *VFS {
 		fs.Infof(f, "poll-interval is not supported by this remote")
 	}
 
+	// Warn if can't stream
+	if !vfs.Opt.ReadOnly && vfs.Opt.CacheMode < vfscommon.CacheModeWrites && features.PutStream == nil {
+		fs.Logf(f, "--vfs-cache-mode writes or full is recommended for this remote as it can't stream")
+	}
+
 	vfs.SetCacheMode(vfs.Opt.CacheMode)
 
 	// Pin the Fs into the cache so that when we use cache.NewFs
 	// with the same remote string we get this one. The Pin is
-	// removed by Shutdown
-	cache.Pin(f)
+	// removed when the vfs is finalized
+	cache.PinUntilFinalized(f, vfs)
 
 	return vfs
 }
@@ -286,9 +292,6 @@ func (vfs *VFS) Shutdown() {
 	if atomic.AddInt32(&vfs.inUse, -1) > 0 {
 		return
 	}
-
-	// Unpin the Fs from the cache
-	cache.Unpin(vfs.f)
 
 	// Remove from active cache
 	activeMu.Lock()
