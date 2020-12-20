@@ -149,7 +149,7 @@ In this mode all reads and writes are buffered to and from disk. When
 data is read from the remote this is buffered to disk as well.
 
 In this mode the files in the cache will be sparse files and rclone
-will keep track of which bits of the files it has dowloaded.
+will keep track of which bits of the files it has downloaded.
 
 So if an application only reads the starts of each file, then rclone
 will only buffer the start of the file. These files will appear to be
@@ -165,6 +165,11 @@ whereas the --vfs-read-ahead is buffered on disk.
 
 When using this mode it is recommended that --buffer-size is not set
 too big and --vfs-read-ahead is set large if required.
+
+**IMPORTANT** not all file systems support sparse files. In particular
+FAT/exFAT do not. Rclone will perform very badly if the cache
+directory is on a filesystem which doesn't support sparse files and it
+will log an ERROR message if one is detected.
 
 ### VFS Performance
 

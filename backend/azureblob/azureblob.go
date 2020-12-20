@@ -10,8 +10,10 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
@@ -33,6 +36,7 @@ import (
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/bucket"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/env"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/pool"
 	"github.com/rclone/rclone/lib/readers"
@@ -74,6 +78,20 @@ func init() {
 		Options: []fs.Option{{
 			Name: "account",
 			Help: "Storage Account Name (leave blank to use SAS URL or Emulator)",
+		}, {
+			Name: "service_principal_file",
+			Help: `Path to file containing credentials for use with a service principal.
+
+Leave blank normally. Needed only if you want to use a service principal instead of interactive login.
+
+    $ az sp create-for-rbac --name "<name>" \
+      --role "Storage Blob Data Owner" \
+      --scopes "/subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<storage-account>/blobServices/default/containers/<container>" \
+      > azure-principal.json
+
+See [Use Azure CLI to assign an Azure role for access to blob and queue data](https://docs.microsoft.com/en-us/azure/storage/common/storage-auth-aad-rbac-cli)
+for more details.
+`,
 		}, {
 			Name: "key",
 			Help: "Storage Account Key (leave blank to use SAS URL or Emulator)",
@@ -167,19 +185,20 @@ This option controls how often unused buffers will be removed from the pool.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	Account             string               `config:"account"`
-	Key                 string               `config:"key"`
-	Endpoint            string               `config:"endpoint"`
-	SASURL              string               `config:"sas_url"`
-	UploadCutoff        fs.SizeSuffix        `config:"upload_cutoff"`
-	ChunkSize           fs.SizeSuffix        `config:"chunk_size"`
-	ListChunkSize       uint                 `config:"list_chunk"`
-	AccessTier          string               `config:"access_tier"`
-	UseEmulator         bool                 `config:"use_emulator"`
-	DisableCheckSum     bool                 `config:"disable_checksum"`
-	MemoryPoolFlushTime fs.Duration          `config:"memory_pool_flush_time"`
-	MemoryPoolUseMmap   bool                 `config:"memory_pool_use_mmap"`
-	Enc                 encoder.MultiEncoder `config:"encoding"`
+	Account              string               `config:"account"`
+	ServicePrincipalFile string               `config:"service_principal_file"`
+	Key                  string               `config:"key"`
+	Endpoint             string               `config:"endpoint"`
+	SASURL               string               `config:"sas_url"`
+	UploadCutoff         fs.SizeSuffix        `config:"upload_cutoff"`
+	ChunkSize            fs.SizeSuffix        `config:"chunk_size"`
+	ListChunkSize        uint                 `config:"list_chunk"`
+	AccessTier           string               `config:"access_tier"`
+	UseEmulator          bool                 `config:"use_emulator"`
+	DisableCheckSum      bool                 `config:"disable_checksum"`
+	MemoryPoolFlushTime  fs.Duration          `config:"memory_pool_flush_time"`
+	MemoryPoolUseMmap    bool                 `config:"memory_pool_use_mmap"`
+	Enc                  encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote azure server
@@ -187,6 +206,7 @@ type Fs struct {
 	name          string                          // name of this remote
 	root          string                          // the path we are working on if any
 	opt           Options                         // parsed config options
+	ci            *fs.ConfigInfo                  // global config
 	features      *fs.Features                    // optional features
 	client        *http.Client                    // http client we are using
 	svcURL        *azblob.ServiceURL              // reference to serviceURL
@@ -274,7 +294,7 @@ func validateAccessTier(tier string) bool {
 
 // retryErrorCodes is a slice of error codes that we will retry
 var retryErrorCodes = []int{
-	401, // Unauthorized (eg "Token has expired")
+	401, // Unauthorized (e.g. "Token has expired")
 	408, // Request Timeout
 	429, // Rate exceeded.
 	500, // Get occasional 500 Internal Server Error
@@ -353,6 +373,50 @@ func httpClientFactory(client *http.Client) pipeline.Factory {
 	})
 }
 
+type servicePrincipalCredentials struct {
+	AppID    string `json:"appId"`
+	Password string `json:"password"`
+	Tenant   string `json:"tenant"`
+}
+
+const azureActiveDirectoryEndpoint = "https://login.microsoftonline.com/"
+const azureStorageEndpoint = "https://storage.azure.com/"
+
+// newServicePrincipalTokenRefresher takes the client ID and secret, and returns a refresh-able access token.
+func newServicePrincipalTokenRefresher(ctx context.Context, credentialsData []byte) (azblob.TokenRefresher, error) {
+	var spCredentials servicePrincipalCredentials
+	if err := json.Unmarshal(credentialsData, &spCredentials); err != nil {
+		return nil, errors.Wrap(err, "error parsing credentials from JSON file")
+	}
+	oauthConfig, err := adal.NewOAuthConfig(azureActiveDirectoryEndpoint, spCredentials.Tenant)
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating oauth config")
+	}
+
+	// Create service principal token for Azure Storage.
+	servicePrincipalToken, err := adal.NewServicePrincipalToken(
+		*oauthConfig,
+		spCredentials.AppID,
+		spCredentials.Password,
+		azureStorageEndpoint)
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating service principal token")
+	}
+
+	// Wrap token inside a refresher closure.
+	var tokenRefresher azblob.TokenRefresher = func(credential azblob.TokenCredential) time.Duration {
+		if err := servicePrincipalToken.Refresh(); err != nil {
+			panic(err)
+		}
+		refreshedToken := servicePrincipalToken.Token()
+		credential.SetToken(refreshedToken.AccessToken)
+		exp := refreshedToken.Expires().Sub(time.Now().Add(2 * time.Minute))
+		return exp
+	}
+
+	return tokenRefresher, nil
+}
+
 // newPipeline creates a Pipeline using the specified credentials and options.
 //
 // this code was copied from azblob.NewPipeline
@@ -379,8 +443,7 @@ func (f *Fs) setRoot(root string) {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	ctx := context.Background()
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -410,18 +473,20 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 			string(azblob.AccessTierHot), string(azblob.AccessTierCool), string(azblob.AccessTierArchive))
 	}
 
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:        name,
 		opt:         *opt,
-		pacer:       fs.NewPacer(pacer.NewS3(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		uploadToken: pacer.NewTokenDispenser(fs.Config.Transfers),
-		client:      fshttp.NewClient(fs.Config),
+		ci:          ci,
+		pacer:       fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		uploadToken: pacer.NewTokenDispenser(ci.Transfers),
+		client:      fshttp.NewClient(ctx),
 		cache:       bucket.NewCache(),
 		cntURLcache: make(map[string]*azblob.ContainerURL, 1),
 		pool: pool.New(
 			time.Duration(opt.MemoryPoolFlushTime),
 			int(opt.ChunkSize),
-			fs.Config.Transfers,
+			ci.Transfers,
 			opt.MemoryPoolUseMmap,
 		),
 	}
@@ -433,7 +498,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		BucketBasedRootOK: true,
 		SetTier:           true,
 		GetTier:           true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 
 	var (
 		u          *url.URL
@@ -482,8 +547,27 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		} else {
 			serviceURL = azblob.NewServiceURL(*u, pipeline)
 		}
+	case opt.ServicePrincipalFile != "":
+		// Create a standard URL.
+		u, err = url.Parse(fmt.Sprintf("https://%s.%s", opt.Account, opt.Endpoint))
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to make azure storage url from account and endpoint")
+		}
+		// Try loading service principal credentials from file.
+		loadedCreds, err := ioutil.ReadFile(env.ShellExpand(opt.ServicePrincipalFile))
+		if err != nil {
+			return nil, errors.Wrap(err, "error opening service principal credentials file")
+		}
+		// Create a token refresher from service principal credentials.
+		tokenRefresher, err := newServicePrincipalTokenRefresher(ctx, loadedCreds)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create a service principal token")
+		}
+		options := azblob.PipelineOptions{Retry: azblob.RetryOptions{TryTimeout: maxTryTimeout}}
+		pipe := f.newPipeline(azblob.NewTokenCredential("", tokenRefresher), options)
+		serviceURL = azblob.NewServiceURL(*u, pipe)
 	default:
-		return nil, errors.New("Need account+key or connectionString or sasURL")
+		return nil, errors.New("Need account+key or connectionString or sasURL or servicePrincipalFile")
 	}
 	f.svcURL = &serviceURL
 
@@ -524,7 +608,7 @@ func (f *Fs) cntURL(container string) (containerURL *azblob.ContainerURL) {
 // Return an Object from a path
 //
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
-func (f *Fs) newObjectWithInfo(remote string, info *azblob.BlobItem) (fs.Object, error) {
+func (f *Fs) newObjectWithInfo(remote string, info *azblob.BlobItemInternal) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -581,7 +665,7 @@ func isDirectoryMarker(size int64, metadata azblob.Metadata, remote string) bool
 }
 
 // listFn is called from list to handle an object
-type listFn func(remote string, object *azblob.BlobItem, isDirectory bool) error
+type listFn func(remote string, object *azblob.BlobItemInternal, isDirectory bool) error
 
 // list lists the objects into the function supplied from
 // the container and root supplied
@@ -680,7 +764,7 @@ func (f *Fs) list(ctx context.Context, container, directory, prefix string, addC
 }
 
 // Convert a list item into a DirEntry
-func (f *Fs) itemToDirEntry(remote string, object *azblob.BlobItem, isDirectory bool) (fs.DirEntry, error) {
+func (f *Fs) itemToDirEntry(remote string, object *azblob.BlobItemInternal, isDirectory bool) (fs.DirEntry, error) {
 	if isDirectory {
 		d := fs.NewDir(remote, time.Time{})
 		return d, nil
@@ -694,7 +778,7 @@ func (f *Fs) itemToDirEntry(remote string, object *azblob.BlobItem, isDirectory 
 
 // listDir lists a single directory
 func (f *Fs) listDir(ctx context.Context, container, directory, prefix string, addContainer bool) (entries fs.DirEntries, err error) {
-	err = f.list(ctx, container, directory, prefix, addContainer, false, f.opt.ListChunkSize, func(remote string, object *azblob.BlobItem, isDirectory bool) error {
+	err = f.list(ctx, container, directory, prefix, addContainer, false, f.opt.ListChunkSize, func(remote string, object *azblob.BlobItemInternal, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(remote, object, isDirectory)
 		if err != nil {
 			return err
@@ -775,7 +859,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	container, directory := f.split(dir)
 	list := walk.NewListRHelper(callback)
 	listR := func(container, directory, prefix string, addContainer bool) error {
-		return f.list(ctx, container, directory, prefix, addContainer, true, f.opt.ListChunkSize, func(remote string, object *azblob.BlobItem, isDirectory bool) error {
+		return f.list(ctx, container, directory, prefix, addContainer, true, f.opt.ListChunkSize, func(remote string, object *azblob.BlobItemInternal, isDirectory bool) error {
 			entry, err := f.itemToDirEntry(remote, object, isDirectory)
 			if err != nil {
 				return err
@@ -903,7 +987,7 @@ func (f *Fs) makeContainer(ctx context.Context, container string) error {
 // isEmpty checks to see if a given (container, directory) is empty and returns an error if not
 func (f *Fs) isEmpty(ctx context.Context, container, directory string) (err error) {
 	empty := true
-	err = f.list(ctx, container, directory, f.rootDirectory, f.rootContainer == "", true, 1, func(remote string, object *azblob.BlobItem, isDirectory bool) error {
+	err = f.list(ctx, container, directory, f.rootDirectory, f.rootContainer == "", true, 1, func(remote string, object *azblob.BlobItemInternal, isDirectory bool) error {
 		empty = false
 		return nil
 	})
@@ -976,7 +1060,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.deleteContainer(ctx, container)
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -1008,7 +1092,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	var startCopy *azblob.BlobStartCopyFromURLResponse
 
 	err = f.pacer.Call(func() (bool, error) {
-		startCopy, err = dstBlobURL.StartCopyFromURL(ctx, *source, nil, azblob.ModifiedAccessConditions{}, options)
+		startCopy, err = dstBlobURL.StartCopyFromURL(ctx, *source, nil, azblob.ModifiedAccessConditions{}, options, azblob.AccessTierType(f.opt.AccessTier), nil)
 		return f.shouldRetry(err)
 	})
 	if err != nil {
@@ -1036,7 +1120,7 @@ func (f *Fs) getMemoryPool(size int64) *pool.Pool {
 	return pool.New(
 		time.Duration(f.opt.MemoryPoolFlushTime),
 		int(size),
-		fs.Config.Transfers,
+		f.ci.Transfers,
 		f.opt.MemoryPoolUseMmap,
 	)
 }
@@ -1123,7 +1207,7 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *azblob.BlobGetProper
 	return nil
 }
 
-func (o *Object) decodeMetaDataFromBlob(info *azblob.BlobItem) (err error) {
+func (o *Object) decodeMetaDataFromBlob(info *azblob.BlobItemInternal) (err error) {
 	metadata := info.Metadata
 	size := *info.Properties.ContentLength
 	if isDirectoryMarker(size, metadata, o.remote) {
@@ -1245,15 +1329,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	blob := o.getBlobReference()
 	ac := azblob.BlobAccessConditions{}
-	var dowloadResponse *azblob.DownloadResponse
+	var downloadResponse *azblob.DownloadResponse
 	err = o.fs.pacer.Call(func() (bool, error) {
-		dowloadResponse, err = blob.Download(ctx, offset, count, ac, false)
+		downloadResponse, err = blob.Download(ctx, offset, count, ac, false)
 		return o.fs.shouldRetry(err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to open for download")
 	}
-	in = dowloadResponse.Body(azblob.RetryReaderOptions{})
+	in = downloadResponse.Body(azblob.RetryReaderOptions{})
 	return in, nil
 }
 
@@ -1424,7 +1508,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, size int64, 
 
 	// Finalise the upload session
 	err = o.fs.pacer.Call(func() (bool, error) {
-		_, err := blockBlobURL.CommitBlockList(ctx, blocks, *httpHeaders, o.meta, azblob.BlobAccessConditions{})
+		_, err := blockBlobURL.CommitBlockList(ctx, blocks, *httpHeaders, o.meta, azblob.BlobAccessConditions{}, azblob.AccessTierType(o.fs.opt.AccessTier), nil)
 		return o.fs.shouldRetry(err)
 	})
 	if err != nil {
@@ -1451,7 +1535,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	blob := o.getBlobReference()
 	httpHeaders := azblob.BlobHTTPHeaders{}
-	httpHeaders.ContentType = fs.MimeType(ctx, o)
+	httpHeaders.ContentType = fs.MimeType(ctx, src)
 	// Compute the Content-MD5 of the file, for multiparts uploads it
 	// will be set in PutBlockList API call using the 'x-ms-blob-content-md5' header
 	// Note: If multipart, an MD5 checksum will also be computed for each uploaded block
@@ -1475,7 +1559,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	// FIXME Until https://github.com/Azure/azure-storage-blob-go/pull/75
 	// is merged the SDK can't upload a single blob of exactly the chunk
-	// size, so upload with a multpart upload to work around.
+	// size, so upload with a multipart upload to work around.
 	// See: https://github.com/rclone/rclone/issues/2653
 	multipartUpload := size < 0 || size >= int64(o.fs.opt.UploadCutoff)
 	if size == int64(o.fs.opt.ChunkSize) {

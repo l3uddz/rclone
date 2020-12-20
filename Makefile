@@ -93,8 +93,8 @@ build_dep:
 
 # Get the release dependencies we only install on linux
 release_dep_linux:
-	go run bin/get-github-release.go -extract nfpm goreleaser/nfpm 'nfpm_.*_Linux_x86_64.tar.gz'
-	go run bin/get-github-release.go -extract github-release aktau/github-release 'linux-amd64-github-release.tar.bz2'
+	cd /tmp && go get github.com/goreleaser/nfpm/...
+	cd /tmp && go get github.com/github-release/github-release
 
 # Get the release dependencies we only install on Windows
 release_dep_windows:
@@ -206,7 +206,7 @@ ci_upload:
 	find build -type l -delete
 	gzip -r9v build
 	./rclone --config bin/travis.rclone.conf -v copy build/ $(BETA_UPLOAD)/testbuilds
-ifndef BRANCH_PATH
+ifeq ($(or $(BRANCH_PATH),$(RELEASE_TAG)),)
 	./rclone --config bin/travis.rclone.conf -v copy build/ $(BETA_UPLOAD_ROOT)/test/testbuilds-latest
 endif
 	@echo Beta release ready at $(BETA_URL)/testbuilds
@@ -215,7 +215,7 @@ ci_beta:
 	git log $(LAST_TAG).. > /tmp/git-log.txt
 	go run bin/cross-compile.go -release beta-latest -git-log /tmp/git-log.txt $(BUILD_FLAGS) $(BUILDTAGS) $(TAG)
 	rclone --config bin/travis.rclone.conf -v copy --exclude '*beta-latest*' build/ $(BETA_UPLOAD)
-ifndef BRANCH_PATH
+ifeq ($(or $(BRANCH_PATH),$(RELEASE_TAG)),)
 	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' --include version.txt build/ $(BETA_UPLOAD_ROOT)$(BETA_SUBDIR)
 endif
 	@echo Beta release ready at $(BETA_URL)
@@ -233,7 +233,7 @@ tag:	retag doc
 	@echo "Edit the new changelog in docs/content/changelog.md"
 	@echo "Then commit all the changes"
 	@echo git commit -m \"Version $(VERSION)\" -a -v
-	@echo "And finally run make retag before make cross etc"
+	@echo "And finally run make retag before make cross, etc."
 
 retag:
 	@echo "Version is $(VERSION)"

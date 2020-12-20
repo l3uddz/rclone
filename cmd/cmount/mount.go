@@ -19,15 +19,20 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/vfs"
 )
 
 func init() {
 	name := "cmount"
-	if runtime.GOOS == "windows" {
+	cmountOnly := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+	if cmountOnly {
 		name = "mount"
 	}
-	mountlib.NewMountCommand(name, false, mount)
+	cmd := mountlib.NewMountCommand(name, false, mount)
+	if cmountOnly {
+		cmd.Aliases = append(cmd.Aliases, "cmount")
+	}
 	mountlib.AddRc("cmount", mount)
 }
 
@@ -183,9 +188,17 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 	unmount := func() error {
 		// Shutdown the VFS
 		fsys.VFS.Shutdown()
-		fs.Debugf(nil, "Calling host.Unmount")
-		if host.Unmount() {
-			fs.Debugf(nil, "host.Unmount succeeded")
+		var umountOK bool
+		if atexit.Signalled() {
+			// If we have received a signal then FUSE will be shutting down already
+			fs.Debugf(nil, "Not calling host.Unmount as signal received")
+			umountOK = true
+		} else {
+			fs.Debugf(nil, "Calling host.Unmount")
+			umountOK = host.Unmount()
+		}
+		if umountOK {
+			fs.Debugf(nil, "Unmounted successfully")
 			if runtime.GOOS == "windows" {
 				if !waitFor(func() bool {
 					_, err := os.Stat(mountpoint)

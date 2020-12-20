@@ -19,7 +19,7 @@ FUSE.
 First set up your remote using `rclone config`.  Check it works with `rclone ls` etc.
 
 You can either run mount in foreground mode or background (daemon) mode. Mount runs in
-foreground mode by default, use the --daemon flag to specify background mode mode.
+foreground mode by default, use the --daemon flag to specify background mode behaviour.
 Background mode is only supported on Linux and OSX, you can only run mount in
 foreground mode on Windows.
 
@@ -57,7 +57,7 @@ download and install [WinFsp](http://www.secfs.net/winfsp/).
 [WinFsp](https://github.com/billziss-gh/winfsp) is an open source
 Windows File System Proxy which makes it easy to write user space file
 systems for Windows.  It provides a FUSE emulation layer which rclone
-uses combination with
+uses in combination with
 [cgofuse](https://github.com/billziss-gh/cgofuse).  Both of these
 packages are by Bill Zissimopoulos who was very helpful during the
 implementation of rclone mount for Windows.
@@ -112,7 +112,7 @@ Without the use of "--vfs-cache-mode" this can only write files
 sequentially, it can only seek when reading.  This means that many
 applications won't work with their files on an rclone mount without
 "--vfs-cache-mode writes" or "--vfs-cache-mode full".  See the [File
-Caching](#file-caching) section for more info.
+Caching](#vfs-file-caching) section for more info.
 
 The bucket based remotes (eg Swift, S3, Google Compute Storage, B2,
 Hubic) do not support the concept of empty directories, so empty
@@ -127,7 +127,7 @@ File systems expect things to be 100% reliable, whereas cloud storage
 systems are a long way from 100% reliable. The rclone sync/copy
 commands cope with this with lots of retries.  However rclone mount
 can't use retries in the same way without making local copies of the
-uploads. Look at the [file caching](#file-caching)
+uploads. Look at the [file caching](#vfs-file-caching)
 for solutions to make mount more reliable.
 
 ## Attribute caching
@@ -164,7 +164,7 @@ This is the same as setting the attr_timeout option in mount.fuse.
 
 ## Filters
 
-Note that all the rclone filters can be used to select a subset of the
+Rclone's filters can be used to select a subset of the
 files to be visible in the mount.
 
 ## systemd
@@ -196,7 +196,7 @@ be copied to the vfs cache before opening with --vfs-cache-mode full.
 
 ## VFS - Virtual File System
 
-This command uses the VFS layer. This adapts the cloud storage objects
+Mount uses rclone's VFS layer. This adapts the cloud storage objects
 that rclone uses into something which looks much more like a disk
 filing system.
 

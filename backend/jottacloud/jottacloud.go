@@ -83,9 +83,7 @@ func init() {
 		Name:        "jottacloud",
 		Description: "Jottacloud",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
-			ctx := context.TODO()
-
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
 			refresh := false
 			if version, ok := m.Get("configVersion"); ok {
 				ver, err := strconv.Atoi(version)
@@ -107,7 +105,7 @@ func init() {
 				}
 			}
 
-			fmt.Printf("Use legacy authentification?.\nThis is only required for certain whitelabel versions of Jottacloud and not recommended for normal users.\n")
+			fmt.Printf("Use legacy authentication?.\nThis is only required for certain whitelabel versions of Jottacloud and not recommended for normal users.\n")
 			if config.Confirm(false) {
 				v1config(ctx, name, m)
 			} else {
@@ -230,9 +228,9 @@ func shouldRetry(resp *http.Response, err error) (bool, error) {
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
-// v1config configure a jottacloud backend using legacy authentification
+// v1config configure a jottacloud backend using legacy authentication
 func v1config(ctx context.Context, name string, m configmap.Mapper) {
-	srv := rest.NewClient(fshttp.NewClient(fs.Config))
+	srv := rest.NewClient(fshttp.NewClient(ctx))
 
 	fmt.Printf("\nDo you want to create a machine specific API key?\n\nRclone has it's own Jottacloud API KEY which works fine as long as one only uses rclone on a single machine. When you want to use rclone with this account on more than one machine it's recommended to create a machine specific API key. These keys can NOT be shared between machines.\n\n")
 	if config.Confirm(false) {
@@ -275,7 +273,7 @@ func v1config(ctx context.Context, name string, m configmap.Mapper) {
 
 	fmt.Printf("\nDo you want to use a non standard device/mountpoint e.g. for accessing files uploaded using the official Jottacloud client?\n\n")
 	if config.Confirm(false) {
-		oAuthClient, _, err := oauthutil.NewClient(name, m, oauthConfig)
+		oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 		if err != nil {
 			log.Fatalf("Failed to load oAuthClient: %s", err)
 		}
@@ -323,7 +321,7 @@ func registerDevice(ctx context.Context, srv *rest.Client) (reg *api.DeviceRegis
 	return deviceRegistration, err
 }
 
-// doAuthV1 runs the actual token request for V1 authentification
+// doAuthV1 runs the actual token request for V1 authentication
 func doAuthV1(ctx context.Context, srv *rest.Client, username, password string) (token oauth2.Token, err error) {
 	// prepare out token request with username and password
 	values := url.Values{}
@@ -365,13 +363,16 @@ func doAuthV1(ctx context.Context, srv *rest.Client, username, password string) 
 	return token, err
 }
 
-// v2config configure a jottacloud backend using the modern JottaCli token based authentification
+// v2config configure a jottacloud backend using the modern JottaCli token based authentication
 func v2config(ctx context.Context, name string, m configmap.Mapper) {
-	srv := rest.NewClient(fshttp.NewClient(fs.Config))
+	srv := rest.NewClient(fshttp.NewClient(ctx))
 
 	fmt.Printf("Generate a personal login token here: https://www.jottacloud.com/web/secure\n")
 	fmt.Printf("Login Token> ")
 	loginToken := config.ReadLine()
+
+	m.Set(configClientID, "jottacli")
+	m.Set(configClientSecret, "")
 
 	token, err := doAuthV2(ctx, srv, loginToken, m)
 	if err != nil {
@@ -384,8 +385,7 @@ func v2config(ctx context.Context, name string, m configmap.Mapper) {
 
 	fmt.Printf("\nDo you want to use a non standard device/mountpoint e.g. for accessing files uploaded using the official Jottacloud client?\n\n")
 	if config.Confirm(false) {
-		oauthConfig.ClientID = "jottacli"
-		oAuthClient, _, err := oauthutil.NewClient(name, m, oauthConfig)
+		oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 		if err != nil {
 			log.Fatalf("Failed to load oAuthClient: %s", err)
 		}
@@ -403,7 +403,7 @@ func v2config(ctx context.Context, name string, m configmap.Mapper) {
 	m.Set("configVersion", strconv.Itoa(configVersion))
 }
 
-// doAuthV2 runs the actual token request for V2 authentification
+// doAuthV2 runs the actual token request for V2 authentication
 func doAuthV2(ctx context.Context, srv *rest.Client, loginTokenBase64 string, m configmap.Mapper) (token oauth2.Token, err error) {
 	loginTokenBytes, err := base64.RawURLEncoding.DecodeString(loginTokenBase64)
 	if err != nil {
@@ -551,7 +551,7 @@ func (f *Fs) setEndpointURL() {
 	if f.opt.Mountpoint == "" {
 		f.opt.Mountpoint = defaultMountpoint
 	}
-	f.endpointURL = urlPathEscape(path.Join(f.user, f.opt.Device, f.opt.Mountpoint))
+	f.endpointURL = path.Join(f.user, f.opt.Device, f.opt.Mountpoint)
 }
 
 // readMetaDataForPath reads the metadata from the path
@@ -639,8 +639,7 @@ func grantTypeFilter(req *http.Request) {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	ctx := context.TODO()
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -662,7 +661,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, errors.New("Outdated config - please reconfigure this backend")
 	}
 
-	baseClient := fshttp.NewClient(fs.Config)
+	baseClient := fshttp.NewClient(ctx)
 
 	if ver == configVersion {
 		oauthConfig.ClientID = "jottacli"
@@ -698,7 +697,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	}
 
 	// Create OAuth Client
-	oAuthClient, ts, err := oauthutil.NewClientWithBaseClient(name, m, oauthConfig, baseClient)
+	oAuthClient, ts, err := oauthutil.NewClientWithBaseClient(ctx, name, m, oauthConfig, baseClient)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to configure Jottacloud oauth client")
 	}
@@ -712,14 +711,14 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		opt:    *opt,
 		srv:    rest.NewClient(oAuthClient).SetRoot(rootURL),
 		apiSrv: rest.NewClient(oAuthClient).SetRoot(apiURL),
-		pacer:  fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
 		ReadMimeType:            true,
-		WriteMimeType:           true,
-	}).Fill(f)
+		WriteMimeType:           false,
+	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 	if opt.TrashedOnly { // we cannot support showing Trashed Files when using ListR right now
 		f.features.ListR = nil
@@ -1087,8 +1086,7 @@ func (f *Fs) copyOrMove(ctx context.Context, method, src, dest string) (info *ap
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallXML(ctx, &opts, nil, &info)
-		retry, _ := shouldRetry(resp, err)
-		return (retry && resp.StatusCode != 500), err
+		return shouldRetry(resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1096,7 +1094,7 @@ func (f *Fs) copyOrMove(ctx context.Context, method, src, dest string) (info *ap
 	return info, nil
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -1126,7 +1124,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	//return f.newObjectWithInfo(remote, &result)
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -1157,7 +1155,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -1192,18 +1190,6 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 	_, err = f.copyOrMove(ctx, "mvDir", path.Join(f.endpointURL, f.opt.Enc.FromStandardPath(srcPath))+"/", dstRemote)
 
-	// surprise! jottacloud fucked up dirmove - the api spits out an error but
-	// dir gets moved regardless
-	if apiErr, ok := err.(*api.Error); ok {
-		if apiErr.StatusCode == 500 {
-			_, err := f.NewObject(ctx, dstRemote)
-			if err == fs.ErrorNotAFile {
-				log.Printf("FIXME: ignoring DirMove error - move succeeded anyway\n")
-				return nil
-			}
-			return err
-		}
-	}
 	if err != nil {
 		return errors.Wrap(err, "couldn't move directory")
 	}
@@ -1523,7 +1509,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	// If the file state is INCOMPLETE and CORRPUT, try to upload a then
+	// If the file state is INCOMPLETE and CORRUPT, try to upload a then
 	if response.State != "COMPLETED" {
 		// how much do we still have to upload?
 		remainingBytes := size - response.ResumePos

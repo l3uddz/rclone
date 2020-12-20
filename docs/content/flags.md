@@ -90,7 +90,7 @@ These flags are available for every command.
       --no-traverse                          Don't traverse destination file system on copy.
       --no-unicode-normalization             Don't normalize unicode characters in filenames.
       --no-update-modtime                    Don't update destination mod-time if files identical.
-      --order-by string                      Instructions on how to order the transfers, eg 'size,descending'
+      --order-by string                      Instructions on how to order the transfers, e.g. 'size,descending'
       --password-command SpaceSepList        Command for supplying password for encrypted configuration.
   -P, --progress                             Show progress during transfer.
   -q, --quiet                                Print as little stuff as possible
@@ -135,11 +135,11 @@ These flags are available for every command.
       --suffix string                        Suffix to add to changed files.
       --suffix-keep-extension                Preserve the extension when using --suffix.
       --syslog                               Use Syslog for logging
-      --syslog-facility string               Facility for syslog, eg KERN,USER,... (default "DAEMON")
+      --syslog-facility string               Facility for syslog, e.g. KERN,USER,... (default "DAEMON")
       --timeout duration                     IO idle timeout (default 5m0s)
       --tpslimit float                       Limit HTTP transactions per second to this.
       --tpslimit-burst int                   Max burst of transactions for --tpslimit. (default 1)
-      --track-renames                        When synchronizing, track file renames and do a server side move if possible
+      --track-renames                        When synchronizing, track file renames and do a server-side move if possible
       --track-renames-strategy string        Strategies to use when synchronizing using track-renames hash|modtime|leaf (default "hash")
       --transfers int                        Number of file transfers to run in parallel. (default 4)
   -u, --update                               Skip files that are newer on the destination.
@@ -214,7 +214,7 @@ and may be set in the config file.
       --cache-db-path string                                     Directory to store file structure metadata DB. (default "$HOME/.cache/rclone/cache-backend")
       --cache-db-purge                                           Clear all the cached data for this remote on start.
       --cache-db-wait-time Duration                              How long to wait for the DB to be available - 0 is unlimited (default 1s)
-      --cache-info-age Duration                                  How long to cache file structure information (directory listings, file size, times etc). (default 6h0m0s)
+      --cache-info-age Duration                                  How long to cache file structure information (directory listings, file size, times, etc.). (default 6h0m0s)
       --cache-plex-insecure string                               Skip all certificate verification when connecting to the Plex server
       --cache-plex-password string                               The password of the Plex user (obscured)
       --cache-plex-url string                                    The URL of the Plex server
@@ -239,7 +239,7 @@ and may be set in the config file.
       --crypt-password string                                    Password or pass phrase for encryption. (obscured)
       --crypt-password2 string                                   Password or pass phrase for salt. Optional but recommended. (obscured)
       --crypt-remote string                                      Remote to encrypt/decrypt.
-      --crypt-server-side-across-configs                         Allow server side operations (eg copy) to work across different crypt configs.
+      --crypt-server-side-across-configs                         Allow server-side operations (e.g. copy) to work across different crypt configs.
       --crypt-show-mapping                                       For all files listed show how the names encrypt.
       --drive-acknowledge-abuse                                  Set to allow files which return cannotDownloadAbusiveFile to be downloaded.
       --drive-allow-import-name-change                           Allow the filetype to change when uploading Google docs (e.g. file.doc to file.docx). This will confuse sync and reupload every time.
@@ -260,7 +260,7 @@ and may be set in the config file.
       --drive-pacer-min-sleep Duration                           Minimum time to sleep between API calls. (default 100ms)
       --drive-root-folder-id string                              ID of the root folder
       --drive-scope string                                       Scope that rclone should use when requesting access from drive.
-      --drive-server-side-across-configs                         Allow server side operations (eg copy) to work across different drive configs.
+      --drive-server-side-across-configs                         Allow server-side operations (e.g. copy) to work across different drive configs.
       --drive-service-account-credentials string                 Service Account Credentials JSON blob
       --drive-service-account-file string                        Service Account Credentials JSON file path
       --drive-shared-with-me                                     Only show files that are shared with me.
@@ -377,7 +377,7 @@ and may be set in the config file.
       --onedrive-encoding MultiEncoder                           This sets the encoding for the backend. (default Slash,LtGt,DoubleQuote,Colon,Question,Asterisk,Pipe,Hash,Percent,BackSlash,Del,Ctl,LeftSpace,LeftTilde,RightSpace,RightPeriod,InvalidUtf8,Dot)
       --onedrive-expose-onenote-files                            Set to make OneNote files show up in directory listings.
       --onedrive-no-versions                                     Remove all versions on modifying operations
-      --onedrive-server-side-across-configs                      Allow server side operations (eg copy) to work across different onedrive configs.
+      --onedrive-server-side-across-configs                      Allow server-side operations (e.g. copy) to work across different onedrive configs.
       --onedrive-token string                                    OAuth Access Token as a JSON blob.
       --onedrive-token-url string                                Token server url.
       --opendrive-chunk-size SizeSuffix                          Files will be uploaded in chunks this size. (default 10M)
@@ -420,7 +420,7 @@ and may be set in the config file.
       --s3-max-upload-parts int                                  Maximum number of parts in a multipart upload. (default 10000)
       --s3-memory-pool-flush-time Duration                       How often internal memory buffer pools will be flushed. (default 1m0s)
       --s3-memory-pool-use-mmap                                  Whether to use mmap buffers in internal memory pool.
-      --s3-no-check-bucket                                       If set don't attempt to check the bucket exists or create it
+      --s3-no-check-bucket                                       If set, don't attempt to check the bucket exists or create it
       --s3-profile string                                        Profile to use in the shared credentials file
       --s3-provider string                                       Choose your S3 provider.
       --s3-region string                                         Region to connect to.
@@ -511,7 +511,7 @@ and may be set in the config file.
       --union-create-policy string                               Policy to choose upstream on CREATE category. (default "epmfs")
       --union-search-policy string                               Policy to choose upstream on SEARCH category. (default "ff")
       --union-upstreams string                                   List of space separated upstreams.
-      --webdav-bearer-token string                               Bearer token instead of user/pass (eg a Macaroon)
+      --webdav-bearer-token string                               Bearer token instead of user/pass (e.g. a Macaroon)
       --webdav-bearer-token-command string                       Command to run to get a bearer token
       --webdav-pass string                                       Password. (obscured)
       --webdav-url string                                        URL of http host to connect to

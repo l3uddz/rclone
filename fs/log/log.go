@@ -2,6 +2,7 @@
 package log
 
 import (
+	"context"
 	"io"
 	"log"
 	"os"
@@ -18,7 +19,7 @@ type Options struct {
 	File           string // Log everything to this file
 	Format         string // Comma separated list of log format options
 	UseSyslog      bool   // Use Syslog for logging
-	SyslogFacility string // Facility for syslog, eg KERN,USER,...
+	SyslogFacility string // Facility for syslog, e.g. KERN,USER,...
 }
 
 // DefaultOpt is the default values used for Opt
@@ -51,7 +52,7 @@ func fnName() string {
 //
 // Any pointers in the exit function will be dereferenced
 func Trace(o interface{}, format string, a ...interface{}) func(string, ...interface{}) {
-	if fs.Config.LogLevel < fs.LogLevelDebug {
+	if fs.GetConfig(context.Background()).LogLevel < fs.LogLevelDebug {
 		return func(format string, a ...interface{}) {}
 	}
 	name := fnName()
@@ -76,7 +77,7 @@ func Trace(o interface{}, format string, a ...interface{}) func(string, ...inter
 
 // Stack logs a stack trace of callers with the o and info passed in
 func Stack(o interface{}, info string) {
-	if fs.Config.LogLevel < fs.LogLevelDebug {
+	if fs.GetConfig(context.Background()).LogLevel < fs.LogLevelDebug {
 		return
 	}
 	arr := [16 * 1024]byte{}
@@ -90,23 +91,25 @@ func Stack(o interface{}, info string) {
 func InitLogging() {
 	flagsStr := "," + Opt.Format + ","
 	var flags int
-	if strings.Contains(flagsStr, ",date,") {
-		flags |= log.Ldate
-	}
-	if strings.Contains(flagsStr, ",time,") {
-		flags |= log.Ltime
-	}
-	if strings.Contains(flagsStr, ",microseconds,") {
-		flags |= log.Lmicroseconds
+	if !fs.GetConfig(context.Background()).LogSystemdSupport {
+		if strings.Contains(flagsStr, ",date,") {
+			flags |= log.Ldate
+		}
+		if strings.Contains(flagsStr, ",time,") {
+			flags |= log.Ltime
+		}
+		if strings.Contains(flagsStr, ",microseconds,") {
+			flags |= log.Lmicroseconds
+		}
+		if strings.Contains(flagsStr, ",UTC,") {
+			flags |= log.LUTC
+		}
 	}
 	if strings.Contains(flagsStr, ",longfile,") {
 		flags |= log.Llongfile
 	}
 	if strings.Contains(flagsStr, ",shortfile,") {
 		flags |= log.Lshortfile
-	}
-	if strings.Contains(flagsStr, ",UTC,") {
-		flags |= log.LUTC
 	}
 	log.SetFlags(flags)
 

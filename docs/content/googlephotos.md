@@ -234,6 +234,14 @@ are stored in full resolution at "original quality" and **will** count
 towards your storage quota in your Google Account.  The API does
 **not** offer a way to upload in "high quality" mode..
 
+`rclone about` is not supported by the Google Photos backend. Backends without
+this capability cannot determine free space for an rclone mount or
+use policy `mfs` (most free space) as a member of an rclone union
+remote.
+
+See [List of backends that do not support rclone about](https://rclone.org/overview/#optional-features)
+See [rclone about](https://rclone.org/commands/rclone_about/)
+
 ### Downloading Images
 
 When Images are downloaded this strips EXIF location (according to the
@@ -395,7 +403,7 @@ you want to read the media.
 
 #### --gphotos-start-year
 
-Year limits the photos to be downloaded to those which are uploaded after the given year
+Year limits the photos to be downloaded to those which were uploaded after the given year
 
 - Config:      start_year
 - Env Var:     RCLONE_GPHOTOS_START_YEAR

@@ -30,6 +30,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dropbox/dropbox-sdk-go-unofficial/dropbox"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/dropbox/auth"
@@ -86,6 +87,8 @@ const (
 	// by default.
 	defaultChunkSize = 48 * fs.MebiByte
 	maxChunkSize     = 150 * fs.MebiByte
+	// Max length of filename parts: https://help.dropbox.com/installs-integrations/sync-uploads/files-not-syncing
+	maxFileNameLength = 255
 )
 
 var (
@@ -107,6 +110,9 @@ var (
 
 	// DbHashType is the hash.Type for Dropbox
 	DbHashType hash.Type
+
+	// Errors
+	errNotSupportedInSharedMode = fserrors.NoRetryError(errors.New("not supported in shared files mode"))
 )
 
 // Register with Fs
@@ -116,11 +122,14 @@ func init() {
 		Name:        "dropbox",
 		Description: "Dropbox",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
 			opt := oauthutil.Options{
 				NoOffline: true,
+				OAuth2Opts: []oauth2.AuthCodeOption{
+					oauth2.SetAuthURLParam("token_access_type", "offline"),
+				},
 			}
-			err := oauthutil.Config("dropbox", name, m, dropboxConfig, &opt)
+			err := oauthutil.Config(ctx, "dropbox", name, m, dropboxConfig, &opt)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
@@ -251,9 +260,11 @@ func shouldRetry(err error) (bool, error) {
 		return false, err
 	}
 	baseErrString := errors.Cause(err).Error()
-	// First check for Insufficient Space
+	// First check for specific errors
 	if strings.Contains(baseErrString, "insufficient_space") {
 		return false, fserrors.FatalError(err)
+	} else if strings.Contains(baseErrString, "malformed_path") {
+		return false, fserrors.NoRetryError(err)
 	}
 	// Then handle any official Retry-After header from Dropbox's SDK
 	switch e := err.(type) {
@@ -291,7 +302,7 @@ func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error)
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -316,7 +327,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		}
 	}
 
-	oAuthClient, _, err := oauthutil.NewClient(name, m, dropboxConfig)
+	oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, dropboxConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to configure dropbox")
 	}
@@ -324,7 +335,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	f := &Fs{
 		name:  name,
 		opt:   *opt,
-		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	config := dropbox.Config{
 		LogLevel:        dropbox.LogOff, // logging in the SDK: LogOff, LogDebug, LogInfo
@@ -359,7 +370,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	f.users = users.New(config)
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
-		ReadMimeType:            true,
+		ReadMimeType:            false,
 		CanHaveEmptyDirectories: true,
 	})
 
@@ -414,7 +425,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		f.opt.SharedFolders = false
 	}
 
-	f.features.Fill(f)
+	f.features.Fill(ctx, f)
 
 	// If root starts with / then use the actual root
 	if strings.HasPrefix(root, "/") {
@@ -795,7 +806,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	if f.opt.SharedFiles || f.opt.SharedFolders {
-		return nil, fserrors.NoRetryError(errors.New("not support in shared files mode"))
+		return nil, errNotSupportedInSharedMode
 	}
 	// Temporary Object under construction
 	o := &Object{
@@ -813,7 +824,7 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if f.opt.SharedFiles || f.opt.SharedFolders {
-		return fserrors.NoRetryError(errors.New("not support in shared files mode"))
+		return errNotSupportedInSharedMode
 	}
 	root := path.Join(f.slashRoot, dir)
 
@@ -833,6 +844,10 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	// create it
 	arg2 := files.CreateFolderArg{
 		Path: f.opt.Enc.FromStandardPath(root),
+	}
+	// Don't attempt to create filenames that are too long
+	if cErr := checkPathLength(arg2.Path); cErr != nil {
+		return cErr
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		_, err = f.srv.CreateFolderV2(&arg2)
@@ -893,7 +908,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) (err error)
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if f.opt.SharedFiles || f.opt.SharedFolders {
-		return fserrors.NoRetryError(errors.New("not support in shared files mode"))
+		return errNotSupportedInSharedMode
 	}
 	return f.purgeCheck(ctx, dir, true)
 }
@@ -903,7 +918,7 @@ func (f *Fs) Precision() time.Duration {
 	return time.Second
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -964,7 +979,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) (err error) {
 	return f.purgeCheck(ctx, dir, false)
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -1069,7 +1084,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -1174,7 +1189,7 @@ func (o *Object) ID() string {
 // Hash returns the dropbox special hash
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if o.fs.opt.SharedFiles || o.fs.opt.SharedFolders {
-		return "", fserrors.NoRetryError(errors.New("not support in shared files mode"))
+		return "", errNotSupportedInSharedMode
 	}
 	if t != DbHashType {
 		return "", hash.ErrUnsupported
@@ -1193,7 +1208,7 @@ func (o *Object) Size() int64 {
 
 // setMetadataFromEntry sets the fs data from a files.FileMetadata
 //
-// This isn't a complete set of metadata and has an inacurate date
+// This isn't a complete set of metadata and has an inaccurate date
 func (o *Object) setMetadataFromEntry(info *files.FileMetadata) error {
 	o.id = info.Id
 	o.bytes = int64(info.Size)
@@ -1412,6 +1427,31 @@ func (o *Object) uploadChunked(in0 io.Reader, commitInfo *files.CommitInfo, size
 	return entry, nil
 }
 
+// checks all the parts of name to see they are below
+// maxFileNameLength runes.
+//
+// This checks the length as runes which isn't quite right as dropbox
+// seems to encode some symbols (eg ☺) as two "characters". This seems
+// like utf-16 except that ☺ doesn't need two characters in utf-16.
+//
+// Using runes instead of what dropbox is using will work for most
+// cases, and when it goes wrong we will upload something we should
+// have detected as too long which is the least damaging way to fail.
+func checkPathLength(name string) (err error) {
+	for next := ""; len(name) > 0; name = next {
+		if slash := strings.IndexRune(name, '/'); slash >= 0 {
+			name, next = name[:slash], name[slash+1:]
+		} else {
+			next = ""
+		}
+		length := utf8.RuneCountInString(name)
+		if length > maxFileNameLength {
+			return fserrors.NoRetryError(fs.ErrorFileNameTooLong)
+		}
+	}
+	return nil
+}
+
 // Update the already existing object
 //
 // Copy the reader into the object updating modTime and size
@@ -1419,7 +1459,7 @@ func (o *Object) uploadChunked(in0 io.Reader, commitInfo *files.CommitInfo, size
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	if o.fs.opt.SharedFiles || o.fs.opt.SharedFolders {
-		return fserrors.NoRetryError(errors.New("not support in shared files mode"))
+		return errNotSupportedInSharedMode
 	}
 	remote := o.remotePath()
 	if ignoredFiles.MatchString(remote) {
@@ -1429,6 +1469,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	commitInfo.Mode.Tag = "overwrite"
 	// The Dropbox API only accepts timestamps in UTC with second precision.
 	commitInfo.ClientModified = src.ModTime(ctx).UTC().Round(time.Second)
+	// Don't attempt to create filenames that are too long
+	if cErr := checkPathLength(commitInfo.Path); cErr != nil {
+		return cErr
+	}
 
 	size := src.Size()
 	var err error
@@ -1450,7 +1494,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 // Remove an object
 func (o *Object) Remove(ctx context.Context) (err error) {
 	if o.fs.opt.SharedFiles || o.fs.opt.SharedFolders {
-		return fserrors.NoRetryError(errors.New("not support in shared files mode"))
+		return errNotSupportedInSharedMode
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		_, err = o.fs.srv.DeleteV2(&files.DeleteArg{

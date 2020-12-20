@@ -78,7 +78,7 @@ func init() {
 		Prefix:      "gphotos",
 		Description: "Google Photos",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
 			// Parse config into Options struct
 			opt := new(Options)
 			err := configstruct.Set(m, opt)
@@ -95,7 +95,7 @@ func init() {
 			}
 
 			// Do the oauth
-			err = oauthutil.Config("google photos", name, m, oauthConfig, nil)
+			err = oauthutil.Config(ctx, "google photos", name, m, oauthConfig, nil)
 			if err != nil {
 				golog.Fatalf("Failed to configure token: %v", err)
 			}
@@ -246,7 +246,7 @@ func errorHandler(resp *http.Response) error {
 }
 
 // NewFs constructs an Fs from the path, bucket:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -254,8 +254,8 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, err
 	}
 
-	baseClient := fshttp.NewClient(fs.Config)
-	oAuthClient, ts, err := oauthutil.NewClientWithBaseClient(name, m, oauthConfig, baseClient)
+	baseClient := fshttp.NewClient(ctx)
+	oAuthClient, ts, err := oauthutil.NewClientWithBaseClient(ctx, name, m, oauthConfig, baseClient)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to configure Box")
 	}
@@ -272,14 +272,14 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		unAuth:    rest.NewClient(baseClient),
 		srv:       rest.NewClient(oAuthClient).SetRoot(rootURL),
 		ts:        ts,
-		pacer:     fs.NewPacer(pacer.NewGoogleDrive(pacer.MinSleep(minSleep))),
+		pacer:     fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(minSleep))),
 		startTime: time.Now(),
 		albums:    map[bool]*albums{},
 		uploaded:  dirtree.New(),
 	}
 	f.features = (&fs.Features{
 		ReadMimeType: true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 
 	_, _, pattern := patterns.match(f.root, "", true)
@@ -288,7 +288,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		var leaf string
 		f.root, leaf = path.Split(f.root)
 		f.root = strings.TrimRight(f.root, "/")
-		_, err := f.NewObject(context.TODO(), leaf)
+		_, err := f.NewObject(ctx, leaf)
 		if err == nil {
 			return f, fs.ErrorIsFile
 		}

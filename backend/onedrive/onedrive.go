@@ -80,16 +80,16 @@ func init() {
 		Name:        "onedrive",
 		Description: "Microsoft OneDrive",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
-			ctx := context.TODO()
-			err := oauthutil.Config("onedrive", name, m, oauthConfig, nil)
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+			ci := fs.GetConfig(ctx)
+			err := oauthutil.Config(ctx, "onedrive", name, m, oauthConfig, nil)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 				return
 			}
 
 			// Stop if we are running non-interactive config
-			if fs.Config.AutoConfirm {
+			if ci.AutoConfirm {
 				return
 			}
 
@@ -111,7 +111,7 @@ func init() {
 				Sites []siteResource `json:"value"`
 			}
 
-			oAuthClient, _, err := oauthutil.NewClient(name, m, oauthConfig)
+			oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 			if err != nil {
 				log.Fatalf("Failed to configure OneDrive: %v", err)
 			}
@@ -233,7 +233,7 @@ func init() {
 
 			fmt.Printf("Found drive '%s' of type '%s', URL: %s\nIs that okay?\n", rootItem.Name, rootItem.ParentReference.DriveType, rootItem.WebURL)
 			// This does not work, YET :)
-			if !config.ConfirmWithConfig(m, "config_drive_ok", true) {
+			if !config.ConfirmWithConfig(ctx, m, "config_drive_ok", true) {
 				log.Fatalf("Cancelled by user")
 			}
 
@@ -274,9 +274,9 @@ listing, set this option.`,
 		}, {
 			Name:    "server_side_across_configs",
 			Default: false,
-			Help: `Allow server side operations (eg copy) to work across different onedrive configs.
+			Help: `Allow server-side operations (e.g. copy) to work across different onedrive configs.
 
-This can be useful if you wish to do a server side copy between two
+This can be useful if you wish to do a server-side copy between two
 different Onedrives.  Note that this isn't enabled by default
 because it isn't easy to tell if it will work between any two
 configurations.`,
@@ -364,6 +364,7 @@ type Fs struct {
 	name         string             // name of this remote
 	root         string             // the path we are working on
 	opt          Options            // parsed options
+	ci           *fs.ConfigInfo     // global config
 	features     *fs.Features       // optional features
 	srv          *rest.Client       // the connection to the one drive server
 	dirCache     *dircache.DirCache // Map of directory path to directory id
@@ -427,6 +428,8 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
+var gatewayTimeoutError sync.Once
+
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
 func shouldRetry(resp *http.Response, err error) (bool, error) {
@@ -451,6 +454,10 @@ func shouldRetry(resp *http.Response, err error) (bool, error) {
 					fs.Debugf(nil, "Too many requests. Trying again in %d seconds.", retryAfter)
 				}
 			}
+		case 504: // Gateway timeout
+			gatewayTimeoutError.Do(func() {
+				fs.Errorf(nil, "%v: upload chunks may be taking too long - try reducing --onedrive-chunk-size or decreasing --transfers", err)
+			})
 		case 507: // Insufficient Storage
 			return false, fserrors.FatalError(err)
 		}
@@ -590,8 +597,7 @@ func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error)
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	ctx := context.Background()
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -609,26 +615,28 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	}
 
 	root = parsePath(root)
-	oAuthClient, ts, err := oauthutil.NewClient(name, m, oauthConfig)
+	oAuthClient, ts, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to configure OneDrive")
 	}
 
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:      name,
 		root:      root,
 		opt:       *opt,
+		ci:        ci,
 		driveID:   opt.DriveID,
 		driveType: opt.DriveType,
 		srv:       rest.NewClient(oAuthClient).SetRoot(graphURL + "/drives/" + opt.DriveID),
-		pacer:     fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
 		ReadMimeType:            true,
 		CanHaveEmptyDirectories: true,
 		ServerSideAcrossConfigs: opt.ServerSideAcrossConfigs,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 
 	// Renew the token in the background
@@ -967,7 +975,7 @@ func (f *Fs) Precision() time.Duration {
 
 // waitForJob waits for the job with status in url to complete
 func (f *Fs) waitForJob(ctx context.Context, location string, o *Object) error {
-	deadline := time.Now().Add(fs.Config.Timeout)
+	deadline := time.Now().Add(f.ci.Timeout)
 	for time.Now().Before(deadline) {
 		var resp *http.Response
 		var err error
@@ -1003,10 +1011,10 @@ func (f *Fs) waitForJob(ctx context.Context, location string, o *Object) error {
 
 		time.Sleep(1 * time.Second)
 	}
-	return errors.Errorf("async operation didn't complete after %v", fs.Config.Timeout)
+	return errors.Errorf("async operation didn't complete after %v", f.ci.Timeout)
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -1097,7 +1105,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.purgeCheck(ctx, dir, false)
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -1162,7 +1170,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -1247,6 +1255,10 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 		return nil, errors.Wrap(err, "about failed")
 	}
 	q := drive.Quota
+	// On (some?) Onedrive sharepoints these are all 0 so return unknown in that case
+	if q.Total == 0 && q.Used == 0 && q.Deleted == 0 && q.Remaining == 0 {
+		return &fs.Usage{}, nil
+	}
 	usage = &fs.Usage{
 		Total:   fs.NewUsageValue(q.Total),     // quota of bytes that can be used
 		Used:    fs.NewUsageValue(q.Used),      // bytes in use
@@ -1292,7 +1304,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 
 // CleanUp deletes all the hidden files.
 func (f *Fs) CleanUp(ctx context.Context) error {
-	token := make(chan struct{}, fs.Config.Checkers)
+	token := make(chan struct{}, f.ci.Checkers)
 	var wg sync.WaitGroup
 	err := walk.Walk(ctx, f, "", true, -1, func(path string, entries fs.DirEntries, err error) error {
 		err = entries.ForObjectError(func(obj fs.Object) error {

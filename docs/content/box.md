@@ -8,7 +8,7 @@ description: "Rclone docs for Box"
 
 Paths are specified as `remote:path`
 
-Paths may be as deep as required, eg `remote:directory/subdirectory`.
+Paths may be as deep as required, e.g. `remote:directory/subdirectory`.
 
 The initial setup for Box involves getting a token from Box which you
 can do either in your browser, or with a config.json downloaded from Box
@@ -404,6 +404,16 @@ Note that Box is case insensitive so you can't have a file called
 "Hello.doc" and one called "hello.doc".
 
 Box file names can't have the `\` character in.  rclone maps this to
-and from an identical looking unicode equivalent `＼`.
+and from an identical looking unicode equivalent `＼` (U+FF3C Fullwidth
+Reverse Solidus).
 
 Box only supports filenames up to 255 characters in length.
+
+`rclone about` is not supported by the Box backend. Backends without
+this capability cannot determine free space for an rclone mount or
+use policy `mfs` (most free space) as a member of an rclone union
+remote.
+
+See [List of backends that do not support rclone about](https://rclone.org/overview/#optional-features)
+See [rclone about](https://rclone.org/commands/rclone_about/)
+

@@ -43,6 +43,13 @@ import (
 // be taken before Item.mu. writeback may call into Item but Item may
 // **not** call writeback methods with Item.mu held
 
+// LL Item reset is invoked by cache cleaner for synchronous recovery
+// from ENOSPC errors. The reset operation removes the cache file and
+// closes/reopens the downloaders.  Although most parts of reset and
+// other item operations are done with the item mutex held, the mutex
+// is released during fd.WriteAt and downloaders calls. We use preAccess
+// and postAccess calls to serialize reset and other item operations.
+
 // Item is stored in the item map
 //
 // The Info field is written to the backing store to store status
@@ -239,8 +246,23 @@ func (item *Item) _truncate(size int64) (err error) {
 	// Use open handle if available
 	fd := item.fd
 	if fd == nil {
+		// If the metadata says we have some blocks cached then the
+		// file should exist, so open without O_CREATE
+		oFlags := os.O_WRONLY
+		if item.info.Rs.Size() == 0 {
+			oFlags |= os.O_CREATE
+		}
 		osPath := item.c.toOSPath(item.name) // No locking in Cache
-		fd, err = file.OpenFile(osPath, os.O_CREATE|os.O_WRONLY, 0600)
+		fd, err = file.OpenFile(osPath, oFlags, 0600)
+		if err != nil && os.IsNotExist(err) {
+			// If the metadata has info but the file doesn't
+			// not exist then it has been externally removed
+			fs.Errorf(item.name, "vfs cache: detected external removal of cache file")
+			item.info.Rs = nil      // show we have no blocks cached
+			item.info.Dirty = false // file can't be dirty if it doesn't exist
+			item._removeMeta("cache file externally deleted")
+			fd, err = file.OpenFile(osPath, os.O_CREATE|os.O_WRONLY, 0600)
+		}
 		if err != nil {
 			return errors.Wrap(err, "vfs cache: truncate: failed to open cache file")
 		}
@@ -249,7 +271,7 @@ func (item *Item) _truncate(size int64) (err error) {
 
 		err = file.SetSparse(fd)
 		if err != nil {
-			fs.Debugf(item.name, "vfs cache: truncate: failed to set as a sparse file: %v", err)
+			fs.Errorf(item.name, "vfs cache: truncate: failed to set as a sparse file: %v", err)
 		}
 	}
 
@@ -295,6 +317,8 @@ func (item *Item) _truncateToCurrentSize() (err error) {
 // extended and the extended data will be filled with zeros. The
 // object will be marked as dirty in this case also.
 func (item *Item) Truncate(size int64) (err error) {
+	item.preAccess()
+	defer item.postAccess()
 	item.mu.Lock()
 	defer item.mu.Unlock()
 
@@ -414,6 +438,8 @@ func (item *Item) _dirty() {
 
 // Dirty marks the item as changed and needing writeback
 func (item *Item) Dirty() {
+	item.preAccess()
+	defer item.postAccess()
 	item.mu.Lock()
 	item._dirty()
 	item.mu.Unlock()
@@ -446,7 +472,7 @@ func (item *Item) _createFile(osPath string) (err error) {
 	}
 	err = file.SetSparse(fd)
 	if err != nil {
-		fs.Debugf(item.name, "vfs cache: failed to set as a sparse file: %v", err)
+		fs.Errorf(item.name, "vfs cache: failed to set as a sparse file: %v", err)
 	}
 	item.fd = fd
 
@@ -465,7 +491,7 @@ func (item *Item) _createFile(osPath string) (err error) {
 // Open the local file from the object passed in.  Wraps open()
 // to provide recovery from out of space error.
 func (item *Item) Open(o fs.Object) (err error) {
-	for retries := 0; retries < fs.Config.LowLevelRetries; retries++ {
+	for retries := 0; retries < fs.GetConfig(context.TODO()).LowLevelRetries; retries++ {
 		item.preAccess()
 		err = item.open(o)
 		item.postAccess()
@@ -597,6 +623,8 @@ func (item *Item) store(ctx context.Context, storeFn StoreFn) (err error) {
 // Close the cache file
 func (item *Item) Close(storeFn StoreFn) (err error) {
 	// defer log.Trace(item.o, "Item.Close")("err=%v", &err)
+	item.preAccess()
+	defer item.postAccess()
 	var (
 		downloaders   *downloaders.Downloaders
 		syncWriteBack = item.c.opt.WriteBack <= 0
@@ -619,7 +647,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	// If the file is dirty ensure any segments not transferred
 	// are brought in first.
 	//
-	// FIXME It would be nice to do this asynchronously howeve it
+	// FIXME It would be nice to do this asynchronously however it
 	// would require keeping the downloaders alive after the item
 	// has been closed
 	if item.info.Dirty && item.o != nil {
@@ -780,6 +808,13 @@ func (item *Item) _checkObject(o fs.Object) error {
 	return nil
 }
 
+// WrittenBack checks to see if the item has been written back or not
+func (item *Item) WrittenBack() bool {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.info.Fingerprint != ""
+}
+
 // remove the cached file
 //
 // call with lock held
@@ -813,7 +848,7 @@ func (item *Item) _removeMeta(reason string) {
 // remove the cached file and empty the metadata
 //
 // This returns true if the file was in the transfer queue so may not
-// have completedly uploaded yet.
+// have completely uploaded yet.
 //
 // call with lock held
 func (item *Item) _remove(reason string) (wasWriting bool) {
@@ -831,7 +866,7 @@ func (item *Item) _remove(reason string) (wasWriting bool) {
 // remove the cached file and empty the metadata
 //
 // This returns true if the file was in the transfer queue so may not
-// have completedly uploaded yet.
+// have completely uploaded yet.
 func (item *Item) remove(reason string) (wasWriting bool) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
@@ -1154,7 +1189,8 @@ func (item *Item) setModTime(modTime time.Time) {
 // ReadAt bytes from the file at off
 func (item *Item) ReadAt(b []byte, off int64) (n int, err error) {
 	n = 0
-	for retries := 0; retries < fs.Config.LowLevelRetries; retries++ {
+	var expBackOff int
+	for retries := 0; retries < fs.GetConfig(context.TODO()).LowLevelRetries; retries++ {
 		item.preAccess()
 		n, err = item.readAt(b, off)
 		item.postAccess()
@@ -1167,6 +1203,12 @@ func (item *Item) ReadAt(b []byte, off int64) (n int, err error) {
 			break
 		}
 		item.c.KickCleaner()
+		expBackOff = 2 << uint(retries)
+		time.Sleep(time.Duration(expBackOff) * time.Millisecond) // Exponential back-off the retries
+	}
+
+	if fserrors.IsErrNoSpace(err) {
+		fs.Errorf(item.name, "vfs cache: failed to _ensure cache after retries %v", err)
 	}
 
 	return n, err
@@ -1198,6 +1240,8 @@ func (item *Item) readAt(b []byte, off int64) (n int, err error) {
 
 // WriteAt bytes to the file at off
 func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
+	item.preAccess()
+	defer item.postAccess()
 	item.mu.Lock()
 	if item.fd == nil {
 		item.mu.Unlock()
@@ -1288,6 +1332,8 @@ func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, e
 // this means flushing the file system's in-memory copy of recently written
 // data to disk.
 func (item *Item) Sync() (err error) {
+	item.preAccess()
+	defer item.postAccess()
 	item.mu.Lock()
 	defer item.mu.Unlock()
 	if item.fd == nil {
@@ -1307,6 +1353,8 @@ func (item *Item) Sync() (err error) {
 
 // rename the item
 func (item *Item) rename(name string, newName string, newObj fs.Object) (err error) {
+	item.preAccess()
+	defer item.postAccess()
 	item.mu.Lock()
 
 	// stop downloader
@@ -1336,6 +1384,5 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 		_ = downloaders.Close(nil)
 	}
 	item.c.writeback.Rename(id, newName)
-
 	return err
 }

@@ -27,9 +27,11 @@ See the following for detailed instructions for
   * [Cache](/cache/)
   * [Chunker](/chunker/) - transparently splits large files for other remotes
   * [Citrix ShareFile](/sharefile/)
+  * [Compress](/compress/)
   * [Crypt](/crypt/) - to encrypt other remotes
   * [DigitalOcean Spaces](/s3/#digitalocean-spaces)
   * [Dropbox](/dropbox/)
+  * [Enterprise File Fabric](/filefabric/)
   * [FTP](/ftp/)
   * [Google Cloud Storage](/googlecloudstorage/)
   * [Google Drive](/drive/)
@@ -68,7 +70,7 @@ Its syntax is like this
     Syntax: [options] subcommand <parameters> <parameters...>
 
 Source and destination paths are specified by the name you gave the
-storage system in the config file then the sub path, eg
+storage system in the config file then the sub path, e.g.
 "drive:myfolder" to look at "myfolder" in Google drive.
 
 You can define as many storage paths as you like in the config file.
@@ -219,12 +221,12 @@ Here are some gotchas which may help users unfamiliar with the shell rules
 
 ### Linux / OSX ###
 
-If your names have spaces or shell metacharacters (eg `*`, `?`, `$`,
-`'`, `"` etc) then you must quote them.  Use single quotes `'` by default.
+If your names have spaces or shell metacharacters (e.g. `*`, `?`, `$`,
+`'`, `"`, etc.) then you must quote them.  Use single quotes `'` by default.
 
     rclone copy 'Important files?' remote:backup
 
-If you want to send a `'` you will need to use `"`, eg
+If you want to send a `'` you will need to use `"`, e.g.
 
     rclone copy "O'Reilly Reviews" remote:backup
 
@@ -234,12 +236,12 @@ shell.
 
 ### Windows ###
 
-If your names have spaces in you need to put them in `"`, eg
+If your names have spaces in you need to put them in `"`, e.g.
 
     rclone copy "E:\folder name\folder name\folder name" remote:backup
 
 If you are using the root directory on its own then don't quote it
-(see [#464](https://github.com/rclone/rclone/issues/464) for why), eg
+(see [#464](https://github.com/rclone/rclone/issues/464) for why), e.g.
 
     rclone copy E:\ remote:backup
 
@@ -264,7 +266,7 @@ Server Side Copy
 ----------------
 
 Most remotes (but not all - see [the
-overview](/overview/#optional-features)) support server side copy.
+overview](/overview/#optional-features)) support server-side copy.
 
 This means if you want to copy one folder to another then rclone won't
 download all the files and re-upload them; it will instruct the server
@@ -277,19 +279,19 @@ Eg
 Will copy the contents of `oldbucket` to `newbucket` without
 downloading and re-uploading.
 
-Remotes which don't support server side copy **will** download and
+Remotes which don't support server-side copy **will** download and
 re-upload in this case.
 
 Server side copies are used with `sync` and `copy` and will be
 identified in the log when using the `-v` flag.  The `move` command
-may also use them if remote doesn't support server side move directly.
-This is done by issuing a server side copy then a delete which is much
+may also use them if remote doesn't support server-side move directly.
+This is done by issuing a server-side copy then a delete which is much
 quicker than a download and re-upload.
 
 Server side copies will only be attempted if the remote names are the
 same.
 
-This can be used when scripting to make aged backups efficiently, eg
+This can be used when scripting to make aged backups efficiently, e.g.
 
     rclone sync -i remote:current-backup remote:previous-backup
     rclone sync -i /path/to/files remote:current-backup
@@ -315,7 +317,7 @@ time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 
 Options which use SIZE use kByte by default.  However, a suffix of `b`
 for bytes, `k` for kBytes, `M` for MBytes, `G` for GBytes, `T` for
-TBytes and `P` for PBytes may be used.  These are the binary units, eg
+TBytes and `P` for PBytes may be used.  These are the binary units, e.g.
 1, 2\*\*10, 2\*\*20, 2\*\*30 respectively.
 
 ### --backup-dir=DIR ###
@@ -328,7 +330,7 @@ If `--suffix` is set, then the moved files will have the suffix added
 to them.  If there is a file with the same path (after the suffix has
 been added) in DIR, then it will be overwritten.
 
-The remote in use must support server side move or copy and you must
+The remote in use must support server-side move or copy and you must
 use the same remote as the destination of the sync.  The backup
 directory must not overlap the destination directory.
 
@@ -467,7 +469,7 @@ objects to transfer is held in memory before the transfers start.
 ### --checkers=N ###
 
 The number of checkers to run in parallel.  Checkers do the equality
-checking of files during a sync.  For some storage systems (eg S3,
+checking of files during a sync.  For some storage systems (e.g. S3,
 Swift, Dropbox) this can take a significant amount of time so they are
 run in parallel.
 
@@ -483,7 +485,7 @@ This is useful when the remote doesn't support setting modified time
 and a more accurate sync is desired than just checking the file size.
 
 This is very useful when transferring between remotes which store the
-same hash type on the object, eg Drive and Swift. For details of which
+same hash type on the object, e.g. Drive and Swift. For details of which
 remotes support which hash type see the table in the [overview
 section](/overview/).
 
@@ -521,7 +523,7 @@ for Rclone to use it, it will never be created automatically.
 If you run `rclone config file` you will see where the default
 location is for you.
 
-Use this flag to override the config location, eg `rclone
+Use this flag to override the config location, e.g. `rclone
 --config=".myconfig" .config`.
 
 ### --contimeout=TIME ###
@@ -537,10 +539,10 @@ connection to go through to a remote object storage system.  It is
 
 When using `sync`, `copy` or `move` DIR is checked in addition to the 
 destination for files. If a file identical to the source is found that 
-file is server side copied from DIR to the destination. This is useful 
+file is server-side copied from DIR to the destination. This is useful 
 for incremental backup.
 
-The remote in use must support server side copy and you must
+The remote in use must support server-side copy and you must
 use the same remote as the destination of the sync.  The compare
 directory must not overlap the destination directory.
 
@@ -553,7 +555,7 @@ Mode to run dedupe command in.  One of `interactive`, `skip`, `first`, `newest`,
 ### --disable FEATURE,FEATURE,... ###
 
 This disables a comma separated list of optional features. For example
-to disable server side move and server side copy use:
+to disable server-side move and server-side copy use:
 
     --disable move,copy
 
@@ -568,7 +570,7 @@ See the overview [features](/overview/#features) and
 which feature does what.
 
 This flag can be useful for debugging and in exceptional circumstances
-(eg Google Drive limiting the total volume of Server Side Copies to
+(e.g. Google Drive limiting the total volume of Server Side Copies to
 100GB/day).
 
 ### -n, --dry-run ###
@@ -956,7 +958,7 @@ This means that:
 
 - the destination is not listed minimising the API calls
 - files are always transferred
-- this can cause duplicates on remotes which allow it (eg Google Drive)
+- this can cause duplicates on remotes which allow it (e.g. Google Drive)
 - `--retries 1` is recommended otherwise you'll transfer everything again on a retry
 
 This flag is useful to minimise the transactions if you know that none
@@ -1012,7 +1014,7 @@ When using this flag, rclone won't update modification times of remote
 files if they are incorrect as it would normally.
 
 This can be used if the remote is being synced with another tool also
-(eg the Google Drive client).
+(e.g. the Google Drive client).
 
 ### --order-by string ###
 
@@ -1033,7 +1035,7 @@ This can have a modifier appended with a comma:
 - `mixed` - order so that the smallest is processed first for some threads and the largest for others
 
 If the modifier is `mixed` then it can have an optional percentage
-(which defaults to `50`), eg `size,mixed,25` which means that 25% of
+(which defaults to `50`), e.g. `size,mixed,25` which means that 25% of
 the threads should be taking the smallest items and 75% the
 largest. The threads which take the smallest first will always take
 the smallest first and likewise the largest first threads. The `mixed`
@@ -1108,6 +1110,11 @@ Note: On Windows until [this bug](https://github.com/Azure/go-ansiterm/issues/26
 is fixed all non-ASCII characters will be replaced with `.` when
 `--progress` is in use.
 
+### --progress-terminal-title ###
+
+This flag, when used with `-P/--progress`, will print the string `ETA: %s`
+to the terminal title.
+
 ### -q, --quiet ###
 
 This flag will limit rclone's output to error messages only.
@@ -1122,7 +1129,7 @@ This is useful if you uploaded files with the incorrect timestamps and
 you now wish to correct them.
 
 This flag is **only** useful for destinations which don't support
-hashes (eg `crypt`).
+hashes (e.g. `crypt`).
 
 This can be used any of the sync commands `sync`, `copy` or `move`.
 
@@ -1135,7 +1142,7 @@ to see if there is an existing file on the destination. If this file
 matches the source with size (and checksum if available) but has a
 differing timestamp then instead of re-uploading it, rclone will
 update the timestamp on the destination file. If the checksum does not
-match rclone will upload the new file. If the checksum is absent (eg
+match rclone will upload the new file. If the checksum is absent (e.g.
 on a `crypt` backend) then rclone will update the timestamp.
 
 Note that some remotes can't set the modification time without
@@ -1245,7 +1252,7 @@ overwritten or deleted will have the suffix added to them.  If there
 is a file with the same path (after the suffix has been added), then 
 it will be overwritten.
 
-The remote in use must support server side move or copy and you must
+The remote in use must support server-side move or copy and you must
 use the same remote as the destination of the sync.
 
 This is for use with files to add the suffix in the current directory 
@@ -1253,10 +1260,16 @@ or with `--backup-dir`. See `--backup-dir` for more info.
 
 For example
 
-    rclone sync -i /path/to/local/file remote:current --suffix .bak
+    rclone copy -i /path/to/local/file remote:current --suffix .bak
 
-will sync `/path/to/local` to `remote:current`, but for any files
+will copy `/path/to/local` to `remote:current`, but for any files
 which would have been updated or deleted have .bak added.
+
+If using `rclone sync` with `--suffix` and without `--backup-dir` then
+it is recommended to put a filter rule in excluding the suffix
+otherwise the `sync` will delete the backup files.
+
+    rclone sync -i /path/to/local/file remote:current --suffix .bak --exclude "*.bak"
 
 ### --suffix-keep-extension ###
 
@@ -1276,7 +1289,7 @@ This can be useful for running rclone in a script or `rclone mount`.
 
 ### --syslog-facility string ###
 
-If using `--syslog` this sets the syslog facility (eg `KERN`, `USER`).
+If using `--syslog` this sets the syslog facility (e.g. `KERN`, `USER`).
 See `man syslog` for a list of possible facilities.  The default
 facility is `DAEMON`.
 
@@ -1290,7 +1303,7 @@ For example to limit rclone to 10 HTTP transactions per second use
 0.5`.
 
 Use this when the number of transactions per second from rclone is
-causing a problem with the cloud storage provider (eg getting you
+causing a problem with the cloud storage provider (e.g. getting you
 banned or rate limited).
 
 This can be very useful for `rclone mount` to control the behaviour of
@@ -1320,8 +1333,8 @@ By default, rclone doesn't keep track of renamed files, so if you
 rename a file locally then sync it to a remote, rclone will delete the
 old file on the remote and upload a new copy.
 
-If you use this flag, and the remote supports server side copy or
-server side move, and the source and destination have a compatible
+If you use this flag, and the remote supports server-side copy or
+server-side move, and the source and destination have a compatible
 hash, then this will track renames during `sync`
 operations and perform renaming server-side.
 
@@ -1389,7 +1402,7 @@ there were IO errors`.
 
 ### --fast-list ###
 
-When doing anything which involves a directory listing (eg `sync`,
+When doing anything which involves a directory listing (e.g. `sync`,
 `copy`, `ls` - in fact nearly every command), rclone normally lists a
 directory and processes it before using more directory lists to
 process any subdirectories.  This can be parallelised and works very
@@ -1397,7 +1410,7 @@ quickly using the least amount of memory.
 
 However, some remotes have a way of listing all files beneath a
 directory in one (or a small number) of transactions.  These tend to
-be the bucket based remotes (eg S3, B2, GCS, Swift, Hubic).
+be the bucket based remotes (e.g. S3, B2, GCS, Swift, Hubic).
 
 If you use the `--fast-list` flag then rclone will use this method for
 listing directories.  This will have the following consequences for
@@ -1660,7 +1673,7 @@ Developer options
 
 These options are useful when developing or debugging rclone.  There
 are also some more remote specific options which aren't documented
-here which are used for testing.  These start with remote name eg
+here which are used for testing.  These start with remote name e.g.
 `--drive-test-option` - see the docs for the remote in question.
 
 ### --cpuprofile=FILE ###
@@ -1770,7 +1783,7 @@ Logging
 rclone has 4 levels of logging, `ERROR`, `NOTICE`, `INFO` and `DEBUG`.
 
 By default, rclone logs to standard error.  This means you can redirect
-standard error and still see the normal output of rclone commands (eg
+standard error and still see the normal output of rclone commands (e.g.
 `rclone ls`).
 
 By default, rclone will produce `Error` and `Notice` level messages.
@@ -1791,7 +1804,7 @@ If you use the `--log-file=FILE` option, rclone will redirect `Error`,
 If you use the `--syslog` flag then rclone will log to syslog and the
 `--syslog-facility` control which facility it uses.
 
-Rclone prefixes all log messages with their level in capitals, eg INFO
+Rclone prefixes all log messages with their level in capitals, e.g. INFO
 which makes it easy to grep the log file for different kinds of
 information.
 
@@ -1886,11 +1899,11 @@ you must create the `..._TYPE` variable as above.
 The various different methods of backend configuration are read in
 this order and the first one with a value is used.
 
-- Flag values as supplied on the command line, eg `--drive-use-trash`.
-- Remote specific environment vars, eg `RCLONE_CONFIG_MYREMOTE_USE_TRASH` (see above).
-- Backend specific environment vars, eg `RCLONE_DRIVE_USE_TRASH`.
-- Config file, eg `use_trash = false`.
-- Default values, eg `true` - these can't be changed.
+- Flag values as supplied on the command line, e.g. `--drive-use-trash`.
+- Remote specific environment vars, e.g. `RCLONE_CONFIG_MYREMOTE_USE_TRASH` (see above).
+- Backend specific environment vars, e.g. `RCLONE_DRIVE_USE_TRASH`.
+- Config file, e.g. `use_trash = false`.
+- Default values, e.g. `true` - these can't be changed.
 
 So if both `--drive-use-trash` is supplied on the config line and an
 environment variable `RCLONE_DRIVE_USE_TRASH` is set, the command line
@@ -1898,9 +1911,9 @@ flag will take preference.
 
 For non backend configuration the order is as follows:
 
-- Flag values as supplied on the command line, eg `--stats 5s`.
-- Environment vars, eg `RCLONE_STATS=5s`.
-- Default values, eg `1m` - these can't be changed.
+- Flag values as supplied on the command line, e.g. `--stats 5s`.
+- Environment vars, e.g. `RCLONE_STATS=5s`.
+- Default values, e.g. `1m` - these can't be changed.
 
 ### Other environment variables ###
 

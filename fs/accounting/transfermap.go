@@ -1,6 +1,7 @@
 package accounting
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -72,18 +73,27 @@ func (tm *transferMap) _sortedSlice() []*Transfer {
 	for _, tr := range tm.items {
 		s = append(s, tr)
 	}
+	// sort by time first and if equal by name.  Note that the relatively
+	// low time resolution on Windows can cause equal times.
 	sort.Slice(s, func(i, j int) bool {
-		return s[i].startedAt.Before(s[j].startedAt)
+		a, b := s[i], s[j]
+		if a.startedAt.Before(b.startedAt) {
+			return true
+		} else if !a.startedAt.Equal(b.startedAt) {
+			return false
+		}
+		return a.remote < b.remote
 	})
 	return s
 }
 
 // String returns string representation of map items excluding any in
 // exclude (if set).
-func (tm *transferMap) String(progress *inProgress, exclude *transferMap) string {
+func (tm *transferMap) String(ctx context.Context, progress *inProgress, exclude *transferMap) string {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-	strngs := make([]string, 0, len(tm.items))
+	ci := fs.GetConfig(ctx)
+	stringList := make([]string, 0, len(tm.items))
 	for _, tr := range tm._sortedSlice() {
 		if exclude != nil {
 			exclude.mu.RLock()
@@ -98,14 +108,14 @@ func (tm *transferMap) String(progress *inProgress, exclude *transferMap) string
 			out = acc.String()
 		} else {
 			out = fmt.Sprintf("%*s: %s",
-				fs.Config.StatsFileNameLength,
-				shortenName(tr.remote, fs.Config.StatsFileNameLength),
+				ci.StatsFileNameLength,
+				shortenName(tr.remote, ci.StatsFileNameLength),
 				tm.name,
 			)
 		}
-		strngs = append(strngs, " * "+out)
+		stringList = append(stringList, " * "+out)
 	}
-	return strings.Join(strngs, "\n")
+	return strings.Join(stringList, "\n")
 }
 
 // progress returns total bytes read as well as the size.

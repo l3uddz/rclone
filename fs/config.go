@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"context"
 	"net"
 	"strings"
 	"time"
@@ -10,8 +11,8 @@ import (
 
 // Global
 var (
-	// Config is the global config
-	Config = NewConfig()
+	// globalConfig for rclone
+	globalConfig = NewConfig()
 
 	// Read a value from the config file
 	//
@@ -42,6 +43,7 @@ var (
 type ConfigInfo struct {
 	LogLevel               LogLevel
 	StatsLogLevel          LogLevel
+	LogSystemdSupport      bool
 	UseJSONLog             bool
 	DryRun                 bool
 	Interactive            bool
@@ -61,7 +63,7 @@ type ConfigInfo struct {
 	DeleteMode             DeleteMode
 	MaxDelete              int64
 	TrackRenames           bool   // Track file renames.
-	TrackRenamesStrategy   string // Comma separated list of stratgies used to track renames
+	TrackRenamesStrategy   string // Comma separated list of strategies used to track renames
 	LowLevelRetries        int
 	UpdateOlder            bool // Skip files that are newer on the destination
 	NoGzip                 bool // Disable compression
@@ -106,6 +108,7 @@ type ConfigInfo struct {
 	StatsOneLineDateFormat string // If we want to customize the prefix
 	ErrorOnNoTransfer      bool   // Set appropriate exit code if no files transferred
 	Progress               bool
+	ProgressTerminalTitle  bool
 	Cookie                 bool
 	UseMmap                bool
 	CaCert                 string // Client Side CA
@@ -160,14 +163,42 @@ func NewConfig() *ConfigInfo {
 	return c
 }
 
-// ConfigToEnv converts a config section and name, eg ("myremote",
+type configContextKeyType struct{}
+
+// Context key for config
+var configContextKey = configContextKeyType{}
+
+// GetConfig returns the global or context sensitive context
+func GetConfig(ctx context.Context) *ConfigInfo {
+	if ctx == nil {
+		return globalConfig
+	}
+	c := ctx.Value(configContextKey)
+	if c == nil {
+		return globalConfig
+	}
+	return c.(*ConfigInfo)
+}
+
+// AddConfig returns a mutable config structure based on a shallow
+// copy of that found in ctx and returns a new context with that added
+// to it.
+func AddConfig(ctx context.Context) (context.Context, *ConfigInfo) {
+	c := GetConfig(ctx)
+	cCopy := new(ConfigInfo)
+	*cCopy = *c
+	newCtx := context.WithValue(ctx, configContextKey, cCopy)
+	return newCtx, cCopy
+}
+
+// ConfigToEnv converts a config section and name, e.g. ("myremote",
 // "ignore-size") into an environment name
 // "RCLONE_CONFIG_MYREMOTE_IGNORE_SIZE"
 func ConfigToEnv(section, name string) string {
 	return "RCLONE_CONFIG_" + strings.ToUpper(strings.Replace(section+"_"+name, "-", "_", -1))
 }
 
-// OptionToEnv converts an option name, eg "ignore-size" into an
+// OptionToEnv converts an option name, e.g. "ignore-size" into an
 // environment name "RCLONE_IGNORE_SIZE"
 func OptionToEnv(name string) string {
 	return "RCLONE_" + strings.ToUpper(strings.Replace(name, "-", "_", -1))

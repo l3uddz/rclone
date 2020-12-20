@@ -51,7 +51,7 @@ default for this is 5GB which is its maximum value.`,
 	Name: "no_chunk",
 	Help: `Don't chunk files during streaming upload.
 
-When doing streaming uploads (eg using rcat or mount) setting this
+When doing streaming uploads (e.g. using rcat or mount) setting this
 flag will cause the swift backend to not upload chunked files.
 
 This will limit the maximum upload size to 5GB. However non chunked
@@ -221,6 +221,7 @@ type Fs struct {
 	root             string            // the path we are working on if any
 	features         *fs.Features      // optional features
 	opt              Options           // options for this backend
+	ci               *fs.ConfigInfo    // global config
 	c                *swift.Connection // the connection to the swift server
 	rootContainer    string            // container part of root (if any)
 	rootDirectory    string            // directory part of root (if any)
@@ -272,7 +273,7 @@ func (f *Fs) Features() *fs.Features {
 
 // retryErrorCodes is a slice of error codes that we will retry
 var retryErrorCodes = []int{
-	401, // Unauthorized (eg "Token has expired")
+	401, // Unauthorized (e.g. "Token has expired")
 	408, // Request Timeout
 	409, // Conflict - various states that could be resolved on a retry
 	429, // Rate exceeded.
@@ -340,7 +341,8 @@ func (o *Object) split() (container, containerPath string) {
 }
 
 // swiftConnection makes a connection to swift
-func swiftConnection(opt *Options, name string) (*swift.Connection, error) {
+func swiftConnection(ctx context.Context, opt *Options, name string) (*swift.Connection, error) {
+	ci := fs.GetConfig(ctx)
 	c := &swift.Connection{
 		// Keep these in the same order as the Config for ease of checking
 		UserName:                    opt.User,
@@ -359,9 +361,9 @@ func swiftConnection(opt *Options, name string) (*swift.Connection, error) {
 		ApplicationCredentialName:   opt.ApplicationCredentialName,
 		ApplicationCredentialSecret: opt.ApplicationCredentialSecret,
 		EndpointType:                swift.EndpointType(opt.EndpointType),
-		ConnectTimeout:              10 * fs.Config.ConnectTimeout, // Use the timeouts in the transport
-		Timeout:                     10 * fs.Config.Timeout,        // Use the timeouts in the transport
-		Transport:                   fshttp.NewTransport(fs.Config),
+		ConnectTimeout:              10 * ci.ConnectTimeout, // Use the timeouts in the transport
+		Timeout:                     10 * ci.Timeout,        // Use the timeouts in the transport
+		Transport:                   fshttp.NewTransport(ctx),
 	}
 	if opt.EnvAuth {
 		err := c.ApplyEnvironment()
@@ -432,13 +434,15 @@ func (f *Fs) setRoot(root string) {
 //
 // if noCheckContainer is set then the Fs won't check the container
 // exists before creating it.
-func NewFsWithConnection(opt *Options, name, root string, c *swift.Connection, noCheckContainer bool) (fs.Fs, error) {
+func NewFsWithConnection(ctx context.Context, opt *Options, name, root string, c *swift.Connection, noCheckContainer bool) (fs.Fs, error) {
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:             name,
 		opt:              *opt,
+		ci:               ci,
 		c:                c,
 		noCheckContainer: noCheckContainer,
-		pacer:            fs.NewPacer(pacer.NewS3(pacer.MinSleep(minSleep))),
+		pacer:            fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep))),
 		cache:            bucket.NewCache(),
 	}
 	f.setRoot(root)
@@ -448,7 +452,7 @@ func NewFsWithConnection(opt *Options, name, root string, c *swift.Connection, n
 		BucketBased:       true,
 		BucketBasedRootOK: true,
 		SlowModTime:       true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	if f.rootContainer != "" && f.rootDirectory != "" {
 		// Check to see if the object exists - ignoring directory markers
 		var info swift.Object
@@ -473,7 +477,7 @@ func NewFsWithConnection(opt *Options, name, root string, c *swift.Connection, n
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -485,11 +489,11 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, errors.Wrap(err, "swift: chunk size")
 	}
 
-	c, err := swiftConnection(opt, name)
+	c, err := swiftConnection(ctx, opt, name)
 	if err != nil {
 		return nil, err
 	}
-	return NewFsWithConnection(opt, name, root, c, false)
+	return NewFsWithConnection(ctx, opt, name, root, c, false)
 }
 
 // Return an Object from a path
@@ -849,7 +853,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 		return fs.ErrorListBucketRequired
 	}
 	// Delete all the files including the directory markers
-	toBeDeleted := make(chan fs.Object, fs.Config.Transfers)
+	toBeDeleted := make(chan fs.Object, f.ci.Transfers)
 	delErr := make(chan error, 1)
 	go func() {
 		delErr <- operations.DeleteFiles(ctx, toBeDeleted)
@@ -871,7 +875,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.Rmdir(ctx, dir)
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -1040,7 +1044,7 @@ func (o *Object) readMetaData() (err error) {
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	if fs.Config.UseServerModTime {
+	if o.fs.ci.UseServerModTime {
 		return o.lastModified
 	}
 	err := o.readMetaData()

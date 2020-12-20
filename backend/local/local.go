@@ -87,13 +87,13 @@ Normally rclone checks the size and modification time of files as they
 are being uploaded and aborts with a message which starts "can't copy
 - source file is being updated" if the file changes during upload.
 
-However on some file systems this modification time check may fail (eg
+However on some file systems this modification time check may fail (e.g.
 [Glusterfs #2206](https://github.com/rclone/rclone/issues/2206)) so this
 check can be disabled with this flag.
 
 If this flag is set, rclone will use its best efforts to transfer a
 file which is being updated. If the file is only having things
-appended to it (eg a log) then rclone will transfer the log file with
+appended to it (e.g. a log) then rclone will transfer the log file with
 the size it had the first time rclone saw it.
 
 If the file is being modified throughout (not just appended to) then
@@ -217,7 +217,7 @@ type Object struct {
 var errLinksAndCopyLinks = errors.New("can't use -l/--links with -L/--copy-links")
 
 // NewFs constructs an Fs from the path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -245,7 +245,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		CanHaveEmptyDirectories: true,
 		IsLocal:                 true,
 		SlowHash:                true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	if opt.FollowSymlinks {
 		f.lstat = os.Stat
 	}
@@ -456,8 +456,8 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			if f.opt.FollowSymlinks && (mode&os.ModeSymlink) != 0 {
 				localPath := filepath.Join(fsDirPath, name)
 				fi, err = os.Stat(localPath)
-				if os.IsNotExist(err) {
-					// Skip bad symlinks
+				if os.IsNotExist(err) || isCircularSymlinkError(err) {
+					// Skip bad symlinks and circular symlinks
 					err = fserrors.NoRetryError(errors.Wrap(err, "symlink"))
 					fs.Errorf(newRemote, "Listing error: %v", err)
 					err = accounting.Stats(ctx).Error(err)
@@ -637,7 +637,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return os.RemoveAll(dir)
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -701,7 +701,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -1213,7 +1213,7 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 		// Set the file to be a sparse file (important on Windows)
 		err = file.SetSparse(out)
 		if err != nil {
-			fs.Debugf(o, "Failed to set sparse: %v", err)
+			fs.Errorf(o, "Failed to set sparse: %v", err)
 		}
 	}
 
@@ -1231,6 +1231,15 @@ func (o *Object) setMetadata(info os.FileInfo) {
 	o.modTime = info.ModTime()
 	o.mode = info.Mode()
 	o.fs.objectMetaMu.Unlock()
+	// On Windows links read as 0 size so set the correct size here
+	if runtime.GOOS == "windows" && o.translatedLink {
+		linkdst, err := os.Readlink(o.path)
+		if err != nil {
+			fs.Errorf(o, "Failed to read link size: %v", err)
+		} else {
+			o.size = int64(len(linkdst))
+		}
+	}
 }
 
 // Stat an Object into info

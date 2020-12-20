@@ -71,11 +71,12 @@ func helpText() (tr []string) {
 		" ←,h to return",
 		" c toggle counts",
 		" g toggle graph",
-		" n,s,C sort by name,size,count",
+		" a toggle average size in directory",
+		" n,s,C,A sort by name,size,count,average size",
 		" d delete file/directory",
 	}
 	if !clipboard.Unsupported {
-		tr = append(tr, " y copy current path to clipbard")
+		tr = append(tr, " y copy current path to clipboard")
 	}
 	tr = append(tr, []string{
 		" Y display current path",
@@ -88,27 +89,29 @@ func helpText() (tr []string) {
 
 // UI contains the state of the user interface
 type UI struct {
-	f              fs.Fs     // fs being displayed
-	fsName         string    // human name of Fs
-	root           *scan.Dir // root directory
-	d              *scan.Dir // current directory being displayed
-	path           string    // path of current directory
-	showBox        bool      // whether to show a box
-	boxText        []string  // text to show in box
-	boxMenu        []string  // box menu options
-	boxMenuButton  int
-	boxMenuHandler func(fs fs.Fs, path string, option int) (string, error)
-	entries        fs.DirEntries // entries of current directory
-	sortPerm       []int         // order to display entries in after sorting
-	invSortPerm    []int         // inverse order
-	dirListHeight  int           // height of listing
-	listing        bool          // whether listing is in progress
-	showGraph      bool          // toggle showing graph
-	showCounts     bool          // toggle showing counts
-	sortByName     int8          // +1 for normal, 0 for off, -1 for reverse
-	sortBySize     int8
-	sortByCount    int8
-	dirPosMap      map[string]dirPos // store for directory positions
+	f                  fs.Fs     // fs being displayed
+	fsName             string    // human name of Fs
+	root               *scan.Dir // root directory
+	d                  *scan.Dir // current directory being displayed
+	path               string    // path of current directory
+	showBox            bool      // whether to show a box
+	boxText            []string  // text to show in box
+	boxMenu            []string  // box menu options
+	boxMenuButton      int
+	boxMenuHandler     func(fs fs.Fs, path string, option int) (string, error)
+	entries            fs.DirEntries // entries of current directory
+	sortPerm           []int         // order to display entries in after sorting
+	invSortPerm        []int         // inverse order
+	dirListHeight      int           // height of listing
+	listing            bool          // whether listing is in progress
+	showGraph          bool          // toggle showing graph
+	showCounts         bool          // toggle showing counts
+	showDirAverageSize bool          // toggle average size
+	sortByName         int8          // +1 for normal, 0 for off, -1 for reverse
+	sortBySize         int8
+	sortByCount        int8
+	sortByAverageSize  int8
+	dirPosMap          map[string]dirPos // store for directory positions
 }
 
 // Where we have got to in the directory listing
@@ -346,6 +349,18 @@ func (u *UI) Draw() error {
 				}
 
 			}
+			var averageSize float64
+			if count > 0 {
+				averageSize = float64(size) / float64(count)
+			}
+			if u.showDirAverageSize {
+				if averageSize > 0 {
+					extras += fmt.Sprintf("%8v ", fs.SizeSuffix(int64(averageSize)))
+				} else {
+					extras += "         "
+				}
+
+			}
 			if u.showGraph {
 				bars := (size + perBar/2 - 1) / perBar
 				// clip if necessary - only happens during startup
@@ -496,9 +511,17 @@ type ncduSort struct {
 
 // Less is part of sort.Interface.
 func (ds *ncduSort) Less(i, j int) bool {
+	var iAvgSize, jAvgSize float64
 	isize, icount, _, _ := ds.d.AttrI(ds.sortPerm[i])
 	jsize, jcount, _, _ := ds.d.AttrI(ds.sortPerm[j])
 	iname, jname := ds.entries[ds.sortPerm[i]].Remote(), ds.entries[ds.sortPerm[j]].Remote()
+	if icount > 0 {
+		iAvgSize = float64(isize / icount)
+	}
+	if jcount > 0 {
+		jAvgSize = float64(jsize / jcount)
+	}
+
 	switch {
 	case ds.u.sortByName < 0:
 		return iname > jname
@@ -520,6 +543,18 @@ func (ds *ncduSort) Less(i, j int) bool {
 		if icount != jcount {
 			return icount > jcount
 		}
+	case ds.u.sortByAverageSize < 0:
+		if iAvgSize != jAvgSize {
+			return iAvgSize < jAvgSize
+		}
+		// if avgSize is equal, sort by size
+		return isize < jsize
+	case ds.u.sortByAverageSize > 0:
+		if iAvgSize != jAvgSize {
+			return iAvgSize > jAvgSize
+		}
+		// if avgSize is equal, sort by size
+		return isize > jsize
 	}
 	// if everything equal, sort by name
 	return iname < jname
@@ -628,6 +663,7 @@ func (u *UI) toggleSort(sortType *int8) {
 	u.sortBySize = 0
 	u.sortByCount = 0
 	u.sortByName = 0
+	u.sortByAverageSize = 0
 	if old == 0 {
 		*sortType = 1
 	} else {
@@ -639,16 +675,17 @@ func (u *UI) toggleSort(sortType *int8) {
 // NewUI creates a new user interface for ncdu on f
 func NewUI(f fs.Fs) *UI {
 	return &UI{
-		f:             f,
-		path:          "Waiting for root...",
-		dirListHeight: 20, // updated in Draw
-		fsName:        f.Name() + ":" + f.Root(),
-		showGraph:     true,
-		showCounts:    false,
-		sortByName:    0, // +1 for normal, 0 for off, -1 for reverse
-		sortBySize:    1,
-		sortByCount:   0,
-		dirPosMap:     make(map[string]dirPos),
+		f:                  f,
+		path:               "Waiting for root...",
+		dirListHeight:      20, // updated in Draw
+		fsName:             f.Name() + ":" + f.Root(),
+		showGraph:          true,
+		showCounts:         false,
+		showDirAverageSize: false,
+		sortByName:         0, // +1 for normal, 0 for off, -1 for reverse
+		sortBySize:         1,
+		sortByCount:        0,
+		dirPosMap:          make(map[string]dirPos),
 	}
 }
 
@@ -736,12 +773,16 @@ outer:
 					u.showCounts = !u.showCounts
 				case 'g':
 					u.showGraph = !u.showGraph
+				case 'a':
+					u.showDirAverageSize = !u.showDirAverageSize
 				case 'n':
 					u.toggleSort(&u.sortByName)
 				case 's':
 					u.toggleSort(&u.sortBySize)
 				case 'C':
 					u.toggleSort(&u.sortByCount)
+				case 'A':
+					u.toggleSort(&u.sortByAverageSize)
 				case 'y':
 					u.copyPath()
 				case 'Y':
@@ -761,7 +802,7 @@ outer:
 				}
 			}
 		}
-		// listen to key presses, etc
+		// listen to key presses, etc.
 	}
 	return nil
 }
