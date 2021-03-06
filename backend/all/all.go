@@ -18,6 +18,7 @@ import (
 	_ "github.com/rclone/rclone/backend/ftp"
 	_ "github.com/rclone/rclone/backend/googlecloudstorage"
 	_ "github.com/rclone/rclone/backend/googlephotos"
+	_ "github.com/rclone/rclone/backend/hdfs"
 	_ "github.com/rclone/rclone/backend/http"
 	_ "github.com/rclone/rclone/backend/hubic"
 	_ "github.com/rclone/rclone/backend/jottacloud"
@@ -42,4 +43,5 @@ import (
 	_ "github.com/rclone/rclone/backend/union"
 	_ "github.com/rclone/rclone/backend/webdav"
 	_ "github.com/rclone/rclone/backend/yandex"
+	_ "github.com/rclone/rclone/backend/zoho"
 )

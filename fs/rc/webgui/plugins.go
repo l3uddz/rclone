@@ -15,6 +15,8 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/rc/rcflags"
+	"github.com/rclone/rclone/lib/errors"
 )
 
 // PackageJSON is the structure of package.json of a plugin
@@ -62,19 +64,9 @@ var (
 	PluginsPath              string
 	pluginsConfigPath        string
 	availablePluginsJSONPath = "availablePlugins.json"
+	initSuccess              = false
+	initMutex                = &sync.Mutex{}
 )
-
-func init() {
-	cachePath = filepath.Join(config.CacheDir, "webgui")
-	PluginsPath = filepath.Join(cachePath, "plugins")
-	pluginsConfigPath = filepath.Join(PluginsPath, "config")
-
-	loadedPlugins = newPlugins(availablePluginsJSONPath)
-	err := loadedPlugins.readFromFile()
-	if err != nil {
-		fs.Errorf(nil, "error reading available plugins: %v", err)
-	}
-}
 
 // Plugins represents the structure how plugins are saved onto disk
 type Plugins struct {
@@ -90,9 +82,28 @@ func newPlugins(fileName string) *Plugins {
 	return &p
 }
 
+func initPluginsOrError() error {
+	if !rcflags.Opt.WebUI {
+		return errors.New("WebUI needs to be enabled for plugins to work")
+	}
+	initMutex.Lock()
+	defer initMutex.Unlock()
+	if !initSuccess {
+		cachePath = filepath.Join(config.CacheDir, "webgui")
+		PluginsPath = filepath.Join(cachePath, "plugins")
+		pluginsConfigPath = filepath.Join(PluginsPath, "config")
+		loadedPlugins = newPlugins(availablePluginsJSONPath)
+		err := loadedPlugins.readFromFile()
+		if err != nil {
+			fs.Errorf(nil, "error reading available plugins: %v", err)
+		}
+		initSuccess = true
+	}
+
+	return nil
+}
+
 func (p *Plugins) readFromFile() (err error) {
-	//p.mutex.Lock()
-	//defer p.mutex.Unlock()
 	err = CreatePathIfNotExist(pluginsConfigPath)
 	if err != nil {
 		return err
@@ -169,8 +180,6 @@ func (p *Plugins) addTestPlugin(pluginName string, testURL string, handlesType [
 }
 
 func (p *Plugins) writeToFile() (err error) {
-	//p.mutex.Lock()
-	//defer p.mutex.Unlock()
 	availablePluginsJSON := filepath.Join(pluginsConfigPath, p.fileName)
 
 	file, err := json.MarshalIndent(p, "", " ")
@@ -290,6 +299,10 @@ var referrerPathReg = regexp.MustCompile("^(https?):\\/\\/(.+):([0-9]+)?\\/(.*)\
 // sends a redirect to actual url. This function is useful for plugins to refer to absolute paths when
 // the referrer in http.Request is set
 func ServePluginWithReferrerOK(w http.ResponseWriter, r *http.Request, path string) (ok bool) {
+	err := initPluginsOrError()
+	if err != nil {
+		return false
+	}
 	referrer := r.Referer()
 	referrerPathMatch := referrerPathReg.FindStringSubmatch(referrer)
 

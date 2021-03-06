@@ -29,11 +29,11 @@ var (
 	}
 
 	// CountError counts an error.  If any errors have been
-	// counted then it will exit with a non zero error code.
+	// counted then rclone will exit with a non zero error code.
 	//
 	// This is a function pointer to decouple the config
 	// implementation from the fs
-	CountError = func(err error) error { return nil }
+	CountError = func(err error) error { return err }
 
 	// ConfigProvider is the config key used for provider options
 	ConfigProvider = "provider"
@@ -43,7 +43,6 @@ var (
 type ConfigInfo struct {
 	LogLevel               LogLevel
 	StatsLogLevel          LogLevel
-	LogSystemdSupport      bool
 	UseJSONLog             bool
 	DryRun                 bool
 	Interactive            bool
@@ -77,8 +76,8 @@ type ConfigInfo struct {
 	NoUnicodeNormalization bool
 	NoUpdateModTime        bool
 	DataRateUnit           string
-	CompareDest            string
-	CopyDest               string
+	CompareDest            []string
+	CopyDest               []string
 	BackupDir              string
 	Suffix                 string
 	SuffixKeepExtension    bool
@@ -122,6 +121,8 @@ type ConfigInfo struct {
 	DownloadHeaders        []*HTTPOption
 	Headers                []*HTTPOption
 	RefreshTimes           bool
+	NoConsole              bool
+	TrafficClass           uint8
 }
 
 // NewConfig creates a new config with everything set to the default
@@ -161,6 +162,14 @@ func NewConfig() *ConfigInfo {
 	c.TrackRenamesStrategy = "hash"
 
 	return c
+}
+
+// TimeoutOrInfinite returns ci.Timeout if > 0 or infinite otherwise
+func (c *ConfigInfo) TimeoutOrInfinite() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	return ModTimeNotSupported
 }
 
 type configContextKeyType struct{}

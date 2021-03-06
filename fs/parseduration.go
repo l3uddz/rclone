@@ -88,8 +88,9 @@ func parseDurationDates(age string, epoch time.Time) (t time.Duration, err error
 	return t, err
 }
 
-// ParseDuration parses a duration string. Accept ms|s|m|h|d|w|M|y suffixes. Defaults to second if not provided
-func ParseDuration(age string) (d time.Duration, err error) {
+// parseDurationFromNow parses a duration string. Allows ParseDuration to match the time
+// package and easier testing within the fs package.
+func parseDurationFromNow(age string, getNow func() time.Time) (d time.Duration, err error) {
 	if age == "off" {
 		return time.Duration(DurationOff), nil
 	}
@@ -105,12 +106,17 @@ func ParseDuration(age string) (d time.Duration, err error) {
 		return d, nil
 	}
 
-	d, err = parseDurationDates(age, time.Now())
+	d, err = parseDurationDates(age, getNow())
 	if err == nil {
 		return d, nil
 	}
 
 	return d, err
+}
+
+// ParseDuration parses a duration string. Accept ms|s|m|h|d|w|M|y suffixes. Defaults to second if not provided
+func ParseDuration(age string) (time.Duration, error) {
+	return parseDurationFromNow(age, time.Now)
 }
 
 // ReadableString parses d into a human readable duration.
@@ -188,6 +194,14 @@ func (d *Duration) Set(s string) error {
 // Type of the value
 func (d Duration) Type() string {
 	return "Duration"
+}
+
+// UnmarshalJSON makes sure the value can be parsed as a string or integer in JSON
+func (d *Duration) UnmarshalJSON(in []byte) error {
+	return UnmarshalJSONFlag(in, d, func(i int64) error {
+		*d = Duration(i)
+		return nil
+	})
 }
 
 // Scan implements the fmt.Scanner interface

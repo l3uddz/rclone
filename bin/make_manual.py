@@ -42,6 +42,7 @@ docs = [
     "googlecloudstorage.md",
     "drive.md",
     "googlephotos.md",
+    "hdfs.md",
     "http.md",
     "hubic.md",
     "jottacloud.md",
@@ -64,6 +65,7 @@ docs = [
     "union.md",
     "webdav.md",
     "yandex.md",
+    "zoho.md",
 
     "local.md",
     "changelog.md",

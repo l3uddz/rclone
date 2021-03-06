@@ -71,6 +71,20 @@ points, as you explicitly acknowledge that they should be skipped.`,
 			NoPrefix: true,
 			Advanced: true,
 		}, {
+			Name: "zero_size_links",
+			Help: `Assume the Stat size of links is zero (and read them instead)
+
+On some virtual filesystems (such ash LucidLink), reading a link size via a Stat call always returns 0.
+However, on unix it reads as the length of the text in the link. This may cause errors like this when
+syncing:
+
+    Failed to copy: corrupted on transfer: sizes differ 0 vs 13
+
+Setting this flag causes rclone to read the link and use that as the size of the link
+instead of 0 which in most cases fixes the problem.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "no_unicode_normalization",
 			Help: `Don't apply unicode normalization to paths and filenames (Deprecated)
 
@@ -135,6 +149,17 @@ to override the default choice.`,
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "no_preallocate",
+			Help: `Disable preallocation of disk space for transferred files
+
+Preallocation of disk space helps prevent filesystem fragmentation.
+However, some virtual filesystem layers (such as Google Drive File
+Stream) may incorrectly set the actual file size equal to the
+preallocated space, causing checksum and file size checks to fail.
+Use this flag to disable preallocation.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "no_sparse",
 			Help: `Disable sparse files for multi-thread downloads
 
@@ -170,12 +195,14 @@ type Options struct {
 	FollowSymlinks    bool                 `config:"copy_links"`
 	TranslateSymlinks bool                 `config:"links"`
 	SkipSymlinks      bool                 `config:"skip_links"`
+	ZeroSizeLinks     bool                 `config:"zero_size_links"`
 	NoUTFNorm         bool                 `config:"no_unicode_normalization"`
 	NoCheckUpdated    bool                 `config:"no_check_updated"`
 	NoUNC             bool                 `config:"nounc"`
 	OneFileSystem     bool                 `config:"one_file_system"`
 	CaseSensitive     bool                 `config:"case_sensitive"`
 	CaseInsensitive   bool                 `config:"case_insensitive"`
+	NoPreAllocate     bool                 `config:"no_preallocate"`
 	NoSparse          bool                 `config:"no_sparse"`
 	NoSetModTime      bool                 `config:"no_set_modtime"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
@@ -1112,10 +1139,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				return err
 			}
 		}
-		// Pre-allocate the file for performance reasons
-		err = file.PreAllocate(src.Size(), f)
-		if err != nil {
-			fs.Debugf(o, "Failed to pre-allocate: %v", err)
+		if !o.fs.opt.NoPreAllocate {
+			// Pre-allocate the file for performance reasons
+			err = file.PreAllocate(src.Size(), f)
+			if err != nil {
+				fs.Debugf(o, "Failed to pre-allocate: %v", err)
+			}
 		}
 		out = f
 	} else {
@@ -1202,9 +1231,11 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 		return nil, err
 	}
 	// Pre-allocate the file for performance reasons
-	err = file.PreAllocate(size, out)
-	if err != nil {
-		fs.Debugf(o, "Failed to pre-allocate: %v", err)
+	if !f.opt.NoPreAllocate {
+		err = file.PreAllocate(size, out)
+		if err != nil {
+			fs.Debugf(o, "Failed to pre-allocate: %v", err)
+		}
 	}
 	if !f.opt.NoSparse && file.SetSparseImplemented {
 		sparseWarning.Do(func() {
@@ -1232,7 +1263,8 @@ func (o *Object) setMetadata(info os.FileInfo) {
 	o.mode = info.Mode()
 	o.fs.objectMetaMu.Unlock()
 	// On Windows links read as 0 size so set the correct size here
-	if runtime.GOOS == "windows" && o.translatedLink {
+	// Optionally, users can turn this feature on with the zero_size_links flag
+	if (runtime.GOOS == "windows" || o.fs.opt.ZeroSizeLinks) && o.translatedLink {
 		linkdst, err := os.Readlink(o.path)
 		if err != nil {
 			fs.Errorf(o, "Failed to read link size: %v", err)

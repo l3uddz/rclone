@@ -155,7 +155,9 @@ to start uploading.`,
 
 This is usually set to a Cloudflare CDN URL as Backblaze offers
 free egress for data downloaded through the Cloudflare network.
-This is probably only useful for a public bucket.
+Rclone works with private buckets by sending an "Authorization" header.
+If the custom endpoint rewrites the requests for authentication,
+e.g., in Cloudflare Workers, this header needs to be handled properly.
 Leave blank if you want to use the endpoint provided by Backblaze.`,
 			Advanced: true,
 		}, {
@@ -401,6 +403,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
+	if opt.UploadCutoff < opt.ChunkSize {
+		opt.UploadCutoff = opt.ChunkSize
+		fs.Infof(nil, "b2: raising upload cutoff to chunk size: %v", opt.UploadCutoff)
+	}
 	err = checkUploadCutoff(opt, opt.UploadCutoff)
 	if err != nil {
 		return nil, errors.Wrap(err, "b2: upload cutoff")
@@ -473,12 +479,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.setRoot(newRoot)
 		_, err := f.NewObject(ctx, leaf)
 		if err != nil {
-			if err == fs.ErrorObjectNotFound {
-				// File doesn't exist so return old f
-				f.setRoot(oldRoot)
-				return f, nil
-			}
-			return nil, err
+			// File doesn't exist so return old f
+			f.setRoot(oldRoot)
+			return f, nil
 		}
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
@@ -706,7 +709,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 			remote := file.Name[len(prefix):]
 			// Check for directory
 			isDirectory := remote == "" || strings.HasSuffix(remote, "/")
-			if isDirectory {
+			if isDirectory && len(remote) > 1 {
 				remote = remote[:len(remote)-1]
 			}
 			if addBucket {

@@ -13,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/rc"
 )
 
@@ -29,11 +30,68 @@ type Job struct {
 	Duration  float64   `json:"duration"`
 	Output    rc.Params `json:"output"`
 	Stop      func()    `json:"-"`
+	listeners []*func()
 
 	// realErr is the Error before printing it as a string, it's used to return
 	// the real error to the upper application layers while still printing the
 	// string error message.
 	realErr error
+}
+
+// mark the job as finished
+func (job *Job) finish(out rc.Params, err error) {
+	job.mu.Lock()
+	job.EndTime = time.Now()
+	if out == nil {
+		out = make(rc.Params)
+	}
+	job.Output = out
+	job.Duration = job.EndTime.Sub(job.StartTime).Seconds()
+	if err != nil {
+		job.realErr = err
+		job.Error = err.Error()
+		job.Success = false
+	} else {
+		job.realErr = nil
+		job.Error = ""
+		job.Success = true
+	}
+	job.Finished = true
+
+	// Notify listeners that the job is finished
+	for i := range job.listeners {
+		go (*job.listeners[i])()
+	}
+
+	job.mu.Unlock()
+	running.kickExpire() // make sure this job gets expired
+}
+
+func (job *Job) addListener(fn *func()) {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	job.listeners = append(job.listeners, fn)
+}
+
+func (job *Job) removeListener(fn *func()) {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	for i, ln := range job.listeners {
+		if ln == fn {
+			job.listeners = append(job.listeners[:i], job.listeners[i+1:]...)
+			return
+		}
+	}
+}
+
+// run the job until completion writing the return status
+func (job *Job) run(ctx context.Context, fn rc.Func, in rc.Params) {
+	defer func() {
+		if r := recover(); r != nil {
+			job.finish(nil, errors.Errorf("panic received: %v \n%s", r, string(debug.Stack())))
+		}
+	}()
+	job.finish(fn(ctx, in))
 }
 
 // Jobs describes a collection of running tasks
@@ -117,65 +175,101 @@ func (jobs *Jobs) Get(ID int64) *Job {
 	return jobs.jobs[ID]
 }
 
-// mark the job as finished
-func (job *Job) finish(out rc.Params, err error) {
-	job.mu.Lock()
-	job.EndTime = time.Now()
-	if out == nil {
-		out = make(rc.Params)
-	}
-	job.Output = out
-	job.Duration = job.EndTime.Sub(job.StartTime).Seconds()
-	if err != nil {
-		job.realErr = err
-		job.Error = err.Error()
-		job.Success = false
-	} else {
-		job.realErr = nil
-		job.Error = ""
-		job.Success = true
-	}
-	job.Finished = true
-	job.mu.Unlock()
-	running.kickExpire() // make sure this job gets expired
-}
-
-// run the job until completion writing the return status
-func (job *Job) run(ctx context.Context, fn rc.Func, in rc.Params) {
-	defer func() {
-		if r := recover(); r != nil {
-			job.finish(nil, errors.Errorf("panic received: %v \n%s", r, string(debug.Stack())))
-		}
-	}()
-	job.finish(fn(ctx, in))
-}
-
-func getGroup(in rc.Params) string {
-	// Check to see if the group is set
+// Check to see if the group is set
+func getGroup(ctx context.Context, in rc.Params, id int64) (context.Context, string, error) {
 	group, err := in.GetString("_group")
 	if rc.NotErrParamNotFound(err) {
-		fs.Errorf(nil, "Can't get _group param %+v", err)
+		return ctx, "", err
 	}
 	delete(in, "_group")
-	return group
-}
-
-// NewAsyncJob start a new asynchronous Job off
-func (jobs *Jobs) NewAsyncJob(fn rc.Func, in rc.Params) *Job {
-	id := atomic.AddInt64(&jobID, 1)
-
-	group := getGroup(in)
 	if group == "" {
 		group = fmt.Sprintf("job/%d", id)
 	}
-	ctx := accounting.WithStatsGroup(context.Background(), group)
+	ctx = accounting.WithStatsGroup(ctx, group)
+	return ctx, group, nil
+}
+
+// See if _async is set returning a boolean and a possible new context
+func getAsync(ctx context.Context, in rc.Params) (context.Context, bool, error) {
+	isAsync, err := in.GetBool("_async")
+	if rc.NotErrParamNotFound(err) {
+		return ctx, false, err
+	}
+	delete(in, "_async") // remove the async parameter after parsing
+	if isAsync {
+		// unlink this job from the current context
+		ctx = context.Background()
+	}
+	return ctx, isAsync, nil
+}
+
+// See if _config is set and if so adjust ctx to include it
+func getConfig(ctx context.Context, in rc.Params) (context.Context, error) {
+	if _, ok := in["_config"]; !ok {
+		return ctx, nil
+	}
+	ctx, ci := fs.AddConfig(ctx)
+	err := in.GetStruct("_config", ci)
+	if err != nil {
+		return ctx, err
+	}
+	delete(in, "_config") // remove the parameter
+	return ctx, nil
+}
+
+// See if _filter is set and if so adjust ctx to include it
+func getFilter(ctx context.Context, in rc.Params) (context.Context, error) {
+	if _, ok := in["_filter"]; !ok {
+		return ctx, nil
+	}
+	// Copy of the current filter options
+	opt := filter.GetConfig(ctx).Opt
+	// Update the options from the parameter
+	err := in.GetStruct("_filter", &opt)
+	if err != nil {
+		return ctx, err
+	}
+	fi, err := filter.NewFilter(&opt)
+	if err != nil {
+		return ctx, err
+	}
+	ctx = filter.ReplaceConfig(ctx, fi)
+	delete(in, "_filter") // remove the parameter
+	return ctx, nil
+}
+
+// NewJob creates a Job and executes it, possibly in the background if _async is set
+func (jobs *Jobs) NewJob(ctx context.Context, fn rc.Func, in rc.Params) (job *Job, out rc.Params, err error) {
+	id := atomic.AddInt64(&jobID, 1)
+	in = in.Copy() // copy input so we can change it
+
+	ctx, isAsync, err := getAsync(ctx, in)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctx, err = getConfig(ctx, in)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctx, err = getFilter(ctx, in)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctx, group, err := getGroup(ctx, in, id)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	stop := func() {
 		cancel()
 		// Wait for cancel to propagate before returning.
 		<-ctx.Done()
 	}
-	job := &Job{
+	job = &Job{
 		ID:        id,
 		Group:     group,
 		StartTime: time.Now(),
@@ -184,51 +278,38 @@ func (jobs *Jobs) NewAsyncJob(fn rc.Func, in rc.Params) *Job {
 	jobs.mu.Lock()
 	jobs.jobs[job.ID] = job
 	jobs.mu.Unlock()
-	go job.run(ctx, fn, in)
-	return job
+	if isAsync {
+		go job.run(ctx, fn, in)
+		out = make(rc.Params)
+		out["jobid"] = job.ID
+		err = nil
+	} else {
+		job.run(ctx, fn, in)
+		out = job.Output
+		err = job.realErr
+	}
+	return job, out, err
 }
 
-// NewSyncJob start a new synchronous Job off
-func (jobs *Jobs) NewSyncJob(ctx context.Context, in rc.Params) (*Job, context.Context) {
-	id := atomic.AddInt64(&jobID, 1)
-	group := getGroup(in)
-	if group == "" {
-		group = fmt.Sprintf("job/%d", id)
-	}
-	ctxG := accounting.WithStatsGroup(ctx, fmt.Sprintf("job/%d", id))
-	ctx, cancel := context.WithCancel(ctxG)
-	stop := func() {
-		cancel()
-		// Wait for cancel to propagate before returning.
-		<-ctx.Done()
-	}
-	job := &Job{
-		ID:        id,
-		Group:     group,
-		StartTime: time.Now(),
-		Stop:      stop,
-	}
-	jobs.mu.Lock()
-	jobs.jobs[job.ID] = job
-	jobs.mu.Unlock()
-	return job, ctx
+// NewJob creates a Job and executes it on the global job queue,
+// possibly in the background if _async is set
+func NewJob(ctx context.Context, fn rc.Func, in rc.Params) (job *Job, out rc.Params, err error) {
+	return running.NewJob(ctx, fn, in)
 }
 
-// StartAsyncJob starts a new job asynchronously and returns a Param suitable
-// for output.
-func StartAsyncJob(fn rc.Func, in rc.Params) (rc.Params, error) {
-	job := running.NewAsyncJob(fn, in)
-	out := make(rc.Params)
-	out["jobid"] = job.ID
-	return out, nil
-}
-
-// ExecuteJob executes new job synchronously and returns a Param suitable for
-// output.
-func ExecuteJob(ctx context.Context, fn rc.Func, in rc.Params) (rc.Params, int64, error) {
-	job, ctx := running.NewSyncJob(ctx, in)
-	job.run(ctx, fn, in)
-	return job.Output, job.ID, job.realErr
+// OnFinish adds listener to jobid that will be triggered when job is finished.
+// It returns a function to cancel listening.
+func OnFinish(jobID int64, fn func()) (func(), error) {
+	job := running.Get(jobID)
+	if job == nil {
+		return func() {}, errors.New("job not found")
+	}
+	if job.Finished {
+		fn()
+	} else {
+		job.addListener(&fn)
+	}
+	return func() { job.removeListener(&fn) }, nil
 }
 
 func init() {

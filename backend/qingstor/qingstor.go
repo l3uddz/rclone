@@ -872,11 +872,12 @@ func (f *Fs) cleanUpBucket(ctx context.Context, bucket string) (err error) {
 	if err != nil {
 		return err
 	}
-	maxLimit := int(listLimitSize)
+	// maxLimit := int(listLimitSize)
 	var marker *string
 	for {
 		req := qs.ListMultipartUploadsInput{
-			Limit:     &maxLimit,
+			// The default is 200 but this errors if more than 200 is put in so leave at the default
+			// Limit:     &maxLimit,
 			KeyMarker: marker,
 		}
 		var resp *qs.ListMultipartUploadsOutput
@@ -927,7 +928,7 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 	}
 	for _, entry := range entries {
 		cleanErr := f.cleanUpBucket(ctx, f.opt.Enc.FromStandardName(entry.Remote()))
-		if err != nil {
+		if cleanErr != nil {
 			fs.Errorf(f, "Failed to cleanup bucket: %q", cleanErr)
 			err = cleanErr
 		}

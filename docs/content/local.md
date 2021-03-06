@@ -347,6 +347,24 @@ points, as you explicitly acknowledge that they should be skipped.
 - Type:        bool
 - Default:     false
 
+#### --local-zero-size-links
+
+Assume the Stat size of links is zero (and read them instead)
+
+On some virtual filesystems (such ash LucidLink), reading a link size via a Stat call always returns 0.
+However, on unix it reads as the length of the text in the link. This may cause errors like this when
+syncing:
+
+    Failed to copy: corrupted on transfer: sizes differ 0 vs 13
+
+Setting this flag causes rclone to read the link and use that as the size of the link
+instead of 0 which in most cases fixes the problem.
+
+- Config:      zero_size_links
+- Env Var:     RCLONE_LOCAL_ZERO_SIZE_LINKS
+- Type:        bool
+- Default:     false
+
 #### --local-no-unicode-normalization
 
 Don't apply unicode normalization to paths and filenames (Deprecated)
@@ -426,6 +444,21 @@ to override the default choice.
 
 - Config:      case_insensitive
 - Env Var:     RCLONE_LOCAL_CASE_INSENSITIVE
+- Type:        bool
+- Default:     false
+
+#### --local-no-preallocate
+
+Disable preallocation of disk space for transferred files
+
+Preallocation of disk space helps prevent filesystem fragmentation.
+However, some virtual filesystem layers (such as Google Drive File
+Stream) may incorrectly set the actual file size equal to the
+preallocated space, causing checksum and file size checks to fail.
+Use this flag to disable preallocation.
+
+- Config:      no_preallocate
+- Env Var:     RCLONE_LOCAL_NO_PREALLOCATE
 - Type:        bool
 - Default:     false
 

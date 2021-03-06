@@ -33,7 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/ncw/swift"
+	"github.com/ncw/swift/v2"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -869,6 +869,12 @@ isn't set then "acl" is used instead.`,
 				Help:  "Owner gets FULL_CONTROL. The AuthenticatedUsers group gets READ access.",
 			}},
 		}, {
+			Name:     "requester_pays",
+			Help:     "Enables requester pays option when interacting with S3 bucket.",
+			Provider: "AWS",
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     "server_side_encryption",
 			Help:     "The server-side encryption algorithm used when storing this object in S3.",
 			Provider: "AWS,Ceph,Minio",
@@ -1175,6 +1181,43 @@ In Ceph, this can be increased with the "rgw list buckets max chunk" option.
 
 This can be useful when trying to minimise the number of transactions
 rclone does if you know the bucket exists already.
+
+It can also be needed if the user you are using does not have bucket
+creation permissions. Before v1.52.0 this would have passed silently
+due to a bug.
+`,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "no_head",
+			Help: `If set, don't HEAD uploaded objects to check integrity
+
+This can be useful when trying to minimise the number of transactions
+rclone does.
+
+Setting it means that if rclone receives a 200 OK message after
+uploading an object with PUT then it will assume that it got uploaded
+properly.
+
+In particular it will assume:
+
+- the metadata, including modtime, storage class and content type was as uploaded
+- the size was as uploaded
+
+It reads the following items from the response for a single part PUT:
+
+- the MD5SUM
+- The uploaded date
+
+For multipart uploads these items aren't read.
+
+If an source object of unknown length is uploaded then rclone **will** do a
+HEAD request.
+
+Setting this flag increases the chance for undetected upload failures,
+in particular an incorrect size, so it isn't recommended for normal
+operation. In practice the chance of an undetected upload failure is
+very small even with this flag.
 `,
 			Default:  false,
 			Advanced: true,
@@ -1253,6 +1296,7 @@ type Options struct {
 	LocationConstraint    string               `config:"location_constraint"`
 	ACL                   string               `config:"acl"`
 	BucketACL             string               `config:"bucket_acl"`
+	RequesterPays         bool                 `config:"requester_pays"`
 	ServerSideEncryption  string               `config:"server_side_encryption"`
 	SSEKMSKeyID           string               `config:"sse_kms_key_id"`
 	SSECustomerAlgorithm  string               `config:"sse_customer_algorithm"`
@@ -1274,6 +1318,7 @@ type Options struct {
 	LeavePartsOnError     bool                 `config:"leave_parts_on_error"`
 	ListChunk             int64                `config:"list_chunk"`
 	NoCheckBucket         bool                 `config:"no_check_bucket"`
+	NoHead                bool                 `config:"no_head"`
 	Enc                   encoder.MultiEncoder `config:"encoding"`
 	MemoryPoolFlushTime   fs.Duration          `config:"memory_pool_flush_time"`
 	MemoryPoolUseMmap     bool                 `config:"memory_pool_use_mmap"`
@@ -1417,7 +1462,7 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 }
 
 // s3Connection makes a connection to s3
-func s3Connection(ctx context.Context, opt *Options) (*s3.S3, *session.Session, error) {
+func s3Connection(ctx context.Context, opt *Options, client *http.Client) (*s3.S3, *session.Session, error) {
 	// Make the auth
 	v := credentials.Value{
 		AccessKeyID:     opt.AccessKeyID,
@@ -1495,7 +1540,7 @@ func s3Connection(ctx context.Context, opt *Options) (*s3.S3, *session.Session, 
 	awsConfig := aws.NewConfig().
 		WithMaxRetries(0). // Rely on rclone's retry logic
 		WithCredentials(cred).
-		WithHTTPClient(getClient(ctx, opt)).
+		WithHTTPClient(client).
 		WithS3ForcePathStyle(opt.ForcePathStyle).
 		WithS3UseAccelerate(opt.UseAccelerateEndpoint).
 		WithS3UsEast1RegionalEndpoint(endpoints.RegionalS3UsEast1Endpoint)
@@ -1514,9 +1559,6 @@ func s3Connection(ctx context.Context, opt *Options) (*s3.S3, *session.Session, 
 	if opt.EnvAuth && opt.AccessKeyID == "" && opt.SecretAccessKey == "" {
 		// Enable loading config options from ~/.aws/config (selected by AWS_PROFILE env)
 		awsSessionOpts.SharedConfigState = session.SharedConfigEnable
-		// The session constructor (aws/session/mergeConfigSrcs) will only use the user's preferred credential source
-		// (from the shared config file) if the passed-in Options.Config.Credentials is nil.
-		awsSessionOpts.Config.Credentials = nil
 	}
 	ses, err := session.NewSessionWithOptions(awsSessionOpts)
 	if err != nil {
@@ -1602,7 +1644,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		md5sumBinary := md5.Sum([]byte(opt.SSECustomerKey))
 		opt.SSECustomerKeyMD5 = base64.StdEncoding.EncodeToString(md5sumBinary[:])
 	}
-	c, ses, err := s3Connection(ctx, opt)
+	srv := getClient(ctx, opt)
+	c, ses, err := s3Connection(ctx, opt, srv)
 	if err != nil {
 		return nil, err
 	}
@@ -1617,7 +1660,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ses:   ses,
 		pacer: fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep))),
 		cache: bucket.NewCache(),
-		srv:   getClient(ctx, opt),
+		srv:   srv,
 		pool: pool.New(
 			time.Duration(opt.MemoryPoolFlushTime),
 			int(opt.ChunkSize),
@@ -1652,12 +1695,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.setRoot(newRoot)
 		_, err := f.NewObject(ctx, leaf)
 		if err != nil {
-			if err == fs.ErrorObjectNotFound || err == fs.ErrorNotAFile {
-				// File doesn't exist or is a directory so return old f
-				f.setRoot(oldRoot)
-				return f, nil
-			}
-			return nil, err
+			// File doesn't exist or is a directory so return old f
+			f.setRoot(oldRoot)
+			return f, nil
 		}
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
@@ -1734,7 +1774,7 @@ func (f *Fs) updateRegionForBucket(bucket string) error {
 	// Make a new session with the new region
 	oldRegion := f.opt.Region
 	f.opt.Region = region
-	c, ses, err := s3Connection(f.ctx, &f.opt)
+	c, ses, err := s3Connection(f.ctx, &f.opt, f.srv)
 	if err != nil {
 		return errors.Wrap(err, "creating new session failed")
 	}
@@ -1793,6 +1833,9 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 		}
 		if urlEncodeListings {
 			req.EncodingType = aws.String(s3.EncodingTypeUrl)
+		}
+		if f.opt.RequesterPays {
+			req.RequestPayer = aws.String(s3.RequestPayerRequester)
 		}
 		var resp *s3.ListObjectsOutput
 		var err error
@@ -2169,6 +2212,9 @@ func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPa
 	req.Key = &dstPath
 	source := pathEscape(path.Join(srcBucket, srcPath))
 	req.CopySource = &source
+	if f.opt.RequesterPays {
+		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+	}
 	if f.opt.ServerSideEncryption != "" {
 		req.ServerSideEncryption = &f.opt.ServerSideEncryption
 	}
@@ -2740,6 +2786,9 @@ func (o *Object) headObject(ctx context.Context) (resp *s3.HeadObjectOutput, err
 		Bucket: &bucket,
 		Key:    &bucketPath,
 	}
+	if o.fs.opt.RequesterPays {
+		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+	}
 	if o.fs.opt.SSECustomerAlgorithm != "" {
 		req.SSECustomerAlgorithm = &o.fs.opt.SSECustomerAlgorithm
 	}
@@ -2858,6 +2907,9 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		Metadata:          o.meta,
 		MetadataDirective: aws.String(s3.MetadataDirectiveReplace), // replace metadata with that passed in
 	}
+	if o.fs.opt.RequesterPays {
+		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+	}
 	return o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o)
 }
 
@@ -2872,6 +2924,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	req := s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &bucketPath,
+	}
+	if o.fs.opt.RequesterPays {
+		req.RequestPayer = aws.String(s3.RequestPayerRequester)
 	}
 	if o.fs.opt.SSECustomerAlgorithm != "" {
 		req.SSECustomerAlgorithm = &o.fs.opt.SSECustomerAlgorithm
@@ -3157,6 +3212,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if md5sum != "" {
 		req.ContentMD5 = &md5sum
 	}
+	if o.fs.opt.RequesterPays {
+		req.RequestPayer = aws.String(s3.RequestPayerRequester)
+	}
 	if o.fs.opt.ServerSideEncryption != "" {
 		req.ServerSideEncryption = &o.fs.opt.ServerSideEncryption
 	}
@@ -3205,6 +3263,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
+	var resp *http.Response // response from PUT
 	if multipart {
 		err = o.uploadMultipart(ctx, &req, size, in)
 		if err != nil {
@@ -3234,18 +3293,18 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 
 		// create the vanilla http request
-		httpReq, err := http.NewRequest("PUT", url, in)
+		httpReq, err := http.NewRequestWithContext(ctx, "PUT", url, in)
 		if err != nil {
 			return errors.Wrap(err, "s3 upload: new request")
 		}
-		httpReq = httpReq.WithContext(ctx) // go1.13 can use NewRequestWithContext
 
 		// set the headers we signed and the length
 		httpReq.Header = headers
 		httpReq.ContentLength = size
 
 		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-			resp, err := o.fs.srv.Do(httpReq)
+			var err error
+			resp, err = o.fs.srv.Do(httpReq)
 			if err != nil {
 				return o.fs.shouldRetry(err)
 			}
@@ -3264,6 +3323,26 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
+	// User requested we don't HEAD the object after uploading it
+	// so make up the object as best we can assuming it got
+	// uploaded properly. If size < 0 then we need to do the HEAD.
+	if o.fs.opt.NoHead && size >= 0 {
+		o.md5 = md5sum
+		o.bytes = size
+		o.lastModified = time.Now()
+		o.meta = req.Metadata
+		o.mimeType = aws.StringValue(req.ContentType)
+		o.storageClass = aws.StringValue(req.StorageClass)
+		// If we have done a single part PUT request then we can read these
+		if resp != nil {
+			if date, err := http.ParseTime(resp.Header.Get("Date")); err == nil {
+				o.lastModified = date
+			}
+			o.setMD5FromEtag(resp.Header.Get("Etag"))
+		}
+		return nil
+	}
+
 	// Read the metadata from the newly created object
 	o.meta = nil // wipe old metadata
 	err = o.readMetaData(ctx)
@@ -3276,6 +3355,9 @@ func (o *Object) Remove(ctx context.Context) error {
 	req := s3.DeleteObjectInput{
 		Bucket: &bucket,
 		Key:    &bucketPath,
+	}
+	if o.fs.opt.RequesterPays {
+		req.RequestPayer = aws.String(s3.RequestPayerRequester)
 	}
 	err := o.fs.pacer.Call(func() (bool, error) {
 		_, err := o.fs.c.DeleteObjectWithContext(ctx, &req)

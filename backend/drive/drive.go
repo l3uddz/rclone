@@ -75,6 +75,7 @@ const (
 	partialFields    = "id,name,size,md5Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks"
 	listRGrouping    = 50   // number of IDs to search at once when using ListR
 	listRInputBuffer = 1000 // size of input buffer when using ListR
+	defaultXDGIcon   = "text-html"
 )
 
 // Globals
@@ -129,6 +130,12 @@ var (
 	}
 	_mimeTypeCustomTransform = map[string]string{
 		"application/vnd.google-apps.script+json": "application/json",
+	}
+	_mimeTypeToXDGLinkIcons = map[string]string{
+		"application/vnd.google-apps.document":     "x-office-document",
+		"application/vnd.google-apps.drawing":      "x-office-drawing",
+		"application/vnd.google-apps.presentation": "x-office-presentation",
+		"application/vnd.google-apps.spreadsheet":  "x-office-spreadsheet",
 	}
 	fetchFormatsOnce sync.Once                     // make sure we fetch the export/import formats only once
 	_exportFormats   map[string][]string           // allowed export MIME type conversions
@@ -202,7 +209,7 @@ func init() {
 			}
 			err = configTeamDrive(ctx, opt, m, name)
 			if err != nil {
-				log.Fatalf("Failed to configure team drive: %v", err)
+				log.Fatalf("Failed to configure Shared Drive: %v", err)
 			}
 		},
 		Options: append(driveOAuthOptions(), []fs.Option{{
@@ -248,7 +255,7 @@ a non root folder as its starting point.
 			Advanced: true,
 		}, {
 			Name:     "team_drive",
-			Help:     "ID of the Team Drive",
+			Help:     "ID of the Shared Drive (Team Drive)",
 			Hide:     fs.OptionHideConfigurator,
 			Advanced: true,
 		}, {
@@ -1038,24 +1045,24 @@ func configTeamDrive(ctx context.Context, opt *Options, m configmap.Mapper, name
 		return nil
 	}
 	if opt.TeamDriveID == "" {
-		fmt.Printf("Configure this as a team drive?\n")
+		fmt.Printf("Configure this as a Shared Drive (Team Drive)?\n")
 	} else {
-		fmt.Printf("Change current team drive ID %q?\n", opt.TeamDriveID)
+		fmt.Printf("Change current Shared Drive (Team Drive) ID %q?\n", opt.TeamDriveID)
 	}
 	if !config.Confirm(false) {
 		return nil
 	}
 	f, err := newFs(ctx, name, "", m)
 	if err != nil {
-		return errors.Wrap(err, "failed to make Fs to list teamdrives")
+		return errors.Wrap(err, "failed to make Fs to list Shared Drives")
 	}
-	fmt.Printf("Fetching team drive list...\n")
+	fmt.Printf("Fetching Shared Drive list...\n")
 	teamDrives, err := f.listTeamDrives(ctx)
 	if err != nil {
 		return err
 	}
 	if len(teamDrives) == 0 {
-		fmt.Printf("No team drives found in your account")
+		fmt.Printf("No Shared Drives found in your account")
 		return nil
 	}
 	var driveIDs, driveNames []string
@@ -1063,7 +1070,7 @@ func configTeamDrive(ctx context.Context, opt *Options, m configmap.Mapper, name
 		driveIDs = append(driveIDs, teamDrive.Id)
 		driveNames = append(driveNames, teamDrive.Name)
 	}
-	driveID := config.Choose("Enter a Team Drive ID", driveIDs, driveNames, true)
+	driveID := config.Choose("Enter a Shared Drive ID", driveIDs, driveNames, true)
 	m.Set("team_drive", driveID)
 	m.Set("root_folder_id", "")
 	opt.TeamDriveID = driveID
@@ -1392,11 +1399,15 @@ func (f *Fs) newLinkObject(remote string, info *drive.File, extension, exportMim
 	if t == nil {
 		return nil, errors.Errorf("unsupported link type %s", exportMimeType)
 	}
+	xdgIcon := _mimeTypeToXDGLinkIcons[info.MimeType]
+	if xdgIcon == "" {
+		xdgIcon = defaultXDGIcon
+	}
 	var buf bytes.Buffer
 	err := t.Execute(&buf, struct {
-		URL, Title string
+		URL, Title, XDGIcon string
 	}{
-		info.WebViewLink, info.Name,
+		info.WebViewLink, info.Name, xdgIcon,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "executing template failed")
@@ -2555,6 +2566,7 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	fs.Logf(f, "Note that emptying the trash happens in the background and can take some time.")
 	return nil
 }
 
@@ -2570,9 +2582,9 @@ func (f *Fs) teamDriveOK(ctx context.Context) (err error) {
 		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
 	})
 	if err != nil {
-		return errors.Wrap(err, "failed to get Team/Shared Drive info")
+		return errors.Wrap(err, "failed to get Shared Drive info")
 	}
-	fs.Debugf(f, "read info from team drive %q", td.Name)
+	fs.Debugf(f, "read info from Shared Drive %q", td.Name)
 	return err
 }
 
@@ -3170,7 +3182,7 @@ func (f *Fs) listTeamDrives(ctx context.Context) (drives []*drive.TeamDrive, err
 			return defaultFs.shouldRetry(NewErrorWithRetryContext(err, sa))
 		})
 		if err != nil {
-			return drives, errors.Wrap(err, "listing team drives failed")
+			return drives, errors.Wrap(err, "listing Team Drives failed")
 		}
 		drives = append(drives, teamDrives.TeamDrives...)
 		if teamDrives.NextPageToken == "" {
@@ -3272,6 +3284,9 @@ func (f *Fs) copyID(ctx context.Context, id, dest string) (err error) {
 	if destLeaf == "" {
 		destLeaf = info.Name
 	}
+	if destDir == "" {
+		destDir = "."
+	}
 	dstFs, err := cache.Get(ctx, destDir)
 	if err != nil {
 		return err
@@ -3336,8 +3351,8 @@ authenticated with "drive2:" can't read files from "drive:".
 	},
 }, {
 	Name:  "drives",
-	Short: "List the shared drives available to this account",
-	Long: `This command lists the shared drives (teamdrives) available to this
+	Short: "List the Shared Drives available to this account",
+	Long: `This command lists the Shared Drives (Team Drives) available to this
 account.
 
 Usage:
@@ -3633,11 +3648,10 @@ func (o *baseObject) httpResponse(ctx context.Context, url, method string, optio
 	if url == "" {
 		return nil, nil, errors.New("forbidden to download - check sharing permission")
 	}
-	req, err = http.NewRequest(method, url, nil)
+	req, err = http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		return req, nil, err
 	}
-	req = req.WithContext(ctx) // go1.13 can use NewRequestWithContext
 	fs.OpenOptionAddHTTPHeaders(req.Header, options)
 	if o.bytes == 0 {
 		// Don't supply range requests for 0 length objects as they always fail
@@ -3975,7 +3989,7 @@ URL={{ .URL }}{{"\r"}}
 Encoding=UTF-8
 Name={{ .Title }}
 URL={{ .URL }}
-Icon=text-html
+Icon={{ .XDGIcon }}
 Type=Link
 `
 	htmlTemplate = `<html>

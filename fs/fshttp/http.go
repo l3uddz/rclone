@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/lib/structs"
 	"golang.org/x/net/publicsuffix"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -29,79 +29,9 @@ const (
 var (
 	transport    http.RoundTripper
 	noTransport  = new(sync.Once)
-	tpsBucket    *rate.Limiter // for limiting number of http transactions per second
 	cookieJar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	logMutex     sync.Mutex
 )
-
-// StartHTTPTokenBucket starts the token bucket if necessary
-func StartHTTPTokenBucket(ctx context.Context) {
-	ci := fs.GetConfig(ctx)
-	if ci.TPSLimit > 0 {
-		tpsBurst := ci.TPSLimitBurst
-		if tpsBurst < 1 {
-			tpsBurst = 1
-		}
-		tpsBucket = rate.NewLimiter(rate.Limit(ci.TPSLimit), tpsBurst)
-		fs.Infof(nil, "Starting HTTP transaction limiter: max %g transactions/s with burst %d", ci.TPSLimit, tpsBurst)
-	}
-}
-
-// A net.Conn that sets a deadline for every Read or Write operation
-type timeoutConn struct {
-	net.Conn
-	timeout time.Duration
-}
-
-// create a timeoutConn using the timeout
-func newTimeoutConn(conn net.Conn, timeout time.Duration) (c *timeoutConn, err error) {
-	c = &timeoutConn{
-		Conn:    conn,
-		timeout: timeout,
-	}
-	err = c.nudgeDeadline()
-	return
-}
-
-// Nudge the deadline for an idle timeout on by c.timeout if non-zero
-func (c *timeoutConn) nudgeDeadline() (err error) {
-	if c.timeout == 0 {
-		return nil
-	}
-	when := time.Now().Add(c.timeout)
-	return c.Conn.SetDeadline(when)
-}
-
-// readOrWrite bytes doing idle timeouts
-func (c *timeoutConn) readOrWrite(f func([]byte) (int, error), b []byte) (n int, err error) {
-	n, err = f(b)
-	// Don't nudge if no bytes or an error
-	if n == 0 || err != nil {
-		return
-	}
-	// Nudge the deadline on successful Read or Write
-	err = c.nudgeDeadline()
-	return
-}
-
-// Read bytes doing idle timeouts
-func (c *timeoutConn) Read(b []byte) (n int, err error) {
-	return c.readOrWrite(c.Conn.Read, b)
-}
-
-// Write bytes doing idle timeouts
-func (c *timeoutConn) Write(b []byte) (n int, err error) {
-	return c.readOrWrite(c.Conn.Write, b)
-}
-
-// dial with context and timeouts
-func dialContextTimeout(ctx context.Context, network, address string, ci *fs.ConfigInfo) (net.Conn, error) {
-	dialer := NewDialer(ctx)
-	c, err := dialer.DialContext(ctx, network, address)
-	if err != nil {
-		return c, err
-	}
-	return newTimeoutConn(c, ci.Timeout)
-}
 
 // ResetTransport resets the existing transport, allowing it to take new settings.
 // Should only be used for testing.
@@ -158,7 +88,7 @@ func NewTransportCustom(ctx context.Context, customize func(*http.Transport)) ht
 
 	t.DisableCompression = ci.NoGzip
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialContextTimeout(ctx, network, addr, ci)
+		return dialContext(ctx, network, addr, ci)
 	}
 	t.IdleConnTimeout = 60 * time.Second
 	t.ExpectContinueTimeout = ci.ExpectContinueTimeout
@@ -308,13 +238,8 @@ func cleanAuths(buf []byte) []byte {
 
 // RoundTrip implements the RoundTripper interface.
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
-	// Get transactions per second token first if limiting
-	if tpsBucket != nil {
-		tbErr := tpsBucket.Wait(req.Context())
-		if tbErr != nil && tbErr != context.Canceled {
-			fs.Errorf(nil, "HTTP token bucket error: %v", tbErr)
-		}
-	}
+	// Limit transactions per second if required
+	accounting.LimitTPS(req.Context())
 	// Force user agent
 	req.Header.Set("User-Agent", t.userAgent)
 	// Set user defined headers
@@ -331,15 +256,18 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		if t.dump&fs.DumpAuth == 0 {
 			buf = cleanAuths(buf)
 		}
+		logMutex.Lock()
 		fs.Debugf(nil, "%s", separatorReq)
 		fs.Debugf(nil, "%s (req %p)", "HTTP REQUEST", req)
 		fs.Debugf(nil, "%s", string(buf))
 		fs.Debugf(nil, "%s", separatorReq)
+		logMutex.Unlock()
 	}
 	// Do round trip
 	resp, err = t.Transport.RoundTrip(req)
 	// Logf response
 	if t.dump&(fs.DumpHeaders|fs.DumpBodies|fs.DumpAuth|fs.DumpRequests|fs.DumpResponses) != 0 {
+		logMutex.Lock()
 		fs.Debugf(nil, "%s", separatorResp)
 		fs.Debugf(nil, "%s (req %p)", "HTTP RESPONSE", req)
 		if err != nil {
@@ -349,23 +277,10 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			fs.Debugf(nil, "%s", string(buf))
 		}
 		fs.Debugf(nil, "%s", separatorResp)
+		logMutex.Unlock()
 	}
 	if err == nil {
 		checkServerTime(req, resp)
 	}
 	return resp, err
-}
-
-// NewDialer creates a net.Dialer structure with Timeout, Keepalive
-// and LocalAddr set from rclone flags.
-func NewDialer(ctx context.Context) *net.Dialer {
-	ci := fs.GetConfig(ctx)
-	dialer := &net.Dialer{
-		Timeout:   ci.ConnectTimeout,
-		KeepAlive: 30 * time.Second,
-	}
-	if ci.BindAddr != nil {
-		dialer.LocalAddr = &net.TCPAddr{IP: ci.BindAddr}
-	}
-	return dialer
 }

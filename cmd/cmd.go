@@ -21,7 +21,6 @@ import (
 	"sync"
 	"time"
 
-	systemd "github.com/iguanesolutions/go-systemd/v5"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
@@ -265,7 +264,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 			break
 		}
 		if accounting.GlobalStats().Errored() && !accounting.GlobalStats().HadRetryError() {
-			fs.Errorf(nil, "Can't retry this error - not attempting retries")
+			fs.Errorf(nil, "Can't retry any of the errors - not attempting retries")
 			break
 		}
 		if retryAfter := accounting.GlobalStats().RetryAfter(); !retryAfter.IsZero() {
@@ -376,17 +375,17 @@ func StartStats() func() {
 func initConfig() {
 	ctx := context.Background()
 	ci := fs.GetConfig(ctx)
-	// Activate logger systemd support if systemd invocation ID is detected
-	_, sysdLaunch := systemd.GetInvocationID()
-	if sysdLaunch {
-		ci.LogSystemdSupport = true // used during fslog.InitLogging()
-	}
 
 	// Start the logger
 	fslog.InitLogging()
 
 	// Finish parsing any command line flags
 	configflags.SetFlags(ci)
+
+	// Hide console window
+	if ci.NoConsole {
+		terminal.HideConsole()
+	}
 
 	// Load filters
 	err := filterflags.Reload(ctx)
@@ -398,10 +397,8 @@ func initConfig() {
 	fs.Debugf("rclone", "Version %q starting with parameters %q", fs.Version, os.Args)
 
 	// Inform user about systemd log support now that we have a logger
-	if sysdLaunch {
-		fs.Debugf("rclone", "systemd logging support automatically activated")
-	} else if ci.LogSystemdSupport {
-		fs.Debugf("rclone", "systemd logging support manually activated")
+	if fslog.Opt.LogSystemdSupport {
+		fs.Debugf("rclone", "systemd logging support activated")
 	}
 
 	// Start the remote control server if configured

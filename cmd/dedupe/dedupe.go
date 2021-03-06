@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
@@ -92,7 +93,7 @@ Now the ` + "`dedupe`" + ` session
     s/k/r> k
     Enter the number of the file to keep> 1
     one.txt: Deleted 1 extra copies
-    two.txt: Found 3 files with duplicates names
+    two.txt: Found 3 files with duplicate names
     two.txt: 3 duplicates remain
       1:       564374 bytes, 2016-03-05 16:22:52.118000000, MD5 7594e7dc9fc28f727c42ee3e0749de81
       2:      6048320 bytes, 2016-03-05 16:22:46.185000000, MD5 1eedaa9fe86fd4b8632e2ac549403b36
@@ -143,6 +144,9 @@ Or
 			args = args[1:]
 		}
 		fdst := cmd.NewFsSrc(args)
+		if !byHash && !fdst.Features().DuplicateFiles {
+			fs.Logf(fdst, "Can't have duplicate names here. Perhaps you wanted --by-hash ? Continuing anyway.")
+		}
 		cmd.Run(false, false, command, func() error {
 			return operations.Deduplicate(context.Background(), fdst, dedupeMode, byHash)
 		})

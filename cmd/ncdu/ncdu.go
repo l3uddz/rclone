@@ -281,12 +281,26 @@ func (u *UI) biggestEntry() (biggest int64) {
 		return
 	}
 	for i := range u.entries {
-		size, _, _, _ := u.d.AttrI(u.sortPerm[i])
+		size, _, _, _, _, _ := u.d.AttrI(u.sortPerm[i])
 		if size > biggest {
 			biggest = size
 		}
 	}
 	return
+}
+
+// hasEmptyDir returns true if there is empty folder in current listing
+func (u *UI) hasEmptyDir() bool {
+	if u.d == nil {
+		return false
+	}
+	for i := range u.entries {
+		_, count, isDir, _, _, _ := u.d.AttrI(u.sortPerm[i])
+		if isDir && count == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Draw the current screen
@@ -319,6 +333,7 @@ func (u *UI) Draw() error {
 		if perBar == 0 {
 			perBar = 1
 		}
+		showEmptyDir := u.hasEmptyDir()
 		dirPos := u.dirPosMap[u.path]
 		for i, j := range u.sortPerm[dirPos.offset:] {
 			entry := u.entries[j]
@@ -326,19 +341,34 @@ func (u *UI) Draw() error {
 			if y >= h-1 {
 				break
 			}
+			size, count, isDir, readable, entriesHaveErrors, err := u.d.AttrI(u.sortPerm[n])
 			fg := termbox.ColorWhite
+			if entriesHaveErrors {
+				fg = termbox.ColorYellow
+			}
+			if err != nil {
+				fg = termbox.ColorRed
+			}
 			bg := termbox.ColorBlack
 			if n == dirPos.entry {
 				fg, bg = bg, fg
 			}
-			size, count, isDir, readable := u.d.AttrI(u.sortPerm[n])
 			mark := ' '
 			if isDir {
 				mark = '/'
 			}
+			fileFlag := ' '
 			message := ""
 			if !readable {
 				message = " [not read yet]"
+			}
+			if entriesHaveErrors {
+				message = " [some subdirectories could not be read, size may be underestimated]"
+				fileFlag = '.'
+			}
+			if err != nil {
+				message = fmt.Sprintf(" [%s]", err)
+				fileFlag = '!'
 			}
 			extras := ""
 			if u.showCounts {
@@ -361,6 +391,11 @@ func (u *UI) Draw() error {
 				}
 
 			}
+			if showEmptyDir {
+				if isDir && count == 0 && fileFlag == ' ' {
+					fileFlag = 'e'
+				}
+			}
 			if u.showGraph {
 				bars := (size + perBar/2 - 1) / perBar
 				// clip if necessary - only happens during startup
@@ -371,7 +406,7 @@ func (u *UI) Draw() error {
 				}
 				extras += "[" + graph[graphBars-bars:2*graphBars-bars] + "] "
 			}
-			Linef(0, y, w, fg, bg, ' ', "%8v %s%c%s%s", fs.SizeSuffix(size), extras, mark, path.Base(entry.Remote()), message)
+			Linef(0, y, w, fg, bg, ' ', "%c %8v %s%c%s%s", fileFlag, fs.SizeSuffix(size), extras, mark, path.Base(entry.Remote()), message)
 			y++
 		}
 	}
@@ -512,8 +547,8 @@ type ncduSort struct {
 // Less is part of sort.Interface.
 func (ds *ncduSort) Less(i, j int) bool {
 	var iAvgSize, jAvgSize float64
-	isize, icount, _, _ := ds.d.AttrI(ds.sortPerm[i])
-	jsize, jcount, _, _ := ds.d.AttrI(ds.sortPerm[j])
+	isize, icount, _, _, _, _ := ds.d.AttrI(ds.sortPerm[i])
+	jsize, jcount, _, _, _, _ := ds.d.AttrI(ds.sortPerm[j])
 	iname, jname := ds.entries[ds.sortPerm[i]].Remote(), ds.entries[ds.sortPerm[j]].Remote()
 	if icount > 0 {
 		iAvgSize = float64(isize / icount)

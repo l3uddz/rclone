@@ -10,16 +10,18 @@ import (
 	"runtime"
 	"strings"
 
+	systemd "github.com/iguanesolutions/go-systemd/v5"
 	"github.com/rclone/rclone/fs"
 	"github.com/sirupsen/logrus"
 )
 
-// Options contains options for the remote control server
+// Options contains options for controlling the logging
 type Options struct {
-	File           string // Log everything to this file
-	Format         string // Comma separated list of log format options
-	UseSyslog      bool   // Use Syslog for logging
-	SyslogFacility string // Facility for syslog, e.g. KERN,USER,...
+	File              string // Log everything to this file
+	Format            string // Comma separated list of log format options
+	UseSyslog         bool   // Use Syslog for logging
+	SyslogFacility    string // Facility for syslog, e.g. KERN,USER,...
+	LogSystemdSupport bool   // set if using systemd logging
 }
 
 // DefaultOpt is the default values used for Opt
@@ -91,19 +93,17 @@ func Stack(o interface{}, info string) {
 func InitLogging() {
 	flagsStr := "," + Opt.Format + ","
 	var flags int
-	if !fs.GetConfig(context.Background()).LogSystemdSupport {
-		if strings.Contains(flagsStr, ",date,") {
-			flags |= log.Ldate
-		}
-		if strings.Contains(flagsStr, ",time,") {
-			flags |= log.Ltime
-		}
-		if strings.Contains(flagsStr, ",microseconds,") {
-			flags |= log.Lmicroseconds
-		}
-		if strings.Contains(flagsStr, ",UTC,") {
-			flags |= log.LUTC
-		}
+	if strings.Contains(flagsStr, ",date,") {
+		flags |= log.Ldate
+	}
+	if strings.Contains(flagsStr, ",time,") {
+		flags |= log.Ltime
+	}
+	if strings.Contains(flagsStr, ",microseconds,") {
+		flags |= log.Lmicroseconds
+	}
+	if strings.Contains(flagsStr, ",UTC,") {
+		flags |= log.LUTC
 	}
 	if strings.Contains(flagsStr, ",longfile,") {
 		flags |= log.Llongfile
@@ -134,6 +134,19 @@ func InitLogging() {
 			log.Fatalf("Can't use --syslog and --log-file together")
 		}
 		startSysLog()
+	}
+
+	// Activate systemd logger support if systemd invocation ID is
+	// detected and output is going to stderr (not logging to a file or syslog)
+	if !Redirected() {
+		if _, usingSystemd := systemd.GetInvocationID(); usingSystemd {
+			Opt.LogSystemdSupport = true
+		}
+	}
+
+	// Systemd logging output
+	if Opt.LogSystemdSupport {
+		startSystemdLog()
 	}
 }
 

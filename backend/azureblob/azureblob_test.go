@@ -1,6 +1,6 @@
 // Test AzureBlob filesystem interface
 
-// +build !plan9,!solaris,!js,go1.13
+// +build !plan9,!solaris,!js,go1.14
 
 package azureblob
 
@@ -29,13 +29,8 @@ func (f *Fs) SetUploadChunkSize(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
 	return f.setUploadChunkSize(cs)
 }
 
-func (f *Fs) SetUploadCutoff(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
-	return f.setUploadCutoff(cs)
-}
-
 var (
 	_ fstests.SetUploadChunkSizer = (*Fs)(nil)
-	_ fstests.SetUploadCutoffer   = (*Fs)(nil)
 )
 
 // TestServicePrincipalFileSuccess checks that, given a proper JSON file, we can create a token.

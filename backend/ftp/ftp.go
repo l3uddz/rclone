@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"net"
 	"net/textproto"
 	"path"
 	"runtime"
@@ -15,10 +16,12 @@ import (
 	"github.com/jlaffaye/ftp"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/env"
@@ -91,6 +94,17 @@ to an encrypted one. Cannot be used in combination with implicit FTP.`,
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name:    "idle_timeout",
+			Default: fs.Duration(60 * time.Second),
+			Help: `Max time before closing idle connections
+
+If no connections have been returned to the connection pool in the time
+given, rclone will empty the connection pool.
+
+Set to 0 to keep connections indefinitely.
+`,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -117,6 +131,7 @@ type Options struct {
 	SkipVerifyTLSCert bool                 `config:"no_check_certificate"`
 	DisableEPSV       bool                 `config:"disable_epsv"`
 	DisableMLSD       bool                 `config:"disable_mlsd"`
+	IdleTimeout       fs.Duration          `config:"idle_timeout"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -133,7 +148,9 @@ type Fs struct {
 	dialAddr string
 	poolMu   sync.Mutex
 	pool     []*ftp.ServerConn
+	drain    *time.Timer // used to drain the pool when we stop using the connections
 	tokens   *pacer.TokenDispenser
+	tlsConf  *tls.Config
 }
 
 // Object describes an FTP file
@@ -210,25 +227,36 @@ func (dl *debugLog) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+type dialCtx struct {
+	f   *Fs
+	ctx context.Context
+}
+
+// dial a new connection with fshttp dialer
+func (d *dialCtx) dial(network, address string) (net.Conn, error) {
+	conn, err := fshttp.NewDialer(d.ctx).Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	if d.f.tlsConf != nil {
+		conn = tls.Client(conn, d.f.tlsConf)
+	}
+	return conn, err
+}
+
 // Open a new connection to the FTP server.
 func (f *Fs) ftpConnection(ctx context.Context) (*ftp.ServerConn, error) {
 	fs.Debugf(f, "Connecting to FTP server")
-	ftpConfig := []ftp.DialOption{ftp.DialWithTimeout(f.ci.ConnectTimeout)}
-	if f.opt.TLS && f.opt.ExplicitTLS {
-		fs.Errorf(f, "Implicit TLS and explicit TLS are mutually incompatible. Please revise your config")
-		return nil, errors.New("Implicit TLS and explicit TLS are mutually incompatible. Please revise your config")
-	} else if f.opt.TLS {
-		tlsConfig := &tls.Config{
-			ServerName:         f.opt.Host,
-			InsecureSkipVerify: f.opt.SkipVerifyTLSCert,
+	dCtx := dialCtx{f, ctx}
+	ftpConfig := []ftp.DialOption{ftp.DialWithDialFunc(dCtx.dial)}
+	if f.opt.ExplicitTLS {
+		ftpConfig = append(ftpConfig, ftp.DialWithExplicitTLS(f.tlsConf))
+		// Initial connection needs to be cleartext for explicit TLS
+		conn, err := fshttp.NewDialer(ctx).Dial("tcp", f.dialAddr)
+		if err != nil {
+			return nil, err
 		}
-		ftpConfig = append(ftpConfig, ftp.DialWithTLS(tlsConfig))
-	} else if f.opt.ExplicitTLS {
-		tlsConfig := &tls.Config{
-			ServerName:         f.opt.Host,
-			InsecureSkipVerify: f.opt.SkipVerifyTLSCert,
-		}
-		ftpConfig = append(ftpConfig, ftp.DialWithExplicitTLS(tlsConfig))
+		ftpConfig = append(ftpConfig, ftp.DialWithNetConn(conn))
 	}
 	if f.opt.DisableEPSV {
 		ftpConfig = append(ftpConfig, ftp.DialWithDisabledEPSV(true))
@@ -258,6 +286,7 @@ func (f *Fs) getFtpConnection(ctx context.Context) (c *ftp.ServerConn, err error
 	if f.opt.Concurrency > 0 {
 		f.tokens.Get()
 	}
+	accounting.LimitTPS(ctx)
 	f.poolMu.Lock()
 	if len(f.pool) > 0 {
 		c = f.pool[0]
@@ -306,7 +335,30 @@ func (f *Fs) putFtpConnection(pc **ftp.ServerConn, err error) {
 	}
 	f.poolMu.Lock()
 	f.pool = append(f.pool, c)
+	if f.opt.IdleTimeout > 0 {
+		f.drain.Reset(time.Duration(f.opt.IdleTimeout)) // nudge on the pool emptying timer
+	}
 	f.poolMu.Unlock()
+}
+
+// Drain the pool of any connections
+func (f *Fs) drainPool(ctx context.Context) (err error) {
+	f.poolMu.Lock()
+	defer f.poolMu.Unlock()
+	if f.opt.IdleTimeout > 0 {
+		f.drain.Stop()
+	}
+	if len(f.pool) != 0 {
+		fs.Debugf(f, "closing %d unused connections", len(f.pool))
+	}
+	for i, c := range f.pool {
+		if cErr := c.Quit(); cErr != nil {
+			err = cErr
+		}
+		f.pool[i] = nil
+	}
+	f.pool = nil
+	return err
 }
 
 // NewFs constructs an Fs from the path, container:path
@@ -336,6 +388,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (ff fs.Fs
 	if opt.TLS {
 		protocol = "ftps://"
 	}
+	if opt.TLS && opt.ExplicitTLS {
+		return nil, errors.New("Implicit TLS and explicit TLS are mutually incompatible. Please revise your config")
+	}
+	var tlsConfig *tls.Config
+	if opt.TLS || opt.ExplicitTLS {
+		tlsConfig = &tls.Config{
+			ServerName:         opt.Host,
+			InsecureSkipVerify: opt.SkipVerifyTLSCert,
+		}
+	}
 	u := protocol + path.Join(dialAddr+"/", root)
 	ci := fs.GetConfig(ctx)
 	f := &Fs{
@@ -348,10 +410,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (ff fs.Fs
 		pass:     pass,
 		dialAddr: dialAddr,
 		tokens:   pacer.NewTokenDispenser(opt.Concurrency),
+		tlsConf:  tlsConfig,
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
+	// set the pool drainer timer going
+	if f.opt.IdleTimeout > 0 {
+		f.drain = time.AfterFunc(time.Duration(opt.IdleTimeout), func() { _ = f.drainPool(ctx) })
+	}
 	// Make a connection and pool it to return errors early
 	c, err := f.getFtpConnection(ctx)
 	if err != nil {
@@ -378,6 +445,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (ff fs.Fs
 		return f, fs.ErrorIsFile
 	}
 	return f, err
+}
+
+// Shutdown the backend, closing any background tasks and any
+// cached connections.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	return f.drainPool(ctx)
 }
 
 // translateErrorFile turns FTP errors into rclone errors if possible for a file
@@ -525,7 +598,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}()
 
 	// Wait for List for up to Timeout seconds
-	timer := time.NewTimer(f.ci.Timeout)
+	timer := time.NewTimer(f.ci.TimeoutOrInfinite())
 	select {
 	case listErr = <-errchan:
 		timer.Stop()
@@ -988,5 +1061,6 @@ var (
 	_ fs.Mover       = &Fs{}
 	_ fs.DirMover    = &Fs{}
 	_ fs.PutStreamer = &Fs{}
+	_ fs.Shutdowner  = &Fs{}
 	_ fs.Object      = &Object{}
 )

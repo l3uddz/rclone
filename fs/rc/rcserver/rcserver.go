@@ -186,7 +186,7 @@ func writeError(path string, in rc.Params, w http.ResponseWriter, err error, sta
 	})
 	if err != nil {
 		// can't return the error at this point
-		fs.Errorf(nil, "rc: failed to write JSON output: %v", err)
+		fs.Errorf(nil, "rc: writeError: failed to write JSON output from %#v: %v", in, err)
 	}
 }
 
@@ -229,6 +229,7 @@ func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string) {
+	ctx := r.Context()
 	contentType := r.Header.Get("Content-Type")
 
 	values := r.URL.Query()
@@ -270,6 +271,9 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 		writeError(path, in, w, errors.Errorf("authentication must be set up on the rc server to use %q or the --rc-no-auth flag must be in use", path), http.StatusForbidden)
 		return
 	}
+
+	inOrig := in.Copy()
+
 	if call.NeedsRequest {
 		// Add the request to RC
 		in["_request"] = r
@@ -279,25 +283,13 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 		in["_response"] = w
 	}
 
-	// Check to see if it is async or not
-	isAsync, err := in.GetBool("_async")
-	if rc.NotErrParamNotFound(err) {
-		writeError(path, in, w, err, http.StatusBadRequest)
-		return
-	}
-	delete(in, "_async") // remove the async parameter after parsing so vfs operations don't get confused
-
 	fs.Debugf(nil, "rc: %q: with parameters %+v", path, in)
-	var out rc.Params
-	if isAsync {
-		out, err = jobs.StartAsyncJob(call.Fn, in)
-	} else {
-		var jobID int64
-		out, jobID, err = jobs.ExecuteJob(r.Context(), call.Fn, in)
-		w.Header().Add("x-rclone-jobid", fmt.Sprintf("%d", jobID))
+	job, out, err := jobs.NewJob(ctx, call.Fn, in)
+	if job != nil {
+		w.Header().Add("x-rclone-jobid", fmt.Sprintf("%d", job.ID))
 	}
 	if err != nil {
-		writeError(path, in, w, err, http.StatusInternalServerError)
+		writeError(path, inOrig, w, err, http.StatusInternalServerError)
 		return
 	}
 	if out == nil {
@@ -308,8 +300,8 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 	err = rc.WriteJSON(w, out)
 	if err != nil {
 		// can't return the error at this point - but have a go anyway
-		writeError(path, in, w, err, http.StatusInternalServerError)
-		fs.Errorf(nil, "rc: failed to write JSON output: %v", err)
+		writeError(path, inOrig, w, err, http.StatusInternalServerError)
+		fs.Errorf(nil, "rc: handlePost: failed to write JSON output: %v", err)
 	}
 }
 
@@ -390,18 +382,20 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) 
 		s.serveRoot(w, r)
 		return
 	case s.files != nil:
-		pluginsMatchResult := webgui.PluginsMatch.FindStringSubmatch(path)
+		if s.opt.WebUI {
+			pluginsMatchResult := webgui.PluginsMatch.FindStringSubmatch(path)
 
-		if s.opt.WebUI && pluginsMatchResult != nil && len(pluginsMatchResult) > 2 {
-			ok := webgui.ServePluginOK(w, r, pluginsMatchResult)
-			if !ok {
-				r.URL.Path = fmt.Sprintf("/%s/%s/app/build/%s", pluginsMatchResult[1], pluginsMatchResult[2], pluginsMatchResult[3])
-				s.pluginsHandler.ServeHTTP(w, r)
+			if pluginsMatchResult != nil && len(pluginsMatchResult) > 2 {
+				ok := webgui.ServePluginOK(w, r, pluginsMatchResult)
+				if !ok {
+					r.URL.Path = fmt.Sprintf("/%s/%s/app/build/%s", pluginsMatchResult[1], pluginsMatchResult[2], pluginsMatchResult[3])
+					s.pluginsHandler.ServeHTTP(w, r)
+					return
+				}
+				return
+			} else if webgui.ServePluginWithReferrerOK(w, r, path) {
 				return
 			}
-			return
-		} else if s.opt.WebUI && webgui.ServePluginWithReferrerOK(w, r, path) {
-			return
 		}
 		// Serve the files
 		r.URL.Path = "/" + path
