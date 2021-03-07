@@ -89,7 +89,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 		if size >= 0 {
 			req.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%v", size))
 		}
-		sa := f.opt.ServiceAccountFile
+		sa := f.getServiceAccountFile()
 		res, err = f.client.Do(req)
 		if err == nil {
 			defer googleapi.CloseBody(res)
@@ -203,7 +203,7 @@ func (rx *resumableUpload) Upload(ctx context.Context) (*drive.File, error) {
 		err = rx.f.pacer.Call(func() (bool, error) {
 			fs.Debugf(rx.remote, "Sending chunk %d length %d", start, reqSize)
 			StatusCode, err = rx.transferChunk(ctx, start, chunk, reqSize)
-			sa := rx.f.opt.ServiceAccountFile
+			sa := rx.f.getServiceAccountFile()
 			again, err := rx.f.shouldRetry(NewErrorWithRetryContext(err, sa))
 			if StatusCode == statusResumeIncomplete || StatusCode == http.StatusCreated || StatusCode == http.StatusOK {
 				again = false
