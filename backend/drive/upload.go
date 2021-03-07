@@ -90,7 +90,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 			req.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%v", size))
 		}
 		sa := f.getServiceAccountFile()
-		res, err = f.client.Do(req)
+		res, err = f.getClient().Do(req)
 		if err == nil {
 			defer googleapi.CloseBody(res)
 			err = googleapi.CheckResponse(res)
@@ -133,7 +133,7 @@ func (rx *resumableUpload) makeRequest(ctx context.Context, start int64, body io
 func (rx *resumableUpload) transferChunk(ctx context.Context, start int64, chunk io.ReadSeeker, chunkSize int64) (int, error) {
 	_, _ = chunk.Seek(0, io.SeekStart)
 	req := rx.makeRequest(ctx, start, chunk, chunkSize)
-	res, err := rx.f.client.Do(req)
+	res, err := rx.f.getClient().Do(req)
 	if err != nil {
 		return 599, err
 	}
