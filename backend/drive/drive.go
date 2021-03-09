@@ -598,7 +598,7 @@ type Fs struct {
 	listRmu             *sync.Mutex         // protects listRempties
 	listRempties        map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
 	ServiceAccountFiles map[string]time.Time
-	waitChangeSvc       sync.RWMutex
+	waitChangeSvc       *sync.RWMutex
 }
 
 type baseObject struct {
@@ -660,22 +660,22 @@ func (f *Fs) getServiceAccountFile() string {
 }
 
 func (f *Fs) getService() *drive.Service {
-	f.waitChangeSvc.RLock()
-	defer f.waitChangeSvc.RUnlock()
+	//f.waitChangeSvc.RLock()
+	//defer f.waitChangeSvc.RUnlock()
 
 	return f.svc
 }
 
 func (f *Fs) getServiceV2() *drive_v2.Service {
-	f.waitChangeSvc.RLock()
-	defer f.waitChangeSvc.RUnlock()
+	//f.waitChangeSvc.RLock()
+	//defer f.waitChangeSvc.RUnlock()
 
 	return f.v2Svc
 }
 
 func (f *Fs) getClient() *http.Client {
-	f.waitChangeSvc.RLock()
-	defer f.waitChangeSvc.RUnlock()
+	//f.waitChangeSvc.RLock()
+	//defer f.waitChangeSvc.RUnlock()
 
 	return f.client
 }
@@ -683,13 +683,10 @@ func (f *Fs) getClient() *http.Client {
 // shouldRetry determines whether a given err rates being retried
 func (f *Fs) shouldRetry(err error) (bool, error) {
 	// attempt to type-cast err in-case we have additional context r.e. retry (service account...)
-	rec, ok := err.(*ErrorWithRetryContext)
 	serviceAccount := ""
-	if ok {
+	if rec, ok := err.(*ErrorWithRetryContext); ok {
 		err = rec.err
 		serviceAccount = rec.ServiceAccountFile
-	} else {
-		serviceAccount = f.getServiceAccountFile()
 	}
 
 	if err == nil {
@@ -718,6 +715,9 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 	sac := false
 
 	// handle error accordingly
+	f.waitChangeSvc.Lock()
+	defer f.waitChangeSvc.Unlock()
+
 	switch {
 	case reason == "rateLimitExceeded", reason == "userRateLimitExceeded":
 		// rate limit exceeded
@@ -725,13 +725,10 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 			// handle cycling
 			switch {
 			case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+				fs.Debugf(nil, "try cycle, reason: %q, message: %q (failed sa: %q / current: %v)", reason,
+					message, txFailedServiceAccount, f.opt.ServiceAccountFile)
 				sac = true
-
-				f.waitChangeSvc.Lock()
-				defer f.waitChangeSvc.Unlock()
 				e = f.cycleServiceAccountFile(ctx, txFailedServiceAccount)
-			default:
-				break
 			}
 
 			// was service-account-file-path or service-account-url logic applied?
@@ -741,8 +738,6 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 			case sac:
 				fs.Errorf(f, "Service account cycle error: %v", e)
 				return false, fserrors.FatalError(fmt.Errorf("cycle error: %w", e))
-			default:
-				break
 			}
 
 			if f.opt.StopOnUploadLimit {
@@ -757,13 +752,10 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 		// download quota exceeded
 		switch {
 		case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+			fs.Debugf(nil, "try cycle, reason: %q, message: %q (failed sa: %q / current: %v)", reason,
+				message, txFailedServiceAccount, f.opt.ServiceAccountFile)
 			sac = true
-
-			f.waitChangeSvc.Lock()
-			defer f.waitChangeSvc.Unlock()
 			e = f.cycleServiceAccountFile(ctx, txFailedServiceAccount)
-		default:
-			break
 		}
 
 		// was service-account-file-path or service-account-url logic applied?
@@ -773,8 +765,6 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 		case sac:
 			fs.Errorf(f, "Service account cycle error: %v", e)
 			return false, fserrors.FatalError(fmt.Errorf("cycle error: %w", e))
-		default:
-			break
 		}
 
 		if f.opt.StopOnDownloadLimit {
@@ -788,8 +778,6 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 			fs.Errorf(f, "Received team drive file limit error: %v", origError)
 			return false, fserrors.FatalError(origError)
 		}
-	default:
-		break
 	}
 
 	return false, origError
@@ -818,12 +806,11 @@ func containsString(slice []string, s string) bool {
 // getFile returns drive.File for the ID passed and fields passed in
 func (f *Fs) getFile(ID string, fields googleapi.Field) (info *drive.File, err error) {
 	err = f.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
 		info, err = f.getService().Files.Get(ID).
 			Fields(fields).
 			SupportsAllDrives(true).
 			Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 	return info, err
 }
@@ -935,9 +922,8 @@ OUTER:
 	for {
 		var files *drive.FileList
 		err = f.pacer.Call(func() (bool, error) {
-			sa := f.getServiceAccountFile()
 			files, err = list.Fields(googleapi.Field(fields)).Context(ctx).Do()
-			return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+			return f.shouldRetry(err)
 		})
 		if err != nil {
 			return false, errors.Wrap(err, "couldn't list directory")
@@ -1225,15 +1211,16 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 
 	ci := fs.GetConfig(ctx)
 	f := &Fs{
-		name:         name,
-		root:         root,
-		opt:          *opt,
-		ci:           ci,
-		pacer:        fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(opt.PacerMinSleep), pacer.Burst(opt.PacerBurst))),
-		m:            m,
-		grouping:     listRGrouping,
-		listRmu:      new(sync.Mutex),
-		listRempties: make(map[string]struct{}),
+		name:          name,
+		root:          root,
+		opt:           *opt,
+		ci:            ci,
+		pacer:         fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(opt.PacerMinSleep), pacer.Burst(opt.PacerBurst))),
+		m:             m,
+		grouping:      listRGrouping,
+		listRmu:       new(sync.Mutex),
+		listRempties:  make(map[string]struct{}),
+		waitChangeSvc: &sync.RWMutex{},
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
 	f.fileFields = f.getFileFields()
@@ -1575,12 +1562,11 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 	var info *drive.File
 	err = f.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
 		info, err = f.getService().Files.Create(createInfo).
 			Fields("id").
 			SupportsAllDrives(true).
 			Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 	if err != nil {
 		return "", err
@@ -1620,11 +1606,10 @@ func (f *Fs) fetchFormats() {
 		var about *drive.About
 		var err error
 		err = f.pacer.Call(func() (bool, error) {
-			sa := f.getServiceAccountFile()
 			about, err = f.getService().About.Get().
 				Fields("exportFormats,importFormats").
 				Do()
-			return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+			return f.shouldRetry(err)
 		})
 		if err != nil {
 			fs.Errorf(f, "Failed to get Drive exportFormats and importFormats: %v", err)
@@ -2253,14 +2238,13 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		// Make the API request to upload metadata and file data.
 		// Don't retry, return a retry error instead
 		err = f.pacer.CallNoRetry(func() (bool, error) {
-			sa := f.getServiceAccountFile()
 			info, err = f.getService().Files.Create(createInfo).
 				Media(in, googleapi.ContentType(srcMimeType)).
 				Fields(partialFields).
 				SupportsAllDrives(true).
 				KeepRevisionForever(f.opt.KeepRevisionForever).
 				Do()
-			return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+			return f.shouldRetry(err)
 		})
 		if err != nil {
 			return nil, err
@@ -2309,14 +2293,13 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 			fs.Infof(srcDir, "merging %q", info.Name)
 			// Move the file into the destination
 			err = f.pacer.Call(func() (bool, error) {
-				sa := f.getServiceAccountFile()
 				_, err = f.getService().Files.Update(info.Id, nil).
 					RemoveParents(srcDir.ID()).
 					AddParents(dstDir.ID()).
 					Fields("").
 					SupportsAllDrives(true).
 					Do()
-				return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+				return f.shouldRetry(err)
 			})
 			if err != nil {
 				return errors.Wrapf(err, "MergeDirs move failed on %q in %v", info.Name, srcDir)
@@ -2342,7 +2325,6 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 func (f *Fs) delete(ctx context.Context, id string, useTrash bool) error {
 	return f.pacer.Call(func() (bool, error) {
 		var err error
-		sa := f.getServiceAccountFile()
 		if useTrash {
 			info := drive.File{
 				Trashed: true,
@@ -2357,7 +2339,7 @@ func (f *Fs) delete(ctx context.Context, id string, useTrash bool) error {
 				SupportsAllDrives(true).
 				Do()
 		}
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 }
 
@@ -2590,9 +2572,8 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 		return err
 	}
 	err := f.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
 		err := f.getService().Files.EmptyTrash().Context(ctx).Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 
 	if err != nil {
@@ -2609,9 +2590,8 @@ func (f *Fs) teamDriveOK(ctx context.Context) (err error) {
 	}
 	var td *drive.Drive
 	err = f.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
 		td, err = f.getService().Drives.Get(f.opt.TeamDriveID).Fields("name,id,capabilities,createdTime,restrictions").Context(ctx).Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "failed to get Shared Drive info")
@@ -2634,9 +2614,8 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	var err error
 
 	err = f.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
 		about, err = f.getService().About.Get().Fields("storageQuota").Context(ctx).Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get Drive storageQuota")
@@ -2743,12 +2722,11 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	err = f.pacer.Call(func() (bool, error) {
 		// TODO: On TeamDrives this might fail if lacking permissions to change ACLs.
 		// Need to either check `canShare` attribute on the object or see if a sufficient permission is already present.
-		sa := f.getServiceAccountFile()
 		_, err = f.getService().Permissions.Create(id, permission).
 			Fields("").
 			SupportsAllDrives(true).
 			Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 	if err != nil {
 		return "", err
@@ -2785,14 +2763,13 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		Name: dstLeaf,
 	}
 	err = f.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
 		_, err = f.getService().Files.Update(shortcutID(srcID), &patch).
 			RemoveParents(srcDirectoryID).
 			AddParents(dstDirectoryID).
 			Fields("").
 			SupportsAllDrives(true).
 			Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 	if err != nil {
 		return err
@@ -2858,9 +2835,8 @@ func (f *Fs) changeNotifyStartPageToken() (pageToken string, err error) {
 		if f.isTeamDrive {
 			changes.DriveId(f.opt.TeamDriveID)
 		}
-		sa := f.getServiceAccountFile()
 		startPageToken, err = changes.Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(err)
 	})
 	if err != nil {
 		return
@@ -2888,9 +2864,8 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 			if f.rootFolderID == "appDataFolder" {
 				changesCall.Spaces("appDataFolder")
 			}
-			sa := f.getServiceAccountFile()
 			changeList, err = changesCall.Context(ctx).Do()
-			return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+			return f.shouldRetry(err)
 		})
 		if err != nil {
 			return
@@ -3043,15 +3018,15 @@ func (f *Fs) cycleServiceAccountFile(ctx context.Context, oldFile string) error 
 			return errors.New("no more service accounts available")
 		}
 		break
-	default:
-		break
 	}
 
-	if nextServiceAccount == "" {
+	if nextServiceAccount == "" || nextServiceAccount == f.opt.ServiceAccountFile {
 		// current service account should be re-tried
 		return nil
 	}
 
+	fs.Debugf(nil, "actually cycling from: (old: %q, current: %q, next: %q)", oldFile,
+		f.opt.ServiceAccountFile, nextServiceAccount)
 	return f.changeServiceAccountFile(ctx, nextServiceAccount)
 }
 
@@ -3084,7 +3059,6 @@ func (f *Fs) loadServiceAccountsFromPath() error {
 }
 
 func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err error) {
-	// f.opt.ServiceAccountFile should not need read lock this function will only be called by cycler with write lock
 	if file == f.opt.ServiceAccountFile {
 		return nil
 	}
@@ -3184,13 +3158,12 @@ func (f *Fs) makeShortcut(ctx context.Context, srcPath string, dstFs *Fs, dstPat
 
 	var info *drive.File
 	err = dstFs.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
 		info, err = dstFs.getService().Files.Create(createInfo).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			KeepRevisionForever(dstFs.opt.KeepRevisionForever).
 			Do()
-		return dstFs.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return dstFs.shouldRetry(err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "shortcut creation failed")
@@ -3209,9 +3182,8 @@ func (f *Fs) listTeamDrives(ctx context.Context) (drives []*drive.TeamDrive, err
 	for {
 		var teamDrives *drive.TeamDriveList
 		err = f.pacer.Call(func() (bool, error) {
-			sa := f.getServiceAccountFile()
 			teamDrives, err = listTeamDrives.Context(ctx).Do()
-			return defaultFs.shouldRetry(NewErrorWithRetryContext(err, sa))
+			return defaultFs.shouldRetry(err)
 		})
 		if err != nil {
 			return drives, errors.Wrap(err, "listing Team Drives failed")
@@ -3250,12 +3222,11 @@ func (f *Fs) unTrash(ctx context.Context, dir string, directoryID string, recurs
 				Trashed:         false,
 			}
 			err := f.pacer.Call(func() (bool, error) {
-				sa := f.getServiceAccountFile()
 				_, err := f.getService().Files.Update(item.Id, &update).
 					SupportsAllDrives(true).
 					Fields("trashed").
 					Do()
-				return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+				return f.shouldRetry(err)
 			})
 			if err != nil {
 				err = errors.Wrap(err, "failed to restore")
@@ -3654,12 +3625,11 @@ func (o *baseObject) SetModTime(ctx context.Context, modTime time.Time) error {
 	var info *drive.File
 	err := o.fs.pacer.Call(func() (bool, error) {
 		var err error
-		sa := o.fs.getServiceAccountFile()
 		info, err = o.fs.getService().Files.Update(actualID(o.id), updateInfo).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			Do()
-		return o.fs.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return o.fs.shouldRetry(err)
 	})
 	if err != nil {
 		return err
@@ -3691,7 +3661,6 @@ func (o *baseObject) httpResponse(ctx context.Context, url, method string, optio
 	}
 
 	err = o.fs.pacer.Call(func() (bool, error) {
-		sa := o.fs.getServiceAccountFile()
 		res, err = o.fs.getClient().Do(req)
 		if err == nil {
 			err = googleapi.CheckResponse(res)
@@ -3699,7 +3668,7 @@ func (o *baseObject) httpResponse(ctx context.Context, url, method string, optio
 				_ = res.Body.Close() // ignore error
 			}
 		}
-		return o.fs.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return o.fs.shouldRetry(err)
 	})
 	if err != nil {
 		return req, nil, err
@@ -3868,14 +3837,13 @@ func (o *baseObject) update(ctx context.Context, updateInfo *drive.File, uploadM
 	if size >= 0 && size < int64(o.fs.opt.UploadCutoff) {
 		// Don't retry, return a retry error instead
 		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-			sa := o.fs.getServiceAccountFile()
 			info, err = o.fs.getService().Files.Update(actualID(o.id), updateInfo).
 				Media(in, googleapi.ContentType(uploadMimeType)).
 				Fields(partialFields).
 				SupportsAllDrives(true).
 				KeepRevisionForever(o.fs.opt.KeepRevisionForever).
 				Do()
-			return o.fs.shouldRetry(NewErrorWithRetryContext(err, sa))
+			return o.fs.shouldRetry(err)
 		})
 		return
 	}

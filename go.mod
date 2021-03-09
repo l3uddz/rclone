@@ -38,7 +38,6 @@ require (
 	github.com/koofr/go-httpclient v0.0.0-20200420163713-93aa7c75b348
 	github.com/koofr/go-koofrclient v0.0.0-20190724113126-8e5366da203a
 	github.com/lucperkins/rek v0.1.3
-	github.com/mattn/go-ieproxy v0.0.1 // indirect
 	github.com/mattn/go-colorable v0.1.8
 	github.com/mattn/go-runewidth v0.0.10
 	github.com/mitchellh/go-homedir v1.1.0
