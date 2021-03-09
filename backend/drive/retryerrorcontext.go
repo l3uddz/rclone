@@ -1,16 +1,16 @@
 package drive
 
-type ErrorWithRetryContext struct {
+type errorWithRetryContext struct {
 	ServiceAccountFile string
 	err                error
 }
 
-func (e *ErrorWithRetryContext) Error() string {
+func (e *errorWithRetryContext) Error() string {
 	return e.err.Error()
 }
 
-func NewErrorWithRetryContext(err error, serviceAccountFile string) *ErrorWithRetryContext {
-	return &ErrorWithRetryContext{
+func newErrorWithRetryContext(err error, serviceAccountFile string) *errorWithRetryContext {
+	return &errorWithRetryContext{
 		ServiceAccountFile: serviceAccountFile,
 		err:                err,
 	}

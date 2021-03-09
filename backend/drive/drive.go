@@ -684,7 +684,7 @@ func (f *Fs) getClient() *http.Client {
 func (f *Fs) shouldRetry(err error) (bool, error) {
 	// attempt to type-cast err in-case we have additional context r.e. retry (service account...)
 	serviceAccount := ""
-	if rec, ok := err.(*ErrorWithRetryContext); ok {
+	if rec, ok := err.(*errorWithRetryContext); ok {
 		err = rec.err
 		serviceAccount = rec.ServiceAccountFile
 	}
@@ -2474,7 +2474,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 			SupportsAllDrives(true).
 			KeepRevisionForever(f.opt.KeepRevisionForever).
 			Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(newErrorWithRetryContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
@@ -2689,7 +2689,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			Do()
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(newErrorWithRetryContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
@@ -3762,7 +3762,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 				Fields("downloadUrl").
 				SupportsAllDrives(true).
 				Do()
-			return o.fs.shouldRetry(NewErrorWithRetryContext(err, sa))
+			return o.fs.shouldRetry(newErrorWithRetryContext(err, sa))
 		})
 		if err == nil {
 			fs.Debugf(o, "Using v2 download: %v", v2File.DownloadUrl)

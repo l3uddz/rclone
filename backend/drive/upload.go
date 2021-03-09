@@ -95,7 +95,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 			defer googleapi.CloseBody(res)
 			err = googleapi.CheckResponse(res)
 		}
-		return f.shouldRetry(NewErrorWithRetryContext(err, sa))
+		return f.shouldRetry(newErrorWithRetryContext(err, sa))
 	})
 	if err != nil {
 		return nil, err
