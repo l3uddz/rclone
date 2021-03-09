@@ -538,21 +538,21 @@ If this flag is set then rclone will ignore shortcut files completely.
 
 // Options defines the configuration for this backend
 type Options struct {
-	Scope                     string `config:"scope"`
-	RootFolderID              string `config:"root_folder_id"`
-	ServiceAccountFile        string `config:"service_account_file"`
-	ServiceAccountFilePath    string `config:"service_account_file_path"`
-	ServiceAccountURL         string `config:"service_account_url"`
-	ServiceAccountCredentials string `config:"service_account_credentials"`
-	TeamDriveID               string `config:"team_drive"`
-	AuthOwnerOnly             bool   `config:"auth_owner_only"`
-	UseTrash                  bool   `config:"use_trash"`
-	SkipGdocs                 bool   `config:"skip_gdocs"`
-	SkipChecksumGphotos       bool   `config:"skip_checksum_gphotos"`
-	SharedWithMe              bool   `config:"shared_with_me"`
-	TrashedOnly               bool   `config:"trashed_only"`
-	StarredOnly               bool   `config:"starred_only"`
-	Extensions                string `config:"formats"`
+	Scope                     string               `config:"scope"`
+	RootFolderID              string               `config:"root_folder_id"`
+	ServiceAccountFile        string               `config:"service_account_file"`
+	ServiceAccountFilePath    string               `config:"service_account_file_path"`
+	ServiceAccountURL         string               `config:"service_account_url"`
+	ServiceAccountCredentials string               `config:"service_account_credentials"`
+	TeamDriveID               string               `config:"team_drive"`
+	AuthOwnerOnly             bool                 `config:"auth_owner_only"`
+	UseTrash                  bool                 `config:"use_trash"`
+	SkipGdocs                 bool                 `config:"skip_gdocs"`
+	SkipChecksumGphotos       bool                 `config:"skip_checksum_gphotos"`
+	SharedWithMe              bool                 `config:"shared_with_me"`
+	TrashedOnly               bool                 `config:"trashed_only"`
+	StarredOnly               bool                 `config:"starred_only"`
+	Extensions                string               `config:"formats"`
 	ExportExtensions          string               `config:"export_formats"`
 	ImportExtensions          string               `config:"import_formats"`
 	AllowImportNameChange     bool                 `config:"allow_import_name_change"`
@@ -599,6 +599,9 @@ type Fs struct {
 	listRempties        map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
 	ServiceAccountFiles map[string]time.Time
 	waitChangeSvc       *sync.RWMutex
+	mapSvc              map[string]*drive.Service
+	mapv2Svc            map[string]*drive_v2.Service
+	mapClient           map[string]*http.Client
 }
 
 type baseObject struct {
@@ -659,25 +662,46 @@ func (f *Fs) getServiceAccountFile() string {
 	return f.opt.ServiceAccountFile
 }
 
-func (f *Fs) getService() *drive.Service {
-	//f.waitChangeSvc.RLock()
-	//defer f.waitChangeSvc.RUnlock()
+func (f *Fs) getService(sa ...string) *drive.Service {
+	f.waitChangeSvc.RLock()
+	defer f.waitChangeSvc.RUnlock()
 
-	return f.svc
+	c := f.svc
+	if len(sa) > 0 {
+		if mc, ok := f.mapSvc[sa[0]]; ok {
+			c = mc
+		}
+	}
+
+	return c
 }
 
-func (f *Fs) getServiceV2() *drive_v2.Service {
-	//f.waitChangeSvc.RLock()
-	//defer f.waitChangeSvc.RUnlock()
+func (f *Fs) getServiceV2(sa ...string) *drive_v2.Service {
+	f.waitChangeSvc.RLock()
+	defer f.waitChangeSvc.RUnlock()
 
-	return f.v2Svc
+	c := f.v2Svc
+	if len(sa) > 0 {
+		if mc, ok := f.mapv2Svc[sa[0]]; ok {
+			c = mc
+		}
+	}
+
+	return c
 }
 
-func (f *Fs) getClient() *http.Client {
-	//f.waitChangeSvc.RLock()
-	//defer f.waitChangeSvc.RUnlock()
+func (f *Fs) getClient(sa ...string) *http.Client {
+	f.waitChangeSvc.RLock()
+	defer f.waitChangeSvc.RUnlock()
 
-	return f.client
+	c := f.client
+	if len(sa) > 0 && sa[0] != "" {
+		if mc, ok := f.mapClient[sa[0]]; ok {
+			c = mc
+		}
+	}
+
+	return c
 }
 
 // shouldRetry determines whether a given err rates being retried
@@ -1221,6 +1245,9 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		listRmu:       new(sync.Mutex),
 		listRempties:  make(map[string]struct{}),
 		waitChangeSvc: &sync.RWMutex{},
+		mapSvc:        make(map[string]*drive.Service),
+		mapv2Svc:      make(map[string]*drive_v2.Service),
+		mapClient:     make(map[string]*http.Client),
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
 	f.fileFields = f.getFileFields()
@@ -3076,6 +3103,11 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 			f.client = oldOAuthClient
 			f.opt.ServiceAccountFile = oldFile
 			f.opt.ServiceAccountCredentials = oldCredentials
+		} else {
+			f.mapSvc[oldFile] = oldSvc
+			f.mapv2Svc[oldFile] = oldv2Svc
+			f.mapClient[oldFile] = oldOAuthClient
+			fs.Debugf(nil, "Stored drive clients for failed SA: %q, count: %d", oldFile, len(f.mapSvc))
 		}
 	}()
 	f.opt.ServiceAccountFile = file

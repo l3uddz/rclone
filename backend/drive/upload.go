@@ -70,8 +70,9 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 	urls += "?" + params.Encode()
 	var res *http.Response
 	var err error
+	var sa string
 	err = f.pacer.Call(func() (bool, error) {
-		sa := f.getServiceAccountFile()
+		sa = f.getServiceAccountFile()
 
 		var body io.Reader
 		body, err = googleapi.WithoutDataWrapper.JSONReader(info)
@@ -91,7 +92,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 		if size >= 0 {
 			req.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%v", size))
 		}
-		res, err = f.getClient().Do(req)
+		res, err = f.getClient(sa).Do(req)
 		if err == nil {
 			defer googleapi.CloseBody(res)
 			err = googleapi.CheckResponse(res)
@@ -110,7 +111,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 		MediaType:     contentType,
 		ContentLength: size,
 	}
-	return rx.Upload(ctx)
+	return rx.Upload(ctx, sa)
 }
 
 // Make an http.Request for the range passed in
@@ -131,10 +132,10 @@ func (rx *resumableUpload) makeRequest(ctx context.Context, start int64, body io
 }
 
 // Transfer a chunk - caller must call googleapi.CloseBody(res) if err == nil || res != nil
-func (rx *resumableUpload) transferChunk(ctx context.Context, start int64, chunk io.ReadSeeker, chunkSize int64) (int, error) {
+func (rx *resumableUpload) transferChunk(ctx context.Context, start int64, chunk io.ReadSeeker, chunkSize int64, sa string) (int, error) {
 	_, _ = chunk.Seek(0, io.SeekStart)
 	req := rx.makeRequest(ctx, start, chunk, chunkSize)
-	res, err := rx.f.getClient().Do(req)
+	res, err := rx.f.getClient(sa).Do(req)
 	if err != nil {
 		return 599, err
 	}
@@ -166,7 +167,7 @@ func (rx *resumableUpload) transferChunk(ctx context.Context, start int64, chunk
 
 // Upload uploads the chunks from the input
 // It retries each chunk using the pacer and --low-level-retries
-func (rx *resumableUpload) Upload(ctx context.Context) (*drive.File, error) {
+func (rx *resumableUpload) Upload(ctx context.Context, sa string) (*drive.File, error) {
 	start := int64(0)
 	var StatusCode int
 	var err error
@@ -202,11 +203,9 @@ func (rx *resumableUpload) Upload(ctx context.Context) (*drive.File, error) {
 
 		// Transfer the chunk
 		err = rx.f.pacer.Call(func() (bool, error) {
-			sa := rx.f.getServiceAccountFile()
-
 			fs.Debugf(rx.remote, "Sending chunk %d length %d", start, reqSize)
-			StatusCode, err = rx.transferChunk(ctx, start, chunk, reqSize)
-			again, err := rx.f.shouldRetry(newErrorWithRetryContext(err, sa))
+			StatusCode, err = rx.transferChunk(ctx, start, chunk, reqSize, sa)
+			again, err := rx.f.shouldRetry(err)
 			if StatusCode == statusResumeIncomplete || StatusCode == http.StatusCreated || StatusCode == http.StatusOK {
 				again = false
 				err = nil
