@@ -538,21 +538,21 @@ If this flag is set then rclone will ignore shortcut files completely.
 
 // Options defines the configuration for this backend
 type Options struct {
-	Scope                     string               `config:"scope"`
-	RootFolderID              string               `config:"root_folder_id"`
-	ServiceAccountFile        string               `config:"service_account_file"`
-	ServiceAccountFilePath    string               `config:"service_account_file_path"`
-	ServiceAccountUrl         string               `config:"service_account_url"`
-	ServiceAccountCredentials string               `config:"service_account_credentials"`
-	TeamDriveID               string               `config:"team_drive"`
-	AuthOwnerOnly             bool                 `config:"auth_owner_only"`
-	UseTrash                  bool                 `config:"use_trash"`
-	SkipGdocs                 bool                 `config:"skip_gdocs"`
-	SkipChecksumGphotos       bool                 `config:"skip_checksum_gphotos"`
-	SharedWithMe              bool                 `config:"shared_with_me"`
-	TrashedOnly               bool                 `config:"trashed_only"`
-	StarredOnly               bool                 `config:"starred_only"`
-	Extensions                string               `config:"formats"`
+	Scope                     string `config:"scope"`
+	RootFolderID              string `config:"root_folder_id"`
+	ServiceAccountFile        string `config:"service_account_file"`
+	ServiceAccountFilePath    string `config:"service_account_file_path"`
+	ServiceAccountURL         string `config:"service_account_url"`
+	ServiceAccountCredentials string `config:"service_account_credentials"`
+	TeamDriveID               string `config:"team_drive"`
+	AuthOwnerOnly             bool   `config:"auth_owner_only"`
+	UseTrash                  bool   `config:"use_trash"`
+	SkipGdocs                 bool   `config:"skip_gdocs"`
+	SkipChecksumGphotos       bool   `config:"skip_checksum_gphotos"`
+	SharedWithMe              bool   `config:"shared_with_me"`
+	TrashedOnly               bool   `config:"trashed_only"`
+	StarredOnly               bool   `config:"starred_only"`
+	Extensions                string `config:"formats"`
 	ExportExtensions          string               `config:"export_formats"`
 	ImportExtensions          string               `config:"import_formats"`
 	AllowImportNameChange     bool                 `config:"allow_import_name_change"`
@@ -724,7 +724,7 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 		if message == "User rate limit exceeded." {
 			// handle cycling
 			switch {
-			case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+			case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountURL != "":
 				fs.Debugf(nil, "try cycle, reason: %q, message: %q (failed sa: %q / current: %v)", reason,
 					message, txFailedServiceAccount, f.opt.ServiceAccountFile)
 				sac = true
@@ -751,7 +751,7 @@ func (f *Fs) handleCycleError(ctx context.Context, origError error, reason strin
 	case reason == "downloadQuotaExceeded":
 		// download quota exceeded
 		switch {
-		case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountUrl != "":
+		case f.opt.ServiceAccountFilePath != "", f.opt.ServiceAccountURL != "":
 			fs.Debugf(nil, "try cycle, reason: %q, message: %q (failed sa: %q / current: %v)", reason,
 				message, txFailedServiceAccount, f.opt.ServiceAccountFile)
 			sac = true
@@ -2961,7 +2961,7 @@ func (f *Fs) cycleServiceAccountFile(ctx context.Context, oldFile string) error 
 	nextServiceAccount := ""
 
 	switch {
-	case f.opt.ServiceAccountUrl != "" && oldFile == f.opt.ServiceAccountFile:
+	case f.opt.ServiceAccountURL != "" && oldFile == f.opt.ServiceAccountFile:
 		// rotate based on service account from url
 		payload := map[string]string{
 			"old":    f.opt.ServiceAccountFile,
@@ -2969,14 +2969,14 @@ func (f *Fs) cycleServiceAccountFile(ctx context.Context, oldFile string) error 
 		}
 
 		// send request
-		res, err := rek.Post(f.opt.ServiceAccountUrl, rek.Json(payload), rek.Timeout(10*time.Second))
+		res, err := rek.Post(f.opt.ServiceAccountURL, rek.Json(payload), rek.Timeout(10*time.Second))
 		switch {
 		case err != nil:
-			return errors.Wrap(err, "request ServiceAccountUrl request error")
+			return errors.Wrap(err, "request ServiceAccountURL request error")
 		case res.StatusCode() != 200:
 			// drain body
 			_, _ = rek.BodyAsBytes(res.Body())
-			return fmt.Errorf("request ServiceAccountUrl response status: %s", res.Status())
+			return fmt.Errorf("request ServiceAccountURL response status: %s", res.Status())
 		default:
 			break
 		}
@@ -2985,9 +2985,9 @@ func (f *Fs) cycleServiceAccountFile(ctx context.Context, oldFile string) error 
 		sa, err := rek.BodyAsString(res.Body())
 		switch {
 		case err != nil:
-			return errors.Wrap(err, "validate ServiceAccountUrl response")
+			return errors.Wrap(err, "validate ServiceAccountURL response")
 		case sa == "":
-			return errors.New("validate ServiceAccountUrl response service account")
+			return errors.New("validate ServiceAccountURL response service account")
 		default:
 			break
 		}
