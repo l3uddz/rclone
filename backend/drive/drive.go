@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"mime"
 	"net/http"
 	"path"
@@ -68,8 +67,8 @@ const (
 	defaultScope                = "drive"
 	// chunkSize is the size of the chunks created during a resumable upload and should be a power of two.
 	// 1<<18 is the minimum size supported by the Google uploader, and there is no maximum.
-	minChunkSize     = 256 * fs.KibiByte
-	defaultChunkSize = 8 * fs.MebiByte
+	minChunkSize     = 256 * fs.Kibi
+	defaultChunkSize = 8 * fs.Mebi
 	partialFields    = "id,name,size,md5Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks"
 	listRGrouping    = 50   // number of IDs to search at once when using ListR
 	listRInputBuffer = 1000 // size of input buffer when using ListR
@@ -183,32 +182,64 @@ func init() {
 		Description: "Google Drive",
 		NewFs:       NewFs,
 		CommandHelp: commandHelp,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			// Parse config into Options struct
 			opt := new(Options)
 			err := configstruct.Set(m, opt)
 			if err != nil {
-				fs.Errorf(nil, "Couldn't parse config into struct: %v", err)
-				return
+				return nil, errors.Wrap(err, "couldn't parse config into struct")
 			}
 
-			// Fill in the scopes
-			driveConfig.Scopes = driveScopes(opt.Scope)
-			// Set the root_folder_id if using drive.appfolder
-			if driveScopesContainsAppFolder(driveConfig.Scopes) {
-				m.Set("root_folder_id", "appDataFolder")
-			}
+			switch config.State {
+			case "":
+				// Fill in the scopes
+				driveConfig.Scopes = driveScopes(opt.Scope)
 
-			if opt.ServiceAccountFile == "" && opt.ServiceAccountCredentials == "" {
-				err = oauthutil.Config(ctx, "drive", name, m, driveConfig, nil)
-				if err != nil {
-					log.Fatalf("Failed to configure token: %v", err)
+				// Set the root_folder_id if using drive.appfolder
+				if driveScopesContainsAppFolder(driveConfig.Scopes) {
+					m.Set("root_folder_id", "appDataFolder")
 				}
+
+				if opt.ServiceAccountFile == "" && opt.ServiceAccountCredentials == "" {
+					return oauthutil.ConfigOut("teamdrive", &oauthutil.Options{
+						OAuth2Config: driveConfig,
+					})
+				}
+				return fs.ConfigGoto("teamdrive")
+			case "teamdrive":
+				if opt.TeamDriveID == "" {
+					return fs.ConfigConfirm("teamdrive_ok", false, "config_change_team_drive", "Configure this as a Shared Drive (Team Drive)?\n")
+				}
+				return fs.ConfigConfirm("teamdrive_ok", false, "config_change_team_drive", fmt.Sprintf("Change current Shared Drive (Team Drive) ID %q?\n", opt.TeamDriveID))
+			case "teamdrive_ok":
+				if config.Result == "false" {
+					m.Set("team_drive", "")
+					return nil, nil
+				}
+				f, err := newFs(ctx, name, "", m)
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to make Fs to list Shared Drives")
+				}
+				teamDrives, err := f.listTeamDrives(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if len(teamDrives) == 0 {
+					return fs.ConfigError("", "No Shared Drives found in your account")
+				}
+				return fs.ConfigChoose("teamdrive_final", "config_team_drive", "Shared Drive", len(teamDrives), func(i int) (string, string) {
+					teamDrive := teamDrives[i]
+					return teamDrive.Id, teamDrive.Name
+				})
+			case "teamdrive_final":
+				driveID := config.Result
+				m.Set("team_drive", driveID)
+				m.Set("root_folder_id", "")
+				opt.TeamDriveID = driveID
+				opt.RootFolderID = ""
+				return nil, nil
 			}
-			err = configTeamDrive(ctx, opt, m, name)
-			if err != nil {
-				log.Fatalf("Failed to configure Shared Drive: %v", err)
-			}
+			return nil, fmt.Errorf("unknown state %q", config.State)
 		},
 		Options: append(driveOAuthOptions(), []fs.Option{{
 			Name: "scope",
@@ -467,7 +498,7 @@ See: https://github.com/rclone/rclone/issues/3631
 			Default: false,
 			Help: `Make upload limit errors be fatal
 
-At the time of writing it is only possible to upload 750GB of data to
+At the time of writing it is only possible to upload 750 GiB of data to
 Google Drive a day (this is an undocumented limit). When this limit is
 reached Google Drive produces a slightly different error message. When
 this flag is set it causes these errors to be fatal.  These will stop
@@ -484,7 +515,7 @@ See: https://github.com/rclone/rclone/issues/3857
 			Default: false,
 			Help: `Make download limit errors be fatal
 
-At the time of writing it is only possible to download 10TB of data from
+At the time of writing it is only possible to download 10 TiB of data from
 Google Drive a day (this is an undocumented limit). When this limit is
 reached Google Drive produces a slightly different error message. When
 this flag is set it causes these errors to be fatal.  These will stop
@@ -522,7 +553,7 @@ If this flag is set then rclone will ignore shortcut files completely.
 	} {
 		for mimeType, extension := range m {
 			if err := mime.AddExtensionType(extension, mimeType); err != nil {
-				log.Fatalf("Failed to register MIME type %q: %v", mimeType, err)
+				fs.Errorf("Failed to register MIME type %q: %v", mimeType, err)
 			}
 		}
 	}
@@ -949,48 +980,6 @@ func parseExtensions(extensionsIn ...string) (extensions, mimeTypes []string, er
 	return
 }
 
-// Figure out if the user wants to use a team drive
-func configTeamDrive(ctx context.Context, opt *Options, m configmap.Mapper, name string) error {
-	ci := fs.GetConfig(ctx)
-
-	// Stop if we are running non-interactive config
-	if ci.AutoConfirm {
-		return nil
-	}
-	if opt.TeamDriveID == "" {
-		fmt.Printf("Configure this as a Shared Drive (Team Drive)?\n")
-	} else {
-		fmt.Printf("Change current Shared Drive (Team Drive) ID %q?\n", opt.TeamDriveID)
-	}
-	if !config.Confirm(false) {
-		return nil
-	}
-	f, err := newFs(ctx, name, "", m)
-	if err != nil {
-		return errors.Wrap(err, "failed to make Fs to list Shared Drives")
-	}
-	fmt.Printf("Fetching Shared Drive list...\n")
-	teamDrives, err := f.listTeamDrives(ctx)
-	if err != nil {
-		return err
-	}
-	if len(teamDrives) == 0 {
-		fmt.Printf("No Shared Drives found in your account")
-		return nil
-	}
-	var driveIDs, driveNames []string
-	for _, teamDrive := range teamDrives {
-		driveIDs = append(driveIDs, teamDrive.Id)
-		driveNames = append(driveNames, teamDrive.Name)
-	}
-	driveID := config.Choose("Enter a Shared Drive ID", driveIDs, driveNames, true)
-	m.Set("team_drive", driveID)
-	m.Set("root_folder_id", "")
-	opt.TeamDriveID = driveID
-	opt.RootFolderID = ""
-	return nil
-}
-
 // getClient makes an http client according to the options
 func getClient(ctx context.Context, opt *Options) *http.Client {
 	t := fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
@@ -1169,7 +1158,7 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 			}
 		}
 		f.rootFolderID = rootID
-		fs.Debugf(f, "root_folder_id = %q - save this in the config to speed up startup", rootID)
+		fs.Debugf(f, "'root_folder_id = %s' - save this in the config to speed up startup", rootID)
 	}
 
 	f.dirCache = dircache.New(f.root, f.rootFolderID, f)

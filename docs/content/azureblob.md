@@ -166,13 +166,12 @@ Path to file containing credentials for use with a service principal.
 
 Leave blank normally. Needed only if you want to use a service principal instead of interactive login.
 
-    $ az sp create-for-rbac --name "<name>" \
+    $ az ad sp create-for-rbac --name "<name>" \
       --role "Storage Blob Data Owner" \
       --scopes "/subscriptions/<subscription>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<storage-account>/blobServices/default/containers/<container>" \
       > azure-principal.json
 
-See [Use Azure CLI to assign an Azure role for access to blob and queue data](https://docs.microsoft.com/en-us/azure/storage/common/storage-auth-aad-rbac-cli)
-for more details.
+See ["Create an Azure service principal"](https://docs.microsoft.com/en-us/cli/azure/create-an-azure-service-principal-azure-cli) and ["Assign an Azure role for access to blob data"](https://docs.microsoft.com/en-us/azure/storage/common/storage-auth-aad-rbac-cli) pages for more details.
 
 
 - Config:      service_principal_file
@@ -269,7 +268,7 @@ Leave blank normally.
 
 #### --azureblob-upload-cutoff
 
-Cutoff for switching to chunked upload (<= 256MB). (Deprecated)
+Cutoff for switching to chunked upload (<= 256 MiB). (Deprecated)
 
 - Config:      upload_cutoff
 - Env Var:     RCLONE_AZUREBLOB_UPLOAD_CUTOFF
@@ -278,7 +277,7 @@ Cutoff for switching to chunked upload (<= 256MB). (Deprecated)
 
 #### --azureblob-chunk-size
 
-Upload chunk size (<= 100MB).
+Upload chunk size (<= 100 MiB).
 
 Note that this is stored in memory and there may be up to
 "--transfers" chunks stored at once in memory.

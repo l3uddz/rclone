@@ -430,7 +430,7 @@ in it will be mapped to `？` instead.
 
 #### File sizes ####
 
-The largest allowed file size is 250GB for both OneDrive Personal and OneDrive for Business [(Updated 13 Jan 2021)](https://support.microsoft.com/en-us/office/invalid-file-names-and-file-types-in-onedrive-and-sharepoint-64883a5d-228e-48f5-b3d2-eb39e07630fa?ui=en-us&rs=en-us&ad=us#individualfilesize).
+The largest allowed file size is 250 GiB for both OneDrive Personal and OneDrive for Business [(Updated 13 Jan 2021)](https://support.microsoft.com/en-us/office/invalid-file-names-and-file-types-in-onedrive-and-sharepoint-64883a5d-228e-48f5-b3d2-eb39e07630fa?ui=en-us&rs=en-us&ad=us#individualfilesize).
 
 #### Path length ####
 
@@ -516,6 +516,12 @@ is a great way to see what it would do.
 **NB** Onedrive personal can't currently delete versions
 
 ### Troubleshooting ###
+
+#### Excessive throttling or blocked on SharePoint
+
+If you experience excessive throttling or is being blocked on SharePoint then it may help to set the user agent explicitly with a flag like this: `--user-agent "ISV|rclone.org|rclone/v1.55.1"`  
+ 
+The specific details can be found in the Microsoft document: [Avoid getting throttled or blocked in SharePoint Online](https://docs.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online#how-to-decorate-your-http-traffic-to-avoid-throttling)
 
 #### Unexpected file size/hash differences on Sharepoint ####
 

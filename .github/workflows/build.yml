@@ -12,9 +12,15 @@ on:
     tags:
       - '*'
   pull_request:
+  workflow_dispatch:
+    inputs:
+      manual:
+        required: true
+        default: true
 
 jobs:
   build:
+    if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -30,6 +36,7 @@ jobs:
             check: true
             quicktest: true
             racequicktest: true
+            librclonetest: true
             deploy: true
 
           - job_name: mac_amd64
@@ -187,6 +194,14 @@ jobs:
           make racequicktest
         if: matrix.racequicktest
 
+      - name: Run librclone tests
+        shell: bash
+        run: |
+          make -C librclone/ctest test
+          make -C librclone/ctest clean
+          librclone/python/test_rclone.py
+        if: matrix.librclonetest
+
       - name: Code quality test
         shell: bash
         run: |
@@ -214,6 +229,7 @@ jobs:
         if: matrix.deploy && github.head_ref == '' && github.repository == 'rclone/rclone'
 
   android:
+     if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
      timeout-minutes: 30
      name: "android-all"
      runs-on: ubuntu-latest
@@ -251,6 +267,15 @@ jobs:
          run: |
            make
 
+       - name: install gomobile
+         run: |
+           go get golang.org/x/mobile/cmd/gobind
+           go get golang.org/x/mobile/cmd/gomobile
+           env PATH=$PATH:~/go/bin gomobile init
+           
+       - name: arm-v7a gomobile build
+         run: env PATH=$PATH:~/go/bin gomobile bind -v -target=android/arm -javapkg=org.rclone -ldflags '-s -X github.com/rclone/rclone/fs.Version='${VERSION} github.com/rclone/rclone/librclone/gomobile 
+           
        - name: arm-v7a Set environment variables
          shell: bash
          run: |

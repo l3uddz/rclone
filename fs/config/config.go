@@ -19,6 +19,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
+	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/rc"
@@ -64,7 +65,7 @@ const (
 // load and save to a config file when this is imported
 //
 // import "github.com/rclone/rclone/fs/config/configfile"
-// configfile.LoadConfig(ctx)
+// configfile.Install()
 type Storage interface {
 	// GetSectionList returns a slice of strings with names for all the
 	// sections
@@ -101,9 +102,6 @@ type Storage interface {
 
 // Global
 var (
-	// Data is the global config data structure
-	Data Storage = defaultStorage{}
-
 	// CacheDir points to the cache directory.  Users of this
 	// should make a subdirectory and use MkdirAll() to create it
 	// and any parents.
@@ -113,13 +111,18 @@ var (
 	Password = random.Password
 )
 
-var configPath string
+var (
+	configPath string
+	data       Storage
+	dataLoaded bool
+)
 
 func init() {
 	// Set the function pointers up in fs
 	fs.ConfigFileGet = FileGetFlag
 	fs.ConfigFileSet = SetValueAndSave
 	configPath = makeConfigPath()
+	data = newDefaultStorage()
 }
 
 // Join directory with filename, and check if exists
@@ -327,23 +330,39 @@ func SetConfigPath(path string) (err error) {
 	return nil
 }
 
-// LoadConfig loads the config file
-func LoadConfig(ctx context.Context) {
-	// Set RCLONE_CONFIG_DIR for backend config and subprocesses
-	// If empty configPath (in-memory only) the value will be "."
-	_ = os.Setenv("RCLONE_CONFIG_DIR", filepath.Dir(configPath))
-	// Load configuration from file (or initialize sensible default if no file or error)
-	if err := Data.Load(); err == ErrorConfigFileNotFound {
-		if configPath == "" {
-			fs.Debugf(nil, "Config is memory-only - using defaults")
+// SetData sets new config file storage
+func SetData(newData Storage) {
+	data = newData
+	dataLoaded = false
+}
+
+// Data returns current config file storage
+func Data() Storage {
+	return data
+}
+
+// LoadedData ensures the config file storage is loaded and returns it
+func LoadedData() Storage {
+	if !dataLoaded {
+		// Set RCLONE_CONFIG_DIR for backend config and subprocesses
+		// If empty configPath (in-memory only) the value will be "."
+		_ = os.Setenv("RCLONE_CONFIG_DIR", filepath.Dir(configPath))
+		// Load configuration from file (or initialize sensible default if no file or error)
+		if err := data.Load(); err == nil {
+			fs.Debugf(nil, "Using config file from %q", configPath)
+			dataLoaded = true
+		} else if err == ErrorConfigFileNotFound {
+			if configPath == "" {
+				fs.Debugf(nil, "Config is memory-only - using defaults")
+			} else {
+				fs.Logf(nil, "Config file %q not found - using defaults", configPath)
+			}
+			dataLoaded = true
 		} else {
-			fs.Logf(nil, "Config file %q not found - using defaults", configPath)
+			log.Fatalf("Failed to load config file %q: %v", configPath, err)
 		}
-	} else if err != nil {
-		log.Fatalf("Failed to load config file %q: %v", configPath, err)
-	} else {
-		fs.Debugf(nil, "Using config file from %q", configPath)
 	}
+	return data
 }
 
 // ErrorConfigFileNotFound is returned when the config file is not found
@@ -360,7 +379,7 @@ func SaveConfig() {
 	ci := fs.GetConfig(ctx)
 	var err error
 	for i := 0; i < ci.LowLevelRetries+1; i++ {
-		if err = Data.Save(); err == nil {
+		if err = LoadedData().Save(); err == nil {
 			return
 		}
 		waitingTimeMs := mathrand.Intn(1000)
@@ -374,7 +393,7 @@ func SaveConfig() {
 // disk first and overwrites the given value only.
 func SetValueAndSave(name, key, value string) error {
 	// Set the value in config in case we fail to reload it
-	Data.SetValue(name, key, value)
+	LoadedData().SetValue(name, key, value)
 	// Save it again
 	SaveConfig()
 	return nil
@@ -383,42 +402,69 @@ func SetValueAndSave(name, key, value string) error {
 // getWithDefault gets key out of section name returning defaultValue if not
 // found.
 func getWithDefault(name, key, defaultValue string) string {
-	value, found := Data.GetValue(name, key)
+	value, found := LoadedData().GetValue(name, key)
 	if !found {
 		return defaultValue
 	}
 	return value
 }
 
-// UpdateRemote adds the keyValues passed in to the remote of name.
-// keyValues should be key, value pairs.
-func UpdateRemote(ctx context.Context, name string, keyValues rc.Params, doObscure, noObscure bool) error {
-	if doObscure && noObscure {
-		return errors.New("can't use --obscure and --no-obscure together")
+// UpdateRemoteOpt configures the remote update
+type UpdateRemoteOpt struct {
+	// Treat all passwords as plain that need obscuring
+	Obscure bool `json:"obscure"`
+	// Treat all passwords as obscured
+	NoObscure bool `json:"noObscure"`
+	// Don't interact with the user - return questions
+	NonInteractive bool `json:"nonInteractive"`
+	// If set then supply state and result parameters to continue the process
+	Continue bool `json:"continue"`
+	// If set then ask all the questions, not just the post config questions
+	All bool `json:"all"`
+	// State to restart with - used with Continue
+	State string `json:"state"`
+	// Result to return - used with Continue
+	Result string `json:"result"`
+	// If set then edit existing values
+	Edit bool `json:"edit"`
+}
+
+func updateRemote(ctx context.Context, name string, keyValues rc.Params, opt UpdateRemoteOpt) (out *fs.ConfigOut, err error) {
+	if opt.Obscure && opt.NoObscure {
+		return nil, errors.New("can't use --obscure and --no-obscure together")
 	}
-	err := fspath.CheckConfigName(name)
+
+	err = fspath.CheckConfigName(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	ctx = suppressConfirm(ctx)
+	interactive := !(opt.NonInteractive || opt.Continue)
+	if interactive && !opt.All {
+		ctx = suppressConfirm(ctx)
+	}
+
+	fsType := FileGet(name, "type")
+	if fsType == "" {
+		return nil, errors.New("couldn't find type field in config")
+	}
+
+	ri, err := fs.Find(fsType)
+	if err != nil {
+		return nil, errors.Errorf("couldn't find backend for type %q", fsType)
+	}
 
 	// Work out which options need to be obscured
 	needsObscure := map[string]struct{}{}
-	if !noObscure {
-		if fsType := FileGet(name, "type"); fsType != "" {
-			if ri, err := fs.Find(fsType); err != nil {
-				fs.Debugf(nil, "Couldn't find fs for type %q", fsType)
-			} else {
-				for _, opt := range ri.Options {
-					if opt.IsPassword {
-						needsObscure[opt.Name] = struct{}{}
-					}
-				}
+	if !opt.NoObscure {
+		for _, option := range ri.Options {
+			if option.IsPassword {
+				needsObscure[option.Name] = struct{}{}
 			}
-		} else {
-			fs.Debugf(nil, "UpdateRemote: Couldn't find fs type")
 		}
 	}
+
+	choices := configmap.Simple{}
+	m := fs.ConfigMap(ri, name, nil)
 
 	// Set the config
 	for k, v := range keyValues {
@@ -426,37 +472,72 @@ func UpdateRemote(ctx context.Context, name string, keyValues rc.Params, doObscu
 		// Obscure parameter if necessary
 		if _, ok := needsObscure[k]; ok {
 			_, err := obscure.Reveal(vStr)
-			if err != nil || doObscure {
+			if err != nil || opt.Obscure {
 				// If error => not already obscured, so obscure it
 				// or we are forced to obscure
 				vStr, err = obscure.Obscure(vStr)
 				if err != nil {
-					return errors.Wrap(err, "UpdateRemote: obscure failed")
+					return nil, errors.Wrap(err, "UpdateRemote: obscure failed")
 				}
 			}
 		}
-		Data.SetValue(name, k, vStr)
+		choices.Set(k, vStr)
+		if !strings.HasPrefix(k, fs.ConfigKeyEphemeralPrefix) {
+			m.Set(k, vStr)
+		}
 	}
-	RemoteConfig(ctx, name)
+	if opt.Edit {
+		choices[fs.ConfigEdit] = "true"
+	}
+
+	if interactive {
+		var state = ""
+		if opt.All {
+			state = fs.ConfigAll
+		}
+		err = backendConfig(ctx, name, m, ri, choices, state)
+	} else {
+		// Start the config state machine
+		in := fs.ConfigIn{
+			State:  opt.State,
+			Result: opt.Result,
+		}
+		if in.State == "" && opt.All {
+			in.State = fs.ConfigAll
+		}
+		out, err = fs.BackendConfig(ctx, name, m, ri, choices, in)
+	}
+	if err != nil {
+		return nil, err
+	}
 	SaveConfig()
 	cache.ClearConfig(name) // remove any remotes based on this config from the cache
-	return nil
+	return out, nil
 }
 
-// CreateRemote creates a new remote with name, provider and a list of
+// UpdateRemote adds the keyValues passed in to the remote of name.
+// keyValues should be key, value pairs.
+func UpdateRemote(ctx context.Context, name string, keyValues rc.Params, opt UpdateRemoteOpt) (out *fs.ConfigOut, err error) {
+	opt.Edit = true
+	return updateRemote(ctx, name, keyValues, opt)
+}
+
+// CreateRemote creates a new remote with name, type and a list of
 // parameters which are key, value pairs.  If update is set then it
 // adds the new keys rather than replacing all of them.
-func CreateRemote(ctx context.Context, name string, provider string, keyValues rc.Params, doObscure, noObscure bool) error {
-	err := fspath.CheckConfigName(name)
+func CreateRemote(ctx context.Context, name string, Type string, keyValues rc.Params, opts UpdateRemoteOpt) (out *fs.ConfigOut, err error) {
+	err = fspath.CheckConfigName(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Delete the old config if it exists
-	Data.DeleteSection(name)
-	// Set the type
-	Data.SetValue(name, "type", provider)
+	if !opts.Continue {
+		// Delete the old config if it exists
+		LoadedData().DeleteSection(name)
+		// Set the type
+		LoadedData().SetValue(name, "type", Type)
+	}
 	// Set the remaining values
-	return UpdateRemote(ctx, name, keyValues, doObscure, noObscure)
+	return UpdateRemote(ctx, name, keyValues, opts)
 }
 
 // PasswordRemote adds the keyValues passed in to the remote of name.
@@ -470,7 +551,10 @@ func PasswordRemote(ctx context.Context, name string, keyValues rc.Params) error
 	for k, v := range keyValues {
 		keyValues[k] = obscure.MustObscure(fmt.Sprint(v))
 	}
-	return UpdateRemote(ctx, name, keyValues, false, true)
+	_, err = UpdateRemote(ctx, name, keyValues, UpdateRemoteOpt{
+		NoObscure: true,
+	})
+	return err
 }
 
 // JSONListProviders prints all the providers and options in JSON format
@@ -507,7 +591,7 @@ func fsOption() *fs.Option {
 // FileGetFlag gets the config key under section returning the
 // the value and true if found and or ("", false) otherwise
 func FileGetFlag(section, key string) (string, bool) {
-	return Data.GetValue(section, key)
+	return LoadedData().GetValue(section, key)
 }
 
 // FileGet gets the config key under section returning the default if not set.
@@ -527,7 +611,7 @@ func FileGet(section, key string) string {
 // the config file.
 func FileSet(section, key, value string) {
 	if value != "" {
-		Data.SetValue(section, key, value)
+		LoadedData().SetValue(section, key, value)
 	} else {
 		FileDeleteKey(section, key)
 	}
@@ -537,7 +621,7 @@ func FileSet(section, key, value string) {
 // It returns true if the key was deleted,
 // or returns false if the section or key didn't exist.
 func FileDeleteKey(section, key string) bool {
-	return Data.DeleteKey(section, key)
+	return LoadedData().DeleteKey(section, key)
 }
 
 var matchEnv = regexp.MustCompile(`^RCLONE_CONFIG_(.*?)_TYPE=.*$`)
@@ -545,7 +629,7 @@ var matchEnv = regexp.MustCompile(`^RCLONE_CONFIG_(.*?)_TYPE=.*$`)
 // FileSections returns the sections in the config file
 // including any defined by environment variables.
 func FileSections() []string {
-	sections := Data.GetSectionList()
+	sections := LoadedData().GetSectionList()
 	for _, item := range os.Environ() {
 		matches := matchEnv.FindStringSubmatch(item)
 		if len(matches) == 2 {
@@ -558,7 +642,7 @@ func FileSections() []string {
 // DumpRcRemote dumps the config for a single remote
 func DumpRcRemote(name string) (dump rc.Params) {
 	params := rc.Params{}
-	for _, key := range Data.GetKeyList(name) {
+	for _, key := range LoadedData().GetKeyList(name) {
 		params[key] = FileGet(name, key)
 	}
 	return params
@@ -568,7 +652,7 @@ func DumpRcRemote(name string) (dump rc.Params) {
 // for the rc
 func DumpRcBlob() (dump rc.Params) {
 	dump = rc.Params{}
-	for _, name := range Data.GetSectionList() {
+	for _, name := range LoadedData().GetSectionList() {
 		dump[name] = DumpRcRemote(name)
 	}
 	return dump
