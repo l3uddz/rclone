@@ -1,19 +1,19 @@
 // Upload object to QingStor
 
-// +build !plan9,!js
+//go:build !plan9 && !js
 
 package qingstor
 
 import (
 	"bytes"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
 	"sort"
 	"sync"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/atexit"
 	qs "github.com/yunify/qingstor-sdk-go/v3/service"
@@ -174,7 +174,7 @@ func (u *uploader) upload() error {
 	u.init()
 
 	if u.cfg.partSize < minMultiPartSize {
-		return errors.Errorf("part size must be at least %d bytes", minMultiPartSize)
+		return fmt.Errorf("part size must be at least %d bytes", minMultiPartSize)
 	}
 
 	// Do one read to determine if we have more than one part
@@ -183,7 +183,7 @@ func (u *uploader) upload() error {
 		fs.Debugf(u, "Uploading as single part object to QingStor")
 		return u.singlePartUpload(reader, u.readerPos)
 	} else if err != nil {
-		return errors.Errorf("read upload data failed: %s", err)
+		return fmt.Errorf("read upload data failed: %w", err)
 	}
 
 	fs.Debugf(u, "Uploading as multi-part object to QingStor")
@@ -358,7 +358,7 @@ func (mu *multiUploader) multiPartUpload(firstBuf io.ReadSeeker) (err error) {
 	})()
 
 	ch := make(chan chunk, mu.cfg.concurrency)
-	for i := 0; i < mu.cfg.concurrency; i++ {
+	for range mu.cfg.concurrency {
 		mu.wg.Add(1)
 		go mu.readChunk(ch)
 	}

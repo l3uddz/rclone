@@ -18,7 +18,9 @@ type RcloneCollector struct {
 	transferredFiles *prometheus.Desc
 	deletes          *prometheus.Desc
 	deletedDirs      *prometheus.Desc
+	updatedDirs      *prometheus.Desc
 	renames          *prometheus.Desc
+	listed           *prometheus.Desc
 	fatalError       *prometheus.Desc
 	retryError       *prometheus.Desc
 }
@@ -32,7 +34,7 @@ func NewRcloneCollector(ctx context.Context) *RcloneCollector {
 			nil, nil,
 		),
 		transferSpeed: prometheus.NewDesc(namespace+"speed",
-			"Average speed in bytes/sec since the start of the Rclone process",
+			"Average speed in bytes per second since the start of the Rclone process",
 			nil, nil,
 		),
 		numOfErrors: prometheus.NewDesc(namespace+"errors_total",
@@ -55,8 +57,16 @@ func NewRcloneCollector(ctx context.Context) *RcloneCollector {
 			"Total number of directories deleted",
 			nil, nil,
 		),
+		updatedDirs: prometheus.NewDesc(namespace+"dirs_updated_total",
+			"Total number of directories updated",
+			nil, nil,
+		),
 		renames: prometheus.NewDesc(namespace+"files_renamed_total",
 			"Total number of files renamed",
+			nil, nil,
+		),
+		listed: prometheus.NewDesc(namespace+"entries_listed_total",
+			"Total number of entries listed",
 			nil, nil,
 		),
 		fatalError: prometheus.NewDesc(namespace+"fatal_error",
@@ -79,7 +89,9 @@ func (c *RcloneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.transferredFiles
 	ch <- c.deletes
 	ch <- c.deletedDirs
+	ch <- c.updatedDirs
 	ch <- c.renames
+	ch <- c.listed
 	ch <- c.fatalError
 	ch <- c.retryError
 }
@@ -90,13 +102,15 @@ func (c *RcloneCollector) Collect(ch chan<- prometheus.Metric) {
 	s.mu.RLock()
 
 	ch <- prometheus.MustNewConstMetric(c.bytesTransferred, prometheus.CounterValue, float64(s.bytes))
-	ch <- prometheus.MustNewConstMetric(c.transferSpeed, prometheus.GaugeValue, s.speed())
+	ch <- prometheus.MustNewConstMetric(c.transferSpeed, prometheus.GaugeValue, s._speed())
 	ch <- prometheus.MustNewConstMetric(c.numOfErrors, prometheus.CounterValue, float64(s.errors))
 	ch <- prometheus.MustNewConstMetric(c.numOfCheckFiles, prometheus.CounterValue, float64(s.checks))
 	ch <- prometheus.MustNewConstMetric(c.transferredFiles, prometheus.CounterValue, float64(s.transfers))
 	ch <- prometheus.MustNewConstMetric(c.deletes, prometheus.CounterValue, float64(s.deletes))
 	ch <- prometheus.MustNewConstMetric(c.deletedDirs, prometheus.CounterValue, float64(s.deletedDirs))
+	ch <- prometheus.MustNewConstMetric(c.updatedDirs, prometheus.CounterValue, float64(s.updatedDirs))
 	ch <- prometheus.MustNewConstMetric(c.renames, prometheus.CounterValue, float64(s.renames))
+	ch <- prometheus.MustNewConstMetric(c.listed, prometheus.CounterValue, float64(s.listed))
 	ch <- prometheus.MustNewConstMetric(c.fatalError, prometheus.GaugeValue, bool2Float(s.fatalError))
 	ch <- prometheus.MustNewConstMetric(c.retryError, prometheus.GaugeValue, bool2Float(s.retryError))
 

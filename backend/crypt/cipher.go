@@ -7,18 +7,22 @@ import (
 	gocipher "crypto/cipher"
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"github.com/pkg/errors"
+	"github.com/Max-Sum/base32768"
 	"github.com/rclone/rclone/backend/crypt/pkcs7"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/version"
 	"github.com/rfjakob/eme"
 	"golang.org/x/crypto/nacl/secretbox"
@@ -35,7 +39,6 @@ const (
 	blockHeaderSize     = secretbox.Overhead
 	blockDataSize       = 64 * 1024
 	blockSize           = blockHeaderSize + blockDataSize
-	encryptedSuffix     = ".bin" // when file name encryption is off we add this suffix to make sure the cloud provider doesn't process the file
 )
 
 // Errors returned by cipher
@@ -51,8 +54,9 @@ var (
 	ErrorEncryptedBadBlock       = errors.New("failed to authenticate decrypted block - bad password?")
 	ErrorBadBase32Encoding       = errors.New("bad base32 filename encoding")
 	ErrorFileClosed              = errors.New("file already closed")
-	ErrorNotAnEncryptedFile      = errors.New("not an encrypted file - no \"" + encryptedSuffix + "\" suffix")
+	ErrorNotAnEncryptedFile      = errors.New("not an encrypted file - does not match suffix")
 	ErrorBadSeek                 = errors.New("Seek beyond end of file")
+	ErrorSuffixMissingDot        = errors.New("suffix config setting should include a '.'")
 	defaultSalt                  = []byte{0xA8, 0x0D, 0xF4, 0x3A, 0x8F, 0xBD, 0x03, 0x08, 0xA7, 0xCA, 0xB8, 0x3E, 0x58, 0x1F, 0x86, 0xB1}
 	obfuscQuoteRune              = '!'
 )
@@ -94,12 +98,12 @@ func NewNameEncryptionMode(s string) (mode NameEncryptionMode, err error) {
 	case "obfuscate":
 		mode = NameEncryptionObfuscated
 	default:
-		err = errors.Errorf("Unknown file name encryption mode %q", s)
+		err = fmt.Errorf("unknown file name encryption mode %q", s)
 	}
 	return mode, err
 }
 
-// String turns mode into a human readable string
+// String turns mode into a human-readable string
 func (mode NameEncryptionMode) String() (out string) {
 	switch mode {
 	case NameEncryptionOff:
@@ -114,27 +118,83 @@ func (mode NameEncryptionMode) String() (out string) {
 	return out
 }
 
+// FileNameEncoding is the interface for the encoding methods dealing with encrypted file names
+type FileNameEncoding interface {
+	EncodeToString(src []byte) string
+	DecodeString(s string) ([]byte, error)
+}
+
+// caseInsensitiveBase32Encoding defines a file name encoding
+// using a modified version of standard base32 as described in
+// RFC4648
+//
+// The standard encoding is modified in two ways
+//   - it becomes lower case (no-one likes upper case filenames!)
+//   - we strip the padding character `=`
+type caseInsensitiveBase32Encoding struct{}
+
+// EncodeToString encodes a string using the modified version of
+// base32 encoding.
+func (caseInsensitiveBase32Encoding) EncodeToString(src []byte) string {
+	encoded := base32.HexEncoding.EncodeToString(src)
+	encoded = strings.TrimRight(encoded, "=")
+	return strings.ToLower(encoded)
+}
+
+// DecodeString decodes a string as encoded by EncodeToString
+func (caseInsensitiveBase32Encoding) DecodeString(s string) ([]byte, error) {
+	if strings.HasSuffix(s, "=") {
+		return nil, ErrorBadBase32Encoding
+	}
+	// First figure out how many padding characters to add
+	roundUpToMultipleOf8 := (len(s) + 7) &^ 7
+	equals := roundUpToMultipleOf8 - len(s)
+	s = strings.ToUpper(s) + "========"[:equals]
+	return base32.HexEncoding.DecodeString(s)
+}
+
+// NewNameEncoding creates a NameEncoding from a string
+func NewNameEncoding(s string) (enc FileNameEncoding, err error) {
+	s = strings.ToLower(s)
+	switch s {
+	case "base32":
+		enc = caseInsensitiveBase32Encoding{}
+	case "base64":
+		enc = base64.RawURLEncoding
+	case "base32768":
+		enc = base32768.SafeEncoding
+	default:
+		err = fmt.Errorf("unknown file name encoding mode %q", s)
+	}
+	return enc, err
+}
+
 // Cipher defines an encoding and decoding cipher for the crypt backend
 type Cipher struct {
-	dataKey        [32]byte                  // Key for secretbox
-	nameKey        [32]byte                  // 16,24 or 32 bytes
-	nameTweak      [nameCipherBlockSize]byte // used to tweak the name crypto
-	block          gocipher.Block
-	mode           NameEncryptionMode
-	buffers        sync.Pool // encrypt/decrypt buffers
-	cryptoRand     io.Reader // read crypto random numbers from here
-	dirNameEncrypt bool
+	dataKey         [32]byte                  // Key for secretbox
+	nameKey         [32]byte                  // 16,24 or 32 bytes
+	nameTweak       [nameCipherBlockSize]byte // used to tweak the name crypto
+	block           gocipher.Block
+	mode            NameEncryptionMode
+	fileNameEnc     FileNameEncoding
+	buffers         sync.Pool // encrypt/decrypt buffers
+	cryptoRand      io.Reader // read crypto random numbers from here
+	dirNameEncrypt  bool
+	passBadBlocks   bool // if set passed bad blocks as zeroed blocks
+	encryptedSuffix string
 }
 
 // newCipher initialises the cipher.  If salt is "" then it uses a built in salt val
-func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bool) (*Cipher, error) {
+func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bool, enc FileNameEncoding) (*Cipher, error) {
 	c := &Cipher{
-		mode:           mode,
-		cryptoRand:     rand.Reader,
-		dirNameEncrypt: dirNameEncrypt,
+		mode:            mode,
+		fileNameEnc:     enc,
+		cryptoRand:      rand.Reader,
+		dirNameEncrypt:  dirNameEncrypt,
+		encryptedSuffix: ".bin",
 	}
-	c.buffers.New = func() interface{} {
-		return make([]byte, blockSize)
+	c.buffers.New = func() any {
+		return new([blockSize]byte)
 	}
 	err := c.Key(password, salt)
 	if err != nil {
@@ -143,11 +203,29 @@ func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bo
 	return c, nil
 }
 
+// setEncryptedSuffix set suffix, or an empty string
+func (c *Cipher) setEncryptedSuffix(suffix string) {
+	if strings.EqualFold(suffix, "none") {
+		c.encryptedSuffix = ""
+		return
+	}
+	if !strings.HasPrefix(suffix, ".") {
+		fs.Errorf(nil, "crypt: bad suffix: %v", ErrorSuffixMissingDot)
+		suffix = "." + suffix
+	}
+	c.encryptedSuffix = suffix
+}
+
+// Call to set bad block pass through
+func (c *Cipher) setPassBadBlocks(passBadBlocks bool) {
+	c.passBadBlocks = passBadBlocks
+}
+
 // Key creates all the internal keys from the password passed in using
 // scrypt.
 //
 // If salt is "" we use a fixed salt just to make attackers lives
-// slighty harder than using no salt.
+// slightly harder than using no salt.
 //
 // Note that empty password makes all 0x00 keys which is used in the
 // tests.
@@ -175,45 +253,18 @@ func (c *Cipher) Key(password, salt string) (err error) {
 }
 
 // getBlock gets a block from the pool of size blockSize
-func (c *Cipher) getBlock() []byte {
-	return c.buffers.Get().([]byte)
+func (c *Cipher) getBlock() *[blockSize]byte {
+	return c.buffers.Get().(*[blockSize]byte)
 }
 
 // putBlock returns a block to the pool of size blockSize
-func (c *Cipher) putBlock(buf []byte) {
-	if len(buf) != blockSize {
-		panic("bad blocksize returned to pool")
-	}
+func (c *Cipher) putBlock(buf *[blockSize]byte) {
 	c.buffers.Put(buf)
-}
-
-// encodeFileName encodes a filename using a modified version of
-// standard base32 as described in RFC4648
-//
-// The standard encoding is modified in two ways
-//  * it becomes lower case (no-one likes upper case filenames!)
-//  * we strip the padding character `=`
-func encodeFileName(in []byte) string {
-	encoded := base32.HexEncoding.EncodeToString(in)
-	encoded = strings.TrimRight(encoded, "=")
-	return strings.ToLower(encoded)
-}
-
-// decodeFileName decodes a filename as encoded by encodeFileName
-func decodeFileName(in string) ([]byte, error) {
-	if strings.HasSuffix(in, "=") {
-		return nil, ErrorBadBase32Encoding
-	}
-	// First figure out how many padding characters to add
-	roundUpToMultipleOf8 := (len(in) + 7) &^ 7
-	equals := roundUpToMultipleOf8 - len(in)
-	in = strings.ToUpper(in) + "========"[:equals]
-	return base32.HexEncoding.DecodeString(in)
 }
 
 // encryptSegment encrypts a path segment
 //
-// This uses EME with AES
+// This uses EME with AES.
 //
 // EME (ECB-Mix-ECB) is a wide-block encryption mode presented in the
 // 2003 paper "A Parallelizable Enciphering Mode" by Halevi and
@@ -223,15 +274,15 @@ func decodeFileName(in string) ([]byte, error) {
 // same filename must encrypt to the same thing.
 //
 // This means that
-//  * filenames with the same name will encrypt the same
-//  * filenames which start the same won't have a common prefix
+//   - filenames with the same name will encrypt the same
+//   - filenames which start the same won't have a common prefix
 func (c *Cipher) encryptSegment(plaintext string) string {
 	if plaintext == "" {
 		return ""
 	}
 	paddedPlaintext := pkcs7.Pad(nameCipherBlockSize, []byte(plaintext))
 	ciphertext := eme.Transform(c.block, c.nameTweak[:], paddedPlaintext, eme.DirectionEncrypt)
-	return encodeFileName(ciphertext)
+	return c.fileNameEnc.EncodeToString(ciphertext)
 }
 
 // decryptSegment decrypts a path segment
@@ -239,7 +290,7 @@ func (c *Cipher) decryptSegment(ciphertext string) (string, error) {
 	if ciphertext == "" {
 		return "", nil
 	}
-	rawCiphertext, err := decodeFileName(ciphertext)
+	rawCiphertext, err := c.fileNameEnc.DecodeString(ciphertext)
 	if err != nil {
 		return "", err
 	}
@@ -279,14 +330,14 @@ func (c *Cipher) obfuscateSegment(plaintext string) string {
 	for _, runeValue := range plaintext {
 		dir += int(runeValue)
 	}
-	dir = dir % 256
+	dir %= 256
 
 	// We'll use this number to store in the result filename...
 	var result bytes.Buffer
 	_, _ = result.WriteString(strconv.Itoa(dir) + ".")
 
 	// but we'll augment it with the nameKey for real calculation
-	for i := 0; i < len(c.nameKey); i++ {
+	for i := range len(c.nameKey) {
 		dir += int(c.nameKey[i])
 	}
 
@@ -353,14 +404,14 @@ func (c *Cipher) deobfuscateSegment(ciphertext string) (string, error) {
 	if ciphertext == "" {
 		return "", nil
 	}
-	pos := strings.Index(ciphertext, ".")
-	if pos == -1 {
+	before, after, ok := strings.Cut(ciphertext, ".")
+	if !ok {
 		return "", ErrorNotAnEncryptedFile
 	} // No .
-	num := ciphertext[:pos]
+	num := before
 	if num == "!" {
 		// No rotation; probably original was not valid unicode
-		return ciphertext[pos+1:], nil
+		return after, nil
 	}
 	dir, err := strconv.Atoi(num)
 	if err != nil {
@@ -368,14 +419,14 @@ func (c *Cipher) deobfuscateSegment(ciphertext string) (string, error) {
 	}
 
 	// add the nameKey to get the real rotate distance
-	for i := 0; i < len(c.nameKey); i++ {
+	for i := range len(c.nameKey) {
 		dir += int(c.nameKey[i])
 	}
 
 	var result bytes.Buffer
 
 	inQuote := false
-	for _, runeValue := range ciphertext[pos+1:] {
+	for _, runeValue := range after {
 		switch {
 		case inQuote:
 			_, _ = result.WriteRune(runeValue)
@@ -400,7 +451,7 @@ func (c *Cipher) deobfuscateSegment(ciphertext string) (string, error) {
 			if pos >= 26 {
 				pos -= 6
 			}
-			pos = pos - thisdir
+			pos -= thisdir
 			if pos < 0 {
 				pos += 52
 			}
@@ -436,7 +487,12 @@ func (c *Cipher) deobfuscateSegment(ciphertext string) (string, error) {
 }
 
 // encryptFileName encrypts a file path
-func (c *Cipher) encryptFileName(in string) string {
+//
+// If stripVersion is set, a version string (as used by --b2-versions)
+// on the last segment is kept in plain text. Set it for file names
+// only: directory names must encrypt identically whether passed alone
+// or as the parent of a file name.
+func (c *Cipher) encryptFileName(in string, stripVersion bool) string {
 	segments := strings.Split(in, "/")
 	for i := range segments {
 		// Skip directory name encryption if the user chose to
@@ -449,7 +505,7 @@ func (c *Cipher) encryptFileName(in string) string {
 		// of the file name gets encrypted/obfuscated
 		hasVersion := false
 		var t time.Time
-		if i == (len(segments)-1) && version.Match(segments[i]) {
+		if stripVersion && i == (len(segments)-1) && version.Match(segments[i]) {
 			var s string
 			t, s = version.Remove(segments[i])
 			// version.Remove can fail, in which case it returns segments[i]
@@ -477,21 +533,26 @@ func (c *Cipher) encryptFileName(in string) string {
 // EncryptFileName encrypts a file path
 func (c *Cipher) EncryptFileName(in string) string {
 	if c.mode == NameEncryptionOff {
-		return in + encryptedSuffix
+		return in + c.encryptedSuffix
 	}
-	return c.encryptFileName(in)
+	return c.encryptFileName(in, true)
 }
 
 // EncryptDirName encrypts a directory path
+//
+// Unlike EncryptFileName, a version string on the last segment is
+// encrypted along with the rest of the name.
 func (c *Cipher) EncryptDirName(in string) string {
 	if c.mode == NameEncryptionOff || !c.dirNameEncrypt {
 		return in
 	}
-	return c.encryptFileName(in)
+	return c.encryptFileName(in, false)
 }
 
 // decryptFileName decrypts a file path
-func (c *Cipher) decryptFileName(in string) (string, error) {
+//
+// stripVersion is as for encryptFileName.
+func (c *Cipher) decryptFileName(in string, stripVersion bool) (string, error) {
 	segments := strings.Split(in, "/")
 	for i := range segments {
 		var err error
@@ -505,7 +566,7 @@ func (c *Cipher) decryptFileName(in string) (string, error) {
 		// of the file name gets decrypted/deobfuscated
 		hasVersion := false
 		var t time.Time
-		if i == (len(segments)-1) && version.Match(segments[i]) {
+		if stripVersion && i == (len(segments)-1) && version.Match(segments[i]) {
 			var s string
 			t, s = version.Remove(segments[i])
 			// version.Remove can fail, in which case it returns segments[i]
@@ -537,8 +598,8 @@ func (c *Cipher) decryptFileName(in string) (string, error) {
 // DecryptFileName decrypts a file path
 func (c *Cipher) DecryptFileName(in string) (string, error) {
 	if c.mode == NameEncryptionOff {
-		remainingLength := len(in) - len(encryptedSuffix)
-		if remainingLength == 0 || !strings.HasSuffix(in, encryptedSuffix) {
+		remainingLength := len(in) - len(c.encryptedSuffix)
+		if remainingLength == 0 || !strings.HasSuffix(in, c.encryptedSuffix) {
 			return "", ErrorNotAnEncryptedFile
 		}
 		decrypted := in[:remainingLength]
@@ -551,15 +612,31 @@ func (c *Cipher) DecryptFileName(in string) (string, error) {
 		// Leave the version string on, if it was there
 		return decrypted, nil
 	}
-	return c.decryptFileName(in)
+	return c.decryptFileName(in, true)
 }
 
 // DecryptDirName decrypts a directory path
+//
+// Unlike DecryptFileName, a version string on the last segment is
+// expected to be part of the encrypted name. Directory names created
+// by rclone before v1.76 had a version-like suffix left in plain
+// text; these are still decrypted so that they appear in listings,
+// but they can't be opened or removed until renamed on the
+// underlying remote.
 func (c *Cipher) DecryptDirName(in string) (string, error) {
 	if c.mode == NameEncryptionOff || !c.dirNameEncrypt {
 		return in, nil
 	}
-	return c.decryptFileName(in)
+	out, err := c.decryptFileName(in, false)
+	if err != nil && version.Match(path.Base(in)) {
+		var legacyErr error
+		out, legacyErr = c.decryptFileName(in, true)
+		if legacyErr == nil {
+			fs.Logf(nil, "crypt: directory %q has a legacy encrypted name - rename %q on the underlying remote to %q to make it accessible", out, in, c.encryptFileName(out, false))
+			return out, nil
+		}
+	}
+	return out, err
 }
 
 // NameEncryptionMode returns the encryption mode in use for names
@@ -578,9 +655,9 @@ func (n *nonce) pointer() *[fileNonceSize]byte {
 // fromReader fills the nonce from an io.Reader - normally the OSes
 // crypto random number generator
 func (n *nonce) fromReader(in io.Reader) error {
-	read, err := io.ReadFull(in, (*n)[:])
+	read, err := readers.ReadFill(in, (*n)[:])
 	if read != fileNonceSize {
-		return errors.Wrap(err, "short read of nonce")
+		return fmt.Errorf("short read of nonce: %w", err)
 	}
 	return nil
 }
@@ -614,7 +691,7 @@ func (n *nonce) increment() {
 // add a uint64 to the nonce
 func (n *nonce) add(x uint64) {
 	carry := uint16(0)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		digit := (*n)[i]
 		xDigit := byte(x)
 		x >>= 8
@@ -633,8 +710,8 @@ type encrypter struct {
 	in       io.Reader
 	c        *Cipher
 	nonce    nonce
-	buf      []byte
-	readBuf  []byte
+	buf      *[blockSize]byte
+	readBuf  *[blockSize]byte
 	bufIndex int
 	bufSize  int
 	err      error
@@ -659,9 +736,9 @@ func (c *Cipher) newEncrypter(in io.Reader, nonce *nonce) (*encrypter, error) {
 		}
 	}
 	// Copy magic into buffer
-	copy(fh.buf, fileMagicBytes)
+	copy((*fh.buf)[:], fileMagicBytes)
 	// Copy nonce into buffer
-	copy(fh.buf[fileMagicSize:], fh.nonce[:])
+	copy((*fh.buf)[fileMagicSize:], fh.nonce[:])
 	return fh, nil
 }
 
@@ -676,22 +753,20 @@ func (fh *encrypter) Read(p []byte) (n int, err error) {
 	if fh.bufIndex >= fh.bufSize {
 		// Read data
 		// FIXME should overlap the reads with a go-routine and 2 buffers?
-		readBuf := fh.readBuf[:blockDataSize]
-		n, err = io.ReadFull(fh.in, readBuf)
+		readBuf := (*fh.readBuf)[:blockDataSize]
+		n, err = readers.ReadFill(fh.in, readBuf)
 		if n == 0 {
-			// err can't be nil since:
-			// n == len(buf) if and only if err == nil.
 			return fh.finish(err)
 		}
 		// possibly err != nil here, but we will process the
-		// data and the next call to ReadFull will return 0, err
+		// data and the next call to ReadFill will return 0, err
 		// Encrypt the block using the nonce
-		secretbox.Seal(fh.buf[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
+		secretbox.Seal((*fh.buf)[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
 		fh.bufIndex = 0
 		fh.bufSize = blockHeaderSize + n
 		fh.nonce.increment()
 	}
-	n = copy(p, fh.buf[fh.bufIndex:fh.bufSize])
+	n = copy(p, (*fh.buf)[fh.bufIndex:fh.bufSize])
 	fh.bufIndex += n
 	return n, nil
 }
@@ -732,8 +807,8 @@ type decrypter struct {
 	nonce        nonce
 	initialNonce nonce
 	c            *Cipher
-	buf          []byte
-	readBuf      []byte
+	buf          *[blockSize]byte
+	readBuf      *[blockSize]byte
 	bufIndex     int
 	bufSize      int
 	err          error
@@ -751,12 +826,12 @@ func (c *Cipher) newDecrypter(rc io.ReadCloser) (*decrypter, error) {
 		limit:   -1,
 	}
 	// Read file header (magic + nonce)
-	readBuf := fh.readBuf[:fileHeaderSize]
-	_, err := io.ReadFull(fh.rc, readBuf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
+	readBuf := (*fh.readBuf)[:fileHeaderSize]
+	n, err := readers.ReadFill(fh.rc, readBuf)
+	if n < fileHeaderSize && err == io.EOF {
 		// This read from 0..fileHeaderSize-1 bytes
 		return nil, fh.finishAndClose(ErrorEncryptedFileTooShort)
-	} else if err != nil {
+	} else if err != io.EOF && err != nil {
 		return nil, fh.finishAndClose(err)
 	}
 	// check the magic
@@ -814,10 +889,8 @@ func (c *Cipher) newDecrypterSeek(ctx context.Context, open OpenRangeSeek, offse
 func (fh *decrypter) fillBuffer() (err error) {
 	// FIXME should overlap the reads with a go-routine and 2 buffers?
 	readBuf := fh.readBuf
-	n, err := io.ReadFull(fh.rc, readBuf)
+	n, err := readers.ReadFill(fh.rc, (*readBuf)[:])
 	if n == 0 {
-		// err can't be nil since:
-		// n == len(buf) if and only if err == nil.
 		return err
 	}
 	// possibly err != nil here, but we will process the data and
@@ -825,18 +898,25 @@ func (fh *decrypter) fillBuffer() (err error) {
 
 	// Check header + 1 byte exists
 	if n <= blockHeaderSize {
-		if err != nil {
+		if err != nil && err != io.EOF {
 			return err // return pending error as it is likely more accurate
 		}
 		return ErrorEncryptedFileBadHeader
 	}
 	// Decrypt the block using the nonce
-	_, ok := secretbox.Open(fh.buf[:0], readBuf[:n], fh.nonce.pointer(), &fh.c.dataKey)
+	_, ok := secretbox.Open((*fh.buf)[:0], (*readBuf)[:n], fh.nonce.pointer(), &fh.c.dataKey)
 	if !ok {
-		if err != nil {
+		if err != nil && err != io.EOF {
 			return err // return pending error as it is likely more accurate
 		}
-		return ErrorEncryptedBadBlock
+		if !fh.c.passBadBlocks {
+			return ErrorEncryptedBadBlock
+		}
+		fs.Errorf(nil, "crypt: ignoring: %v", ErrorEncryptedBadBlock)
+		// Zero out the bad block and continue
+		for i := range (*fh.buf)[:n] {
+			fh.buf[i] = 0
+		}
 	}
 	fh.bufIndex = 0
 	fh.bufSize = n - blockHeaderSize
@@ -862,7 +942,7 @@ func (fh *decrypter) Read(p []byte) (n int, err error) {
 	if fh.limit >= 0 && fh.limit < int64(toCopy) {
 		toCopy = int(fh.limit)
 	}
-	n = copy(p, fh.buf[fh.bufIndex:fh.bufIndex+toCopy])
+	n = copy(p, (*fh.buf)[fh.bufIndex:fh.bufIndex+toCopy])
 	fh.bufIndex += n
 	if fh.limit >= 0 {
 		fh.limit -= int64(n)
@@ -873,9 +953,8 @@ func (fh *decrypter) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// calculateUnderlying converts an (offset, limit) in a crypted file
-// into an (underlyingOffset, underlyingLimit) for the underlying
-// file.
+// calculateUnderlying converts an (offset, limit) in an encrypted file
+// into an (underlyingOffset, underlyingLimit) for the underlying file.
 //
 // It also returns number of bytes to discard after reading the first
 // block and number of blocks this is from the start so the nonce can
@@ -956,7 +1035,7 @@ func (fh *decrypter) RangeSeek(ctx context.Context, offset int64, whence int, li
 		// Re-open the underlying object with the offset given
 		rc, err := fh.open(ctx, underlyingOffset, underlyingLimit)
 		if err != nil {
-			return 0, fh.finish(errors.Wrap(err, "couldn't reopen file with offset and limit"))
+			return 0, fh.finish(fmt.Errorf("couldn't reopen file with offset and limit: %w", err))
 		}
 
 		// Set the file handle
@@ -1054,7 +1133,7 @@ func (c *Cipher) DecryptData(rc io.ReadCloser) (io.ReadCloser, error) {
 
 // DecryptDataSeek decrypts the data stream from offset
 //
-// The open function must return a ReadCloser opened to the offset supplied
+// The open function must return a ReadCloser opened to the offset supplied.
 //
 // You must use this form of DecryptData if you might want to Seek the file handle
 func (c *Cipher) DecryptDataSeek(ctx context.Context, open OpenRangeSeek, offset, limit int64) (ReadSeekCloser, error) {

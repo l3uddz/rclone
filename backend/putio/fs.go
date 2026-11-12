@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/putdotio/go-putio/putio"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -21,8 +21,10 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
 )
 
@@ -80,7 +82,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (f fs.Fs,
 	httpClient := fshttp.NewClient(ctx)
 	oAuthClient, _, err := oauthutil.NewClientWithBaseClient(ctx, name, m, putioConfig, httpClient)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to configure putio")
+		return nil, fmt.Errorf("failed to configure putio: %w", err)
 	}
 	p := &Fs{
 		name:        name,
@@ -230,7 +232,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // Put the object
 //
-// Copy the reader in to the new object which is returned
+// Copy the reader in to the new object which is returned.
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (o fs.Object, err error) {
@@ -252,9 +254,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // This will create a duplicate if we upload a new file without
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (o fs.Object, err error) {
+	return f.putUnchecked(ctx, in, src, src.Remote(), options...)
+}
+
+func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options ...fs.OpenOption) (o fs.Object, err error) {
 	// defer log.Trace(f, "src=%+v", src)("o=%+v, err=%v", &o, &err)
 	size := src.Size()
-	remote := src.Remote()
 	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return nil, err
@@ -302,8 +307,8 @@ func (f *Fs) createUpload(ctx context.Context, name string, size int64, parentID
 		if err != nil {
 			return false, err
 		}
-		if resp.StatusCode != 201 {
-			return false, fmt.Errorf("unexpected status code from upload create: %d", resp.StatusCode)
+		if err := checkStatusCode(resp, 201); err != nil {
+			return shouldRetry(ctx, err)
 		}
 		location = resp.Header.Get("location")
 		if location == "" {
@@ -326,20 +331,31 @@ func (f *Fs) sendUpload(ctx context.Context, location string, size int64, in io.
 	}
 	var clientOffset int64
 	var offsetMismatch bool
-	buf := make([]byte, defaultChunkSize)
 	for clientOffset < size {
-		chunkSize := size - clientOffset
-		if chunkSize >= int64(defaultChunkSize) {
-			chunkSize = int64(defaultChunkSize)
-		}
-		chunk := readers.NewRepeatableLimitReaderBuffer(in, buf, chunkSize)
+		chunkSize := min(size-clientOffset, int64(defaultChunkSize))
 		chunkStart := clientOffset
 		reqSize := chunkSize
 		transferOffset := clientOffset
 		fs.Debugf(f, "chunkStart: %d, reqSize: %d", chunkStart, reqSize)
 
+		// Buffer the chunk in memory from the global pool so reads are
+		// repeatable for retries
+		rw := multipart.NewRW()
+		_, err = io.CopyN(rw, in, chunkSize)
+		if err != nil {
+			_ = rw.Close()
+			if err == io.EOF {
+				err = fmt.Errorf("short read of chunk at %d: %w", chunkStart, io.ErrUnexpectedEOF)
+			}
+			return
+		}
+
 		// Transfer the chunk
 		err = f.pacer.Call(func() (bool, error) {
+			_, err = rw.Seek(0, io.SeekStart)
+			if err != nil {
+				return false, err
+			}
 			if offsetMismatch {
 				// Get file offset and seek to the position
 				offset, err := f.getServerOffset(ctx, location)
@@ -348,7 +364,7 @@ func (f *Fs) sendUpload(ctx context.Context, location string, size int64, in io.
 				}
 				sentBytes := offset - chunkStart
 				fs.Debugf(f, "sentBytes: %d", sentBytes)
-				_, err = chunk.Seek(sentBytes, io.SeekStart)
+				_, err = rw.Seek(sentBytes, io.SeekStart)
 				if err != nil {
 					return shouldRetry(ctx, err)
 				}
@@ -358,7 +374,7 @@ func (f *Fs) sendUpload(ctx context.Context, location string, size int64, in io.
 			}
 			fs.Debugf(f, "Sending chunk. transferOffset: %d length: %d", transferOffset, reqSize)
 			var serverOffset int64
-			serverOffset, fileID, err = f.transferChunk(ctx, location, transferOffset, chunk, reqSize)
+			serverOffset, fileID, err = f.transferChunk(ctx, location, transferOffset, rw, reqSize)
 			if cerr, ok := err.(*statusCodeError); ok && cerr.response.StatusCode == 409 {
 				offsetMismatch = true
 				return true, err
@@ -369,8 +385,12 @@ func (f *Fs) sendUpload(ctx context.Context, location string, size int64, in io.
 			}
 			return shouldRetry(ctx, err)
 		})
+		closeErr := rw.Close()
 		if err != nil {
 			return
+		}
+		if closeErr != nil {
+			return 0, closeErr
 		}
 
 		clientOffset += chunkSize
@@ -435,11 +455,19 @@ func (f *Fs) makeUploadHeadRequest(ctx context.Context, location string) (*http.
 	return req, nil
 }
 
+// makeUploadPatchRequest makes the tus PATCH request sending length bytes
+// of in at offset.
+//
+// The body is wrapped in readers.NoCloser so the transport can't upgrade it
+// to an io.Closer and close it after each attempt — the chunk buffer is
+// pool-backed, so an early close would free its pages and a retry would then
+// read a dead buffer. The upload loop owns the buffer's lifetime.
 func (f *Fs) makeUploadPatchRequest(ctx context.Context, location string, in io.Reader, offset, length int64) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, "PATCH", location, in)
+	req, err := http.NewRequestWithContext(ctx, "PATCH", location, readers.NoCloser(in))
 	if err != nil {
 		return nil, err
 	}
+	req.ContentLength = length
 	req.Header.Set("tus-resumable", "1.0.0")
 	req.Header.Set("upload-offset", strconv.FormatInt(offset, 10))
 	req.Header.Set("content-length", strconv.FormatInt(length, 10))
@@ -469,7 +497,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) (err error)
 	// check directory exists
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
-		return errors.Wrap(err, "Rmdir")
+		return fmt.Errorf("Rmdir: %w", err)
 	}
 	dirID := atoi(directoryID)
 
@@ -482,7 +510,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) (err error)
 			return shouldRetry(ctx, err)
 		})
 		if err != nil {
-			return errors.Wrap(err, "Rmdir")
+			return fmt.Errorf("Rmdir: %w", err)
 		}
 		if len(children) != 0 {
 			return errors.New("directory not empty")
@@ -523,9 +551,9 @@ func (f *Fs) Purge(ctx context.Context, dir string) (err error) {
 
 // Copy src to this remote using server-side copy operations.
 //
-// This is stored with the remote path given
+// This is stored with the remote path given.
 //
-// It returns the destination Object and a possible error
+// It returns the destination Object and a possible error.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -540,31 +568,77 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (o fs.Objec
 	if err != nil {
 		return nil, err
 	}
+	modTime := src.ModTime(ctx)
+	var resp struct {
+		File putio.File `json:"file"`
+	}
+	// For some unknown reason the API sometimes returns the name
+	// already exists unless we upload to a temporary name and
+	// rename
+	//
+	// {"error_id":null,"error_message":"Name already exist","error_type":"NAME_ALREADY_EXIST","error_uri":"http://api.put.io/v2/docs","extra":{},"status":"ERROR","status_code":400}
+	suffix := "." + random.String(8)
 	err = f.pacer.Call(func() (bool, error) {
 		params := url.Values{}
 		params.Set("file_id", strconv.FormatInt(srcObj.file.ID, 10))
 		params.Set("parent_id", directoryID)
-		params.Set("name", f.opt.Enc.FromStandardName(leaf))
+		params.Set("name", f.opt.Enc.FromStandardName(leaf+suffix))
+
 		req, err := f.client.NewRequest(ctx, "POST", "/v2/files/copy", strings.NewReader(params.Encode()))
 		if err != nil {
 			return false, err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		// fs.Debugf(f, "copying file (%d) to parent_id: %s", srcObj.file.ID, directoryID)
-		_, err = f.client.Do(req, nil)
+		_, err = f.client.Do(req, &resp)
 		return shouldRetry(ctx, err)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return f.NewObject(ctx, remote)
+
+	// We have successfully copied the file to random name
+	// Check to see if file already exists first and delete it if so
+	existingObj, err := f.NewObject(ctx, remote)
+	if err == nil {
+		err = existingObj.Remove(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("server side copy: failed to remove existing file: %w", err)
+		}
+	}
+
+	err = f.pacer.Call(func() (bool, error) {
+		params := url.Values{}
+		params.Set("file_id", strconv.FormatInt(resp.File.ID, 10))
+		params.Set("name", f.opt.Enc.FromStandardName(leaf))
+
+		req, err := f.client.NewRequest(ctx, "POST", "/v2/files/rename", strings.NewReader(params.Encode()))
+		if err != nil {
+			return false, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		_, err = f.client.Do(req, &resp)
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	o, err = f.newObjectWithInfo(ctx, remote, resp.File)
+	if err != nil {
+		return nil, err
+	}
+	err = o.SetModTime(ctx, modTime)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
 // Move src to this remote using server-side move operations.
 //
-// This is stored with the remote path given
+// This is stored with the remote path given.
 //
-// It returns the destination Object and a possible error
+// It returns the destination Object and a possible error.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -579,6 +653,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (o fs.Objec
 	if err != nil {
 		return nil, err
 	}
+	modTime := src.ModTime(ctx)
 	err = f.pacer.Call(func() (bool, error) {
 		params := url.Values{}
 		params.Set("file_id", strconv.FormatInt(srcObj.file.ID, 10))
@@ -596,7 +671,15 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (o fs.Objec
 	if err != nil {
 		return nil, err
 	}
-	return f.NewObject(ctx, remote)
+	o, err = f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	err = o.SetModTime(ctx, modTime)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
@@ -647,7 +730,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 		return shouldRetry(ctx, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "about failed")
+		return nil, err
 	}
 	return &fs.Usage{
 		Total: fs.NewUsageValue(ai.Disk.Size),  // quota of bytes that can be used

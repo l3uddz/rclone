@@ -1,4 +1,4 @@
-//+build linux
+//go:build linux
 
 package file
 
@@ -17,7 +17,7 @@ var (
 		unix.FALLOC_FL_KEEP_SIZE,                             // Default
 		unix.FALLOC_FL_KEEP_SIZE | unix.FALLOC_FL_PUNCH_HOLE, // for ZFS #3066
 	}
-	fallocFlagsIndex int32
+	fallocFlagsIndex atomic.Int32
 	preAllocateMu    sync.Mutex
 )
 
@@ -36,7 +36,7 @@ func PreAllocate(size int64, out *os.File) (err error) {
 
 	for {
 
-		index := atomic.LoadInt32(&fallocFlagsIndex)
+		index := fallocFlagsIndex.Load()
 	again:
 		if index >= int32(len(fallocFlags)) {
 			return nil // Fallocate is disabled
@@ -46,7 +46,7 @@ func PreAllocate(size int64, out *os.File) (err error) {
 		if err == unix.ENOTSUP {
 			// Try the next flags combination
 			index++
-			atomic.StoreInt32(&fallocFlagsIndex, index)
+			fallocFlagsIndex.Store(index)
 			fs.Debugf(nil, "preAllocate: got error on fallocate, trying combination %d/%d: %v", index, len(fallocFlags), err)
 			goto again
 

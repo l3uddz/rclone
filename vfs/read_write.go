@@ -6,7 +6,6 @@ import (
 	"os"
 	"sync"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/vfs/vfscache"
@@ -31,10 +30,20 @@ type RWFileHandle struct {
 	writeCalled bool // if any Write() methods have been called
 }
 
+// Lock performs Unix locking, not supported
+func (fh *RWFileHandle) Lock() error {
+	return os.ErrInvalid
+}
+
+// Unlock performs Unix unlocking, not supported
+func (fh *RWFileHandle) Unlock() error {
+	return os.ErrInvalid
+}
+
 func newRWFileHandle(d *Dir, f *File, flags int) (fh *RWFileHandle, err error) {
 	defer log.Trace(f.Path(), "")("err=%v", &err)
 	// get an item to represent this from the cache
-	item := d.vfs.cache.Item(f.Path())
+	item := d.vfs.cache.Item(f.CachePath())
 
 	exists := f.exists() || (item.Exists() && !item.WrittenBack())
 
@@ -54,7 +63,7 @@ func newRWFileHandle(d *Dir, f *File, flags int) (fh *RWFileHandle, err error) {
 	if !fh.readOnly() && (fh.flags&os.O_TRUNC != 0 || (fh.flags&os.O_CREATE != 0 && !exists)) {
 		err = fh.Truncate(0)
 		if err != nil {
-			return nil, errors.Wrap(err, "cache open with O_TRUNC: failed to truncate")
+			return nil, fmt.Errorf("cache open with O_TRUNC: failed to truncate: %w", err)
 		}
 		// we definitely need to write back the item even if we don't write to it
 		item.Dirty()
@@ -92,7 +101,7 @@ func (fh *RWFileHandle) openPending() (err error) {
 	o := fh.file.getObject()
 	err = fh.item.Open(o)
 	if err != nil {
-		return errors.Wrap(err, "open RW handle failed to open cache file")
+		return fmt.Errorf("open RW handle failed to open cache file: %w", err)
 	}
 
 	size := fh._size() // update size in file and read size
@@ -140,7 +149,7 @@ func (fh *RWFileHandle) updateSize() {
 // close the file handle returning EBADF if it has been
 // closed already.
 //
-// Must be called with fh.mu held
+// Must be called with fh.mu held.
 //
 // Note that we leave the file around in the cache on error conditions
 // to give the user a chance to recover it.

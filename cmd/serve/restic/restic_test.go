@@ -5,14 +5,23 @@ package restic
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/rclone/rclone/backend/all"
-	"github.com/rclone/rclone/cmd/serve/httplib"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/cmd/serve/servetest"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -20,16 +29,24 @@ const (
 	resticSource    = "../../../../../restic/restic"
 )
 
+func newOpt() Options {
+	opt := Opt
+	opt.HTTP.ListenAddr = []string{testBindAddress}
+	return opt
+}
+
 // TestRestic runs the restic server then runs the unit tests for the
 // restic remote against it.
-func TestRestic(t *testing.T) {
+//
+// Requires the restic source code in the location indicated by resticSource.
+func TestResticIntegration(t *testing.T) {
+	ctx := context.Background()
 	_, err := os.Stat(resticSource)
 	if err != nil {
 		t.Skipf("Skipping test as restic source not found: %v", err)
 	}
 
-	opt := httplib.DefaultOpt
-	opt.ListenAddr = testBindAddress
+	opt := newOpt()
 
 	fstest.Initialise()
 
@@ -41,16 +58,19 @@ func TestRestic(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Start the server
-	w := NewServer(fremote, &opt)
-	assert.NoError(t, w.Serve())
+	s, err := newServer(ctx, fremote, &opt)
+	require.NoError(t, err)
+	go func() {
+		require.NoError(t, s.Serve())
+	}()
+	testURL := s.server.URLs()[0]
 	defer func() {
-		w.Close()
-		w.Wait()
+		_ = s.Shutdown()
 	}()
 
 	// Change directory to run the tests
 	err = os.Chdir(resticSource)
-	assert.NoError(t, err, "failed to cd to restic source code")
+	require.NoError(t, err, "failed to cd to restic source code")
 
 	// Run the restic tests
 	runTests := func(path string) {
@@ -60,7 +80,7 @@ func TestRestic(t *testing.T) {
 		}
 		cmd := exec.Command("go", args...)
 		cmd.Env = append(os.Environ(),
-			"RESTIC_TEST_REST_REPOSITORY=rest:"+w.Server.URL()+path,
+			"RESTIC_TEST_REST_REPOSITORY=rest:"+testURL+path,
 			"GO111MODULE=on",
 		)
 		out, err := cmd.CombinedOutput()
@@ -81,7 +101,6 @@ func TestMakeRemote(t *testing.T) {
 	for _, test := range []struct {
 		in, want string
 	}{
-		{"", ""},
 		{"/", ""},
 		{"/data", "data"},
 		{"/data/", "data"},
@@ -89,12 +108,151 @@ func TestMakeRemote(t *testing.T) {
 		{"/data/12", "data/12/12"},
 		{"/data/123", "data/12/123"},
 		{"/data/123/", "data/12/123"},
+		{"/data/abcdef", "data/ab/abcdef"},
+		{"/data/config", "data/config"},
+		{"/data/data/", "data/data"},
+		{"/data/index/", "data/index"},
+		{"/data/keys/", "data/keys"},
+		{"/data/locks/", "data/locks"},
+		{"/data/snapshots/", "data/snapshots"},
+		{"/data/data/abcdef", "data/data/ab/abcdef"},
+		{"/repo/data/config", "repo/data/config"},
+		{"/repo/data/keys/", "repo/data/keys"},
+		{"/repo/data/data/abcdef", "repo/data/data/ab/abcdef"},
 		{"/keys", "keys"},
 		{"/keys/1", "keys/1"},
 		{"/keys/12", "keys/12"},
 		{"/keys/123", "keys/123"},
 	} {
-		got := makeRemote(test.in)
-		assert.Equal(t, test.want, got, test.in)
+		r := httptest.NewRequest("GET", test.in, nil)
+		w := httptest.NewRecorder()
+		next := http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+			remote, ok := request.Context().Value(ContextRemoteKey).(string)
+			assert.True(t, ok, "Failed to get remote from context")
+			assert.Equal(t, test.want, remote, test.in)
+		})
+		got := WithRemote(next)
+		got.ServeHTTP(w, r)
 	}
+}
+
+func TestResticDataRepository(t *testing.T) {
+	for _, repo := range []string{"data", "repo/data"} {
+		t.Run(repo, func(t *testing.T) {
+			tempdir := t.TempDir()
+			f := cmd.NewFsSrc([]string{tempdir})
+			opt := newOpt()
+			s, err := newServer(context.Background(), f, &opt)
+			require.NoError(t, err)
+			handler := s.server.Router().ServeHTTP
+			checkRequest(t, handler, newRequest(t, "POST", "/"+repo+"/?create=true", nil),
+				[]wantFunc{wantCode(http.StatusOK)})
+
+			const id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+			for _, object := range []struct {
+				url, remote string
+			}{
+				{"config", "config"},
+				{"keys/" + id, "keys/" + id},
+				{"data/" + id, "data/ab/" + id},
+			} {
+				url := "/" + repo + "/" + object.url
+				checkRequest(t, handler, newRequest(t, "POST", url, strings.NewReader("test content")),
+					[]wantFunc{wantCode(http.StatusOK)})
+				checkRequest(t, handler, newRequest(t, "GET", url, nil),
+					[]wantFunc{wantCode(http.StatusOK), wantBody("test content")})
+				content, err := os.ReadFile(filepath.Join(tempdir, repo, object.remote))
+				require.NoError(t, err)
+				assert.Equal(t, "test content", string(content))
+			}
+
+			for _, dir := range []string{"keys", "data"} {
+				checkRequest(t, handler, newRequest(t, "GET", "/"+repo+"/"+dir+"/", nil),
+					[]wantFunc{wantCode(http.StatusOK), func(t testing.TB, res *httptest.ResponseRecorder) {
+						assert.JSONEq(t, `[{"name":"`+id+`","size":12}]`, res.Body.String())
+					}})
+			}
+		})
+	}
+}
+
+type listErrorFs struct {
+	fs.Fs
+}
+
+func (f *listErrorFs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	return fs.DirEntries{}, errors.New("oops")
+}
+
+func TestListErrors(t *testing.T) {
+	ctx := context.Background()
+	// setup rclone with a local backend in a temporary directory
+	tempdir := t.TempDir()
+	opt := newOpt()
+
+	// make a new file system in the temp dir
+	f := &listErrorFs{Fs: cmd.NewFsSrc([]string{tempdir})}
+	s, err := newServer(ctx, f, &opt)
+	require.NoError(t, err)
+	router := s.server.Router()
+
+	req := newRequest(t, "GET", "/test/snapshots/", nil)
+	checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusInternalServerError)})
+}
+
+type newObjectErrorFs struct {
+	fs.Fs
+	err error
+}
+
+func (f *newObjectErrorFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return nil, f.err
+}
+
+func TestServeErrors(t *testing.T) {
+	ctx := context.Background()
+	// setup rclone with a local backend in a temporary directory
+	tempdir := t.TempDir()
+	opt := newOpt()
+
+	// make a new file system in the temp dir
+	f := &newObjectErrorFs{Fs: cmd.NewFsSrc([]string{tempdir})}
+	s, err := newServer(ctx, f, &opt)
+	require.NoError(t, err)
+	router := s.server.Router()
+
+	f.err = errors.New("oops")
+	req := newRequest(t, "GET", "/test/config", nil)
+	checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusInternalServerError)})
+
+	f.err = fs.ErrorObjectNotFound
+	checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusNotFound)})
+}
+
+func TestDeleteErrors(t *testing.T) {
+	ctx := context.Background()
+	// setup rclone with a local backend in a temporary directory
+	tempdir := t.TempDir()
+	opt := newOpt()
+
+	// make a new file system in the temp dir
+	f := &newObjectErrorFs{Fs: cmd.NewFsSrc([]string{tempdir})}
+	s, err := newServer(ctx, f, &opt)
+	require.NoError(t, err)
+	router := s.server.Router()
+
+	// a lookup failure that is not "not found" must be a 500 so
+	// restic retries the delete instead of treating it as final
+	f.err = errors.New("oops")
+	req := newRequest(t, "DELETE", "/test/locks/0123456789abcdef", nil)
+	checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusInternalServerError)})
+
+	f.err = fs.ErrorObjectNotFound
+	checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusNotFound)})
+}
+
+func TestRc(t *testing.T) {
+	servetest.TestRc(t, rc.Params{
+		"type": "restic",
+	})
 }

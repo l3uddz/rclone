@@ -2,6 +2,7 @@ package accounting
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/rclone/rclone/fs/rc"
@@ -17,8 +18,8 @@ func init() {
 	// Init stats container
 	groups = newStatsGroups()
 
-	// Set the function pointer up in fs
-	fs.CountError = GlobalStats().Error
+	// Attribute logs to stats groups
+	fs.StatsGroupFromContext = StatsGroupFromContext
 }
 
 func rcListStats(ctx context.Context, in rc.Params) (rc.Params, error) {
@@ -31,9 +32,10 @@ func rcListStats(ctx context.Context, in rc.Params) (rc.Params, error) {
 
 func init() {
 	rc.Add(rc.Call{
-		Path:  "core/group-list",
-		Fn:    rcListStats,
-		Title: "Returns list of stats.",
+		Path:   "core/group-list",
+		NoAuth: true,
+		Fn:     rcListStats,
+		Title:  "Returns list of stats.",
 		Help: `
 This returns list of stats groups currently in memory. 
 
@@ -58,18 +60,21 @@ func rcRemoteStats(ctx context.Context, in rc.Params) (rc.Params, error) {
 	if rc.NotErrParamNotFound(err) {
 		return rc.Params{}, err
 	}
+	short, _ := in.GetBool("short")
+
 	if group != "" {
-		return StatsGroup(ctx, group).RemoteStats()
+		return StatsGroup(ctx, group).RemoteStats(short)
 	}
 
-	return groups.sum(ctx).RemoteStats()
+	return groups.sum(ctx).RemoteStats(short)
 }
 
 func init() {
 	rc.Add(rc.Call{
-		Path:  "core/stats",
-		Fn:    rcRemoteStats,
-		Title: "Returns stats about current transfers.",
+		Path:   "core/stats",
+		NoAuth: true,
+		Fn:     rcRemoteStats,
+		Title:  "Returns stats about current transfers.",
 		Help: `
 This returns all available stats:
 
@@ -80,7 +85,8 @@ returned.
 
 Parameters
 
-- group - name of the stats group (string)
+- group - name of the stats group (string, optional)
+- short - if true will not return the transferring and checking arrays (boolean, optional)
 
 Returns the following values:
 
@@ -88,6 +94,7 @@ Returns the following values:
 {
 	"bytes": total transferred bytes since the start of the group,
 	"checks": number of files checked,
+	"deletedDirs": number of directories deleted,
 	"deletes" : number of files deleted,
 	"elapsedTime": time in floating point seconds since rclone was started,
 	"errors": number of errors,
@@ -95,13 +102,19 @@ Returns the following values:
 	"fatalError": boolean whether there has been at least one fatal error,
 	"lastError": last error string,
 	"renames" : number of files renamed,
+	"listed" : number of directory entries listed,
 	"retryError": boolean showing whether there has been at least one non-NoRetryError,
-	"speed": average speed in bytes/sec since start of the group,
+        "serverSideCopies": number of server side copies done,
+        "serverSideCopyBytes": number bytes server side copied,
+        "serverSideMoves": number of server side moves done,
+        "serverSideMoveBytes": number bytes server side moved,
+	"speed": average speed in bytes per second since start of the group,
 	"totalBytes": total number of bytes in the group,
 	"totalChecks": total number of checks in the group,
 	"totalTransfers": total number of transfers in the group,
 	"transferTime" : total time spent on running jobs,
 	"transfers": number of transferred files,
+	"updatedDirs": number of directories updated (modtime or metadata set),
 	"transferring": an array of currently active file transfers:
 		[
 			{
@@ -109,8 +122,8 @@ Returns the following values:
 				"eta": estimated time in seconds until file transfer completion
 				"name": name of the file,
 				"percentage": progress of the file transfer in percent,
-				"speed": average speed over the whole transfer in bytes/sec,
-				"speedAvg": current speed in bytes/sec as an exponentially weighted moving average,
+				"speed": average speed over the whole transfer in bytes per second,
+				"speedAvg": current speed in bytes per second as an exponentially weighted moving average,
 				"size": size of the file in bytes
 			}
 		],
@@ -143,9 +156,10 @@ func rcTransferredStats(ctx context.Context, in rc.Params) (rc.Params, error) {
 
 func init() {
 	rc.Add(rc.Call{
-		Path:  "core/transferred",
-		Fn:    rcTransferredStats,
-		Title: "Returns stats about completed transfers.",
+		Path:   "core/transferred",
+		NoAuth: true,
+		Fn:     rcTransferredStats,
+		Title:  "Returns stats about completed transfers.",
 		Help: `
 This returns stats about completed transfers:
 
@@ -170,6 +184,7 @@ Returns the following values:
 				"size": size of the file in bytes,
 				"bytes": total transferred bytes for this file,
 				"checked": if the transfer is only checked (skipped, deleted),
+				"what": the purpose of the transfer (transferring, deleting, checking, importing, hashing, merging, listing, moving, renaming),
 				"timestamp": integer representing millisecond unix epoch,
 				"error": string description of the error (empty if successful),
 				"jobid": id of the job that this transfer belongs to
@@ -190,6 +205,9 @@ func rcResetStats(ctx context.Context, in rc.Params) (rc.Params, error) {
 
 	if group != "" {
 		stats := groups.get(group)
+		if stats == nil {
+			return rc.Params{}, fmt.Errorf("group %q not found", group)
+		}
 		stats.ResetErrors()
 		stats.ResetCounters()
 	} else {
@@ -235,7 +253,7 @@ func init() {
 		Fn:    rcDeleteStats,
 		Title: "Delete stats group.",
 		Help: `
-This deletes entire stats group
+This deletes entire stats group.
 
 Parameters
 
@@ -287,6 +305,14 @@ func GlobalStats() *StatsInfo {
 }
 
 // NewStatsGroup creates new stats under named group.
+//
+// The averageLoop is intentionally NOT started here: it is started on
+// demand by NewTransfer / NewTransferRemoteSize when real transfer
+// activity begins and stopped by DoneTransferring when the last
+// transfer completes. Starting it eagerly leaked one goroutine per
+// group that never performed a transfer (issue #9567) - e.g. rcd
+// daemons driven by frequent rc sync/move calls where each call gets
+// a fresh job/N group and the source is often empty.
 func NewStatsGroup(ctx context.Context, group string) *StatsInfo {
 	stats := NewStats(ctx)
 	stats.group = group
@@ -317,7 +343,7 @@ func (sg *statsGroups) set(ctx context.Context, group string, stats *StatsInfo) 
 	// Limit number of groups kept in memory.
 	if len(sg.order) >= ci.MaxStatsGroups {
 		group := sg.order[0]
-		fs.LogPrintf(fs.LogLevelDebug, nil, "Max number of stats groups reached removing %s", group)
+		fs.Debugf(nil, "Max number of stats groups reached removing %s", group)
 		delete(sg.m, group)
 		r := (len(sg.order) - ci.MaxStatsGroups) + 1
 		sg.order = sg.order[r:]
@@ -349,6 +375,7 @@ func (sg *statsGroups) names() []string {
 
 // sum returns aggregate stats that contains summation of all groups.
 func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
+	startTime := GlobalStats().startTime
 	sg.mu.Lock()
 	defer sg.mu.Unlock()
 
@@ -358,25 +385,46 @@ func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
 		{
 			sum.bytes += stats.bytes
 			sum.errors += stats.errors
-			sum.fatalError = sum.fatalError || stats.fatalError
-			sum.retryError = sum.retryError || stats.retryError
-			sum.checks += stats.checks
-			sum.transfers += stats.transfers
-			sum.deletes += stats.deletes
-			sum.deletedDirs += stats.deletedDirs
-			sum.renames += stats.renames
-			sum.checking.merge(stats.checking)
-			sum.transferring.merge(stats.transferring)
-			sum.inProgress.merge(stats.inProgress)
 			if sum.lastError == nil && stats.lastError != nil {
 				sum.lastError = stats.lastError
 			}
+			sum.fatalError = sum.fatalError || stats.fatalError
+			sum.retryError = sum.retryError || stats.retryError
+			if stats.retryAfter.After(sum.retryAfter) {
+				// Update the retryAfter field only if it is a later date than the current one in the sum
+				sum.retryAfter = stats.retryAfter
+			}
+			sum.checks += stats.checks
+			sum.checking.merge(stats.checking)
+			sum.checkQueue += stats.checkQueue
+			sum.checkQueueSize += stats.checkQueueSize
+			sum.transfers += stats.transfers
+			sum.transferring.merge(stats.transferring)
+			sum.transferQueue += stats.transferQueue
+			sum.transferQueueSize += stats.transferQueueSize
+			sum.listed += stats.listed
+			sum.renames += stats.renames
+			sum.renameQueue += stats.renameQueue
+			sum.renameQueueSize += stats.renameQueueSize
+			sum.deletes += stats.deletes
+			sum.deletesSize += stats.deletesSize
+			sum.deletedDirs += stats.deletedDirs
+			sum.updatedDirs += stats.updatedDirs
+			sum.inProgress.merge(stats.inProgress)
 			sum.startedTransfers = append(sum.startedTransfers, stats.startedTransfers...)
-			sum.oldDuration += stats.oldDuration
 			sum.oldTimeRanges = append(sum.oldTimeRanges, stats.oldTimeRanges...)
+			sum.oldDuration += stats.oldDuration
+			stats.average.mu.Lock()
+			sum.average.speed += stats.average.speed
+			stats.average.mu.Unlock()
+			sum.serverSideCopies += stats.serverSideCopies
+			sum.serverSideCopyBytes += stats.serverSideCopyBytes
+			sum.serverSideMoves += stats.serverSideMoves
+			sum.serverSideMoveBytes += stats.serverSideMoveBytes
 		}
 		stats.mu.RUnlock()
 	}
+	sum.startTime = startTime
 	return sum
 }
 

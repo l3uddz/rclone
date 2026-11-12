@@ -1,3 +1,5 @@
+//go:build !plan9 && !js
+
 package cache
 
 import bolt "go.etcd.io/bbolt"

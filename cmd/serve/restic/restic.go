@@ -5,61 +5,111 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	iofs "io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rclone/rclone/cmd"
-	"github.com/rclone/rclone/cmd/serve/httplib"
-	"github.com/rclone/rclone/cmd/serve/httplib/httpflags"
-	"github.com/rclone/rclone/cmd/serve/httplib/serve"
+	cmdserve "github.com/rclone/rclone/cmd/serve"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/flags"
-	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/walk"
+	libhttp "github.com/rclone/rclone/lib/http"
+	"github.com/rclone/rclone/lib/http/serve"
+	"github.com/rclone/rclone/lib/systemd"
 	"github.com/rclone/rclone/lib/terminal"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/http2"
 )
 
-var (
-	stdio        bool
-	appendOnly   bool
-	privateRepos bool
-	cacheObjects bool
-)
+// OptionsInfo describes the Options in use
+var OptionsInfo = fs.Options{{
+	Name:    "stdio",
+	Default: false,
+	Help:    "Run an HTTP2 server on stdin/stdout",
+}, {
+	Name:    "append_only",
+	Default: false,
+	Help:    "Disallow deletion of repository data",
+}, {
+	Name:    "private_repos",
+	Default: false,
+	Help:    "Users can only access their private repo",
+}, {
+	Name:    "cache_objects",
+	Default: true,
+	Help:    "Cache listed objects",
+}}.
+	Add(libhttp.ConfigInfo).
+	Add(libhttp.AuthConfigInfo)
+
+// Options required for http server
+type Options struct {
+	Auth         libhttp.AuthConfig
+	HTTP         libhttp.Config
+	Stdio        bool `config:"stdio"`
+	AppendOnly   bool `config:"append_only"`
+	PrivateRepos bool `config:"private_repos"`
+	CacheObjects bool `config:"cache_objects"`
+}
+
+// Opt is options set by command line flags
+var Opt Options
+
+// flagPrefix is the prefix used to uniquely identify command line flags.
+// It is intentionally empty for this package.
+const flagPrefix = ""
 
 func init() {
-	httpflags.AddFlags(Command.Flags())
+	fs.RegisterGlobalOptions(fs.OptionsInfo{Name: "restic", Opt: &Opt, Options: OptionsInfo})
 	flagSet := Command.Flags()
-	flags.BoolVarP(flagSet, &stdio, "stdio", "", false, "run an HTTP2 server on stdin/stdout")
-	flags.BoolVarP(flagSet, &appendOnly, "append-only", "", false, "disallow deletion of repository data")
-	flags.BoolVarP(flagSet, &privateRepos, "private-repos", "", false, "users can only access their private repo")
-	flags.BoolVarP(flagSet, &cacheObjects, "cache-objects", "", true, "cache listed objects")
+	flags.AddFlagsFromOptions(flagSet, "", OptionsInfo)
+	cmdserve.Command.AddCommand(Command)
+	cmdserve.AddRc("restic", func(ctx context.Context, f fs.Fs, in rc.Params) (cmdserve.Handle, error) {
+		// Read opts
+		var opt = Opt // set default opts
+		err := rc.ParseOptions(in, "opt", &opt)
+		if err != nil {
+			return nil, err
+		}
+		if opt.Stdio {
+			return nil, errors.New("can't use --stdio via the rc")
+		}
+		// Create server
+		return newServer(ctx, f, &opt)
+	})
+
 }
 
 // Command definition for cobra
 var Command = &cobra.Command{
 	Use:   "restic remote:path",
 	Short: `Serve the remote for restic's REST API.`,
-	Long: `rclone serve restic implements restic's REST backend API
-over HTTP.  This allows restic to use rclone as a data storage
+	Long: `Run a basic web server to serve a remote over restic's REST backend
+API over HTTP.  This allows restic to use rclone as a data storage
 mechanism for cloud providers that restic does not support directly.
 
-[Restic](https://restic.net/) is a command line program for doing
+[Restic](https://restic.net/) is a command-line program for doing
 backups.
 
 The server will log errors.  Use -v to see access logs.
 
---bwlimit will be respected for file transfers.  Use --stats to
-control the stats printing.
+` + "`--bwlimit`" + ` will be respected for file transfers.
+Use ` + "`--stats`" + ` to control the stats printing.
 
-### Setting up rclone for use by restic ###
+### Setting up rclone for use by restic
 
 First [set up a remote for your chosen cloud provider](/docs/#configure).
 
@@ -70,21 +120,23 @@ following instructions.
 
 Now start the rclone restic server
 
-    rclone serve restic -v remote:backup
+` + "```console" + `
+rclone serve restic -v remote:backup
+` + "```" + `
 
 Where you can replace "backup" in the above by whatever path in the
 remote you wish to use.
 
 By default this will serve on "localhost:8080" you can change this
-with use of the "--addr" flag.
+with use of the ` + "`--addr`" + ` flag.
 
 You might wish to start this server on boot.
 
-Adding --cache-objects=false will cause rclone to stop caching objects
+Adding ` + "`--cache-objects=false`" + ` will cause rclone to stop caching objects
 returned from the List call. Caching is normally desirable as it speeds
 up downloading objects, saves transactions and uses very little memory.
 
-### Setting up restic to use rclone ###
+### Setting up restic to use rclone
 
 Now you can [follow the restic
 instructions](http://restic.readthedocs.io/en/latest/030_preparing_a_new_repo.html#rest-server)
@@ -98,45 +150,58 @@ the URL for the REST server.
 
 For example:
 
-    $ export RESTIC_REPOSITORY=rest:http://localhost:8080/
-    $ export RESTIC_PASSWORD=yourpassword
-    $ restic init
-    created restic backend 8b1a4b56ae at rest:http://localhost:8080/
+` + "```console" + `
+$ export RESTIC_REPOSITORY=rest:http://localhost:8080/
+$ export RESTIC_PASSWORD=yourpassword
+$ restic init
+created restic backend 8b1a4b56ae at rest:http://localhost:8080/
 
-    Please note that knowledge of your password is required to access
-    the repository. Losing your password means that your data is
-    irrecoverably lost.
-    $ restic backup /path/to/files/to/backup
-    scan [/path/to/files/to/backup]
-    scanned 189 directories, 312 files in 0:00
-    [0:00] 100.00%  38.128 MiB / 38.128 MiB  501 / 501 items  0 errors  ETA 0:00
-    duration: 0:00
-    snapshot 45c8fdd8 saved
+Please note that knowledge of your password is required to access
+the repository. Losing your password means that your data is
+irrecoverably lost.
+$ restic backup /path/to/files/to/backup
+scan [/path/to/files/to/backup]
+scanned 189 directories, 312 files in 0:00
+[0:00] 100.00%  38.128 MiB / 38.128 MiB  501 / 501 items  0 errors  ETA 0:00
+duration: 0:00
+snapshot 45c8fdd8 saved
 
-#### Multiple repositories ####
+` + "```" + `
+
+#### Multiple repositories
 
 Note that you can use the endpoint to host multiple repositories.  Do
 this by adding a directory name or path after the URL.  Note that
 these **must** end with /.  Eg
 
-    $ export RESTIC_REPOSITORY=rest:http://localhost:8080/user1repo/
-    # backup user1 stuff
-    $ export RESTIC_REPOSITORY=rest:http://localhost:8080/user2repo/
-    # backup user2 stuff
+` + "```console" + `
+$ export RESTIC_REPOSITORY=rest:http://localhost:8080/user1repo/
+# backup user1 stuff
+$ export RESTIC_REPOSITORY=rest:http://localhost:8080/user2repo/
+# backup user2 stuff
+` + "```" + `
 
-#### Private repositories ####
+#### Private repositories
 
-The "--private-repos" flag can be used to limit users to repositories starting
+The` + "`--private-repos`" + ` flag can be used to limit users to repositories starting
 with a path of ` + "`/<username>/`" + `.
-` + httplib.Help,
+
+` + strings.TrimSpace(libhttp.Help(flagPrefix)+libhttp.AuthHelp(flagPrefix)),
+	Annotations: map[string]string{
+		"versionIntroduced": "v1.40",
+	},
 	Run: func(command *cobra.Command, args []string) {
+		ctx := context.Background()
 		cmd.CheckArgs(1, 1, command, args)
 		f := cmd.NewFsSrc(args)
 		cmd.Run(false, true, command, func() error {
-			s := NewServer(f, &httpflags.Opt)
-			if stdio {
+			s, err := newServer(ctx, f, &Opt)
+			if err != nil {
+				return err
+			}
+			if s.opt.Stdio {
 				if terminal.IsTerminal(int(os.Stdout.Fd())) {
-					return errors.New("Refusing to run HTTP2 server directly on a terminal, please let restic start rclone")
+					return errors.New("refusing to run HTTP2 server directly on a terminal, please let restic start rclone")
 				}
 
 				conn := &StdioConn{
@@ -144,19 +209,19 @@ with a path of ` + "`/<username>/`" + `.
 					stdout: os.Stdout,
 				}
 
-				httpSrv := &http2.Server{}
-				opts := &http2.ServeConnOpts{
-					Handler: s,
+				// http.Server can't serve a single net.Conn so the
+				// deprecated http2.Server is still needed here.
+				httpSrv := &http2.Server{}    //nolint:staticcheck // see above
+				opts := &http2.ServeConnOpts{ //nolint:staticcheck // see above
+					Handler: s.server.Router(),
 				}
-				httpSrv.ServeConn(conn, opts)
+				httpSrv.ServeConn(conn, opts) //nolint:staticcheck // see above
 				return nil
 			}
-			err := s.Serve()
-			if err != nil {
-				return err
-			}
-			s.Wait()
-			return nil
+			fs.Logf(s.f, "Serving restic REST API on %s", s.server.URLs())
+
+			defer systemd.Notify()()
+			return s.Serve()
 		})
 	},
 }
@@ -165,101 +230,195 @@ const (
 	resticAPIV2 = "application/vnd.x.restic.rest.v2"
 )
 
-// Server contains everything to run the Server
-type Server struct {
-	*httplib.Server
-	f     fs.Fs
-	cache *cache
+type contextRemoteType struct{}
+
+// ContextRemoteKey is a simple context key for storing the username of the request
+var ContextRemoteKey = &contextRemoteType{}
+
+// WithRemote makes a remote from a URL path.  This implements the backend layout
+// required by restic.
+func WithRemote(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var urlpath string
+		rctx := chi.RouteContext(r.Context())
+		if rctx != nil && rctx.RoutePath != "" {
+			urlpath = rctx.RoutePath
+		} else {
+			urlpath = r.URL.Path
+		}
+		urlpath = strings.Trim(urlpath, "/")
+		// Reject anything which isn't a canonical relative path free of "."
+		// and ".." elements. The backends join the path with the Fs root, so
+		// such elements could otherwise address objects outside it.
+		//
+		// The empty path is the root of the API so is allowed. "." is not a
+		// valid object name here, even though iofs.ValidPath accepts it as
+		// the root of an FS.
+		if urlpath != "" && (urlpath == "." || !iofs.ValidPath(urlpath)) {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		parts := matchData.FindStringSubmatch(urlpath)
+		// if no data directory, layout is flat
+		if parts != nil {
+			// otherwise map
+			// data/2159dd48 to
+			// data/21/2159dd48
+			fileName := parts[1]
+			prefix := urlpath[:len(urlpath)-len(fileName)]
+			urlpath = prefix + fileName[:2] + "/" + fileName
+		}
+		ctx := context.WithValue(r.Context(), ContextRemoteKey, urlpath)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
-// NewServer returns an HTTP server that speaks the rest protocol
-func NewServer(f fs.Fs, opt *httplib.Options) *Server {
-	mux := http.NewServeMux()
-	s := &Server{
-		Server: httplib.NewServer(mux, opt),
-		f:      f,
-		cache:  newCache(),
+// Middleware to ensure authenticated user is accessing their own private folder
+func checkPrivate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := chi.URLParam(r, "userID")
+		userID, ok := libhttp.CtxGetUser(r.Context())
+		if ok && user != "" && user == userID {
+			next.ServeHTTP(w, r)
+		} else {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		}
+	})
+}
+
+// uploadLock serializes uploads to one remote.
+type uploadLock struct {
+	uploadingMu sync.Mutex
+	refs        int // protected by server.uploadLocksMu
+}
+
+// server contains everything to run the server
+type server struct {
+	server        *libhttp.Server
+	f             fs.Fs
+	cache         *cache
+	opt           Options
+	uploadLocksMu sync.Mutex
+	uploadLocks   map[string]*uploadLock
+}
+
+func newServer(ctx context.Context, f fs.Fs, opt *Options) (s *server, err error) {
+	s = &server{
+		f:           f,
+		cache:       newCache(opt.CacheObjects),
+		opt:         *opt,
+		uploadLocks: make(map[string]*uploadLock),
 	}
-	mux.HandleFunc(s.Opt.BaseURL+"/", s.ServeHTTP)
-	return s
-}
-
-// Serve runs the http server in the background.
-//
-// Use s.Close() and s.Wait() to shutdown server
-func (s *Server) Serve() error {
-	err := s.Server.Serve()
+	// Don't bind any HTTP listeners if running with --stdio
+	if opt.Stdio {
+		opt.HTTP.ListenAddr = nil
+	}
+	s.server, err = libhttp.NewServer(ctx,
+		libhttp.WithConfig(opt.HTTP),
+		libhttp.WithAuth(opt.Auth),
+	)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to init server: %w", err)
 	}
-	fs.Logf(s.f, "Serving restic REST API on %s", s.URL())
+	router := s.server.Router()
+	s.Bind(router)
+	return s, nil
+}
+
+// lockUpload locks uploads to remote and returns its unlock function.
+func (s *server) lockUpload(remote string) func() {
+	s.uploadLocksMu.Lock()
+	lock := s.uploadLocks[remote]
+	if lock == nil {
+		lock = new(uploadLock)
+		s.uploadLocks[remote] = lock
+	}
+	lock.refs++
+	s.uploadLocksMu.Unlock()
+
+	lock.uploadingMu.Lock()
+	return func() {
+		lock.uploadingMu.Unlock()
+
+		s.uploadLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(s.uploadLocks, remote)
+		}
+		s.uploadLocksMu.Unlock()
+	}
+}
+
+// Serve restic until the server is shutdown
+func (s *server) Serve() error {
+	s.server.Serve()
+	s.server.Wait()
 	return nil
 }
 
-var matchData = regexp.MustCompile("(?:^|/)data/([^/]{2,})$")
-
-// Makes a remote from a URL path.  This implements the backend layout
-// required by restic.
-func makeRemote(path string) string {
-	path = strings.Trim(path, "/")
-	parts := matchData.FindStringSubmatch(path)
-	// if no data directory, layout is flat
-	if parts == nil {
-		return path
-	}
-	// otherwise map
-	// data/2159dd48 to
-	// data/21/2159dd48
-	fileName := parts[1]
-	prefix := path[:len(path)-len(fileName)]
-	return prefix + fileName[:2] + "/" + fileName
+// Return the first address of the server
+func (s *server) Addr() net.Addr {
+	return s.server.Addr()
 }
 
-// ServeHTTP reads incoming requests and dispatches them
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Server", "rclone/"+fs.Version)
+// Shutdown the server
+func (s *server) Shutdown() error {
+	return s.server.Shutdown()
+}
 
-	path, ok := s.Path(w, r)
-	if !ok {
-		return
-	}
-	remote := makeRemote(path)
-	fs.Debugf(s.f, "%s %s", r.Method, path)
-
-	v := r.Context().Value(httplib.ContextUserKey)
-	if privateRepos && (v == nil || !strings.HasPrefix(path, "/"+v.(string)+"/")) {
-		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-		return
-	}
-
-	// Dispatch on path then method
-	if strings.HasSuffix(path, "/") {
-		switch r.Method {
-		case "GET":
-			s.listObjects(w, r, remote)
-		case "POST":
-			s.createRepo(w, r, remote)
-		default:
-			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+// bind helper for main Bind method
+func (s *server) bind(router chi.Router) {
+	router.MethodFunc("GET", "/*", func(w http.ResponseWriter, r *http.Request) {
+		urlpath := chi.URLParam(r, "*")
+		if urlpath == "" || strings.HasSuffix(urlpath, "/") {
+			s.listObjects(w, r)
+		} else {
+			s.serveObject(w, r)
 		}
+	})
+	router.MethodFunc("POST", "/*", func(w http.ResponseWriter, r *http.Request) {
+		urlpath := chi.URLParam(r, "*")
+		if urlpath == "" || strings.HasSuffix(urlpath, "/") {
+			s.createRepo(w, r)
+		} else {
+			s.postObject(w, r)
+		}
+	})
+	router.MethodFunc("HEAD", "/*", s.serveObject)
+	router.MethodFunc("DELETE", "/*", s.deleteObject)
+}
+
+// Bind restic server routes to passed router
+func (s *server) Bind(router chi.Router) {
+	// FIXME
+	// if m := authX.Auth(authX.Opt); m != nil {
+	// 	router.Use(m)
+	// }
+	router.Use(
+		middleware.SetHeader("Accept-Ranges", "bytes"),
+		middleware.SetHeader("Server", "rclone/"+fs.Version),
+		WithRemote,
+	)
+
+	if s.opt.PrivateRepos {
+		router.Route("/{userID}", func(r chi.Router) {
+			r.Use(checkPrivate)
+			s.bind(r)
+		})
+		router.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		})
 	} else {
-		switch r.Method {
-		case "GET", "HEAD":
-			s.serveObject(w, r, remote)
-		case "POST":
-			s.postObject(w, r, remote)
-		case "DELETE":
-			s.deleteObject(w, r, remote)
-		default:
-			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		}
+		s.bind(router)
 	}
 }
+
+// Restic pack names are lowercase hexadecimal storage IDs.
+var matchData = regexp.MustCompile("(?:^|/)data/([0-9a-f]{2,})$")
 
 // newObject returns an object with the remote given either from the
 // cache or directly
-func (s *Server) newObject(ctx context.Context, remote string) (fs.Object, error) {
+func (s *server) newObject(ctx context.Context, remote string) (fs.Object, error) {
 	o := s.cache.find(remote)
 	if o != nil {
 		return o, nil
@@ -273,30 +432,51 @@ func (s *Server) newObject(ctx context.Context, remote string) (fs.Object, error
 }
 
 // get the remote
-func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, remote string) {
+func (s *server) serveObject(w http.ResponseWriter, r *http.Request) {
+	remote, ok := r.Context().Value(ContextRemoteKey).(string)
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
 	o, err := s.newObject(r.Context(), remote)
 	if err != nil {
 		fs.Debugf(remote, "%s request error: %v", r.Method, err)
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		} else {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		}
 		return
 	}
 	serve.Object(w, r, o)
 }
 
 // postObject posts an object to the repository
-func (s *Server) postObject(w http.ResponseWriter, r *http.Request, remote string) {
-	if appendOnly {
-		// make sure the file does not exist yet
+func (s *server) postObject(w http.ResponseWriter, r *http.Request) {
+	remote, ok := r.Context().Value(ContextRemoteKey).(string)
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	if s.opt.AppendOnly {
+		unlock := s.lockUpload(remote)
+		defer unlock()
+
+		// Only a definitive not-found result permits creating the object.
 		_, err := s.newObject(r.Context(), remote)
 		if err == nil {
 			fs.Errorf(remote, "Post request: file already exists, refusing to overwrite in append-only mode")
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-
+			return
+		}
+		if !errors.Is(err, fs.ErrorObjectNotFound) {
+			fs.Errorf(remote, "Post request: failed to check whether file exists: %v", err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 	}
 
-	o, err := operations.RcatSize(r.Context(), s.f, remote, r.Body, r.ContentLength, time.Now())
+	o, err := operations.RcatSize(r.Context(), s.f, remote, r.Body, r.ContentLength, time.Now(), nil)
 	if err != nil {
 		err = accounting.Stats(r.Context()).Error(err)
 		fs.Errorf(remote, "Post request rcat error: %v", err)
@@ -310,8 +490,13 @@ func (s *Server) postObject(w http.ResponseWriter, r *http.Request, remote strin
 }
 
 // delete the remote
-func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, remote string) {
-	if appendOnly {
+func (s *server) deleteObject(w http.ResponseWriter, r *http.Request) {
+	remote, ok := r.Context().Value(ContextRemoteKey).(string)
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	if s.opt.AppendOnly {
 		parts := strings.Split(r.URL.Path, "/")
 
 		// if path doesn't end in "/locks/:name", disallow the operation
@@ -324,13 +509,17 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, remote str
 	o, err := s.newObject(r.Context(), remote)
 	if err != nil {
 		fs.Debugf(remote, "Delete request error: %v", err)
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		} else {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		}
 		return
 	}
 
 	if err := o.Remove(r.Context()); err != nil {
 		fs.Errorf(remote, "Delete request remove error: %v", err)
-		if err == fs.ErrorObjectNotFound {
+		if errors.Is(err, fs.ErrorObjectNotFound) {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		} else {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -360,14 +549,18 @@ func (ls *listItems) add(o fs.Object) {
 }
 
 // listObjects lists all Objects of a given type in an arbitrary order.
-func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, remote string) {
-	fs.Debugf(remote, "list request")
-
-	if r.Header.Get("Accept") != resticAPIV2 {
-		fs.Errorf(remote, "Restic v2 API required")
-		http.Error(w, "Restic v2 API required", http.StatusBadRequest)
+func (s *server) listObjects(w http.ResponseWriter, r *http.Request) {
+	remote, ok := r.Context().Value(ContextRemoteKey).(string)
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
+	if r.Header.Get("Accept") != resticAPIV2 {
+		fs.Errorf(remote, "Restic v2 API required for List Objects")
+		http.Error(w, "Restic v2 API required for List Objects", http.StatusBadRequest)
+		return
+	}
+	fs.Debugf(remote, "list request")
 
 	// make sure an empty list is returned, and not a 'nil' value
 	ls := listItems{}
@@ -386,10 +579,9 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, remote stri
 		return nil
 	})
 	if err != nil {
-		_, err = fserrors.Cause(err)
-		if err != fs.ErrorDirNotFound {
+		if !errors.Is(err, fs.ErrorDirNotFound) {
 			fs.Errorf(remote, "list failed: %#v %T", err, err)
-			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 	}
@@ -407,7 +599,12 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, remote stri
 // createRepo creates repository directories.
 //
 // We don't bother creating the data dirs as rclone will create them on the fly
-func (s *Server) createRepo(w http.ResponseWriter, r *http.Request, remote string) {
+func (s *server) createRepo(w http.ResponseWriter, r *http.Request) {
+	remote, ok := r.Context().Value(ContextRemoteKey).(string)
+	if !ok {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
 	fs.Infof(remote, "Creating repository")
 
 	if r.URL.Query().Get("create") != "true" {

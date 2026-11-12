@@ -1,10 +1,10 @@
 // Read, write and edit the config file
 // Non-unix specific functions.
 
-// +build !darwin,!dragonfly,!freebsd,!linux,!netbsd,!openbsd,!solaris
+//go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris
 
 package configfile
 
-// attemptCopyGroups tries to keep the group the same, which only makes sense
+// attemptCopyGroup tries to keep the group the same, which only makes sense
 // for system with user-group-world permission model.
 func attemptCopyGroup(fromPath, toPath string) {}

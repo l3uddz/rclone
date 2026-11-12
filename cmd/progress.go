@@ -5,11 +5,11 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
@@ -19,8 +19,6 @@ import (
 const (
 	// interval between progress prints
 	defaultProgressInterval = 500 * time.Millisecond
-	// time format for logging
-	logTimeFormat = "2006-01-02 15:04:05"
 )
 
 // startProgress starts the progress bar printing
@@ -28,26 +26,22 @@ const (
 // It returns a func which should be called to stop the stats.
 func startProgress() func() {
 	stopStats := make(chan struct{})
-	oldLogPrint := fs.LogPrint
 	oldSyncPrint := operations.SyncPrintf
 
 	if !log.Redirected() {
 		// Intercept the log calls if not logging to file or syslog
-		fs.LogPrint = func(level fs.LogLevel, text string) {
-			printProgress(fmt.Sprintf("%s %-6s: %s", time.Now().Format(logTimeFormat), level, text))
-
-		}
+		log.Handler.SetOutput(func(level slog.Level, text string) {
+			printProgress(text)
+		})
 	}
 
 	// Intercept output from functions such as HashLister to stdout
-	operations.SyncPrintf = func(format string, a ...interface{}) {
+	operations.SyncPrintf = func(format string, a ...any) {
 		printProgress(fmt.Sprintf(format, a...))
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		progressInterval := defaultProgressInterval
 		if ShowStats() && *statsInterval > 0 {
 			progressInterval = *statsInterval
@@ -60,13 +54,16 @@ func startProgress() func() {
 			case <-stopStats:
 				ticker.Stop()
 				printProgress("")
-				fs.LogPrint = oldLogPrint
+				if !log.Redirected() {
+					// Reset intercept of the log calls
+					log.Handler.ResetOutput()
+				}
 				operations.SyncPrintf = oldSyncPrint
 				fmt.Println("")
 				return
 			}
 		}
-	}()
+	})
 	return func() {
 		close(stopStats)
 		wg.Wait()
@@ -75,14 +72,13 @@ func startProgress() func() {
 
 // state for the progress printing
 var (
-	nlines     = 0 // number of lines in the previous stats block
-	progressMu sync.Mutex
+	nlines = 0 // number of lines in the previous stats block
 )
 
 // printProgress prints the progress with an optional log
 func printProgress(logMessage string) {
-	progressMu.Lock()
-	defer progressMu.Unlock()
+	operations.StdoutMutex.Lock()
+	defer operations.StdoutMutex.Unlock()
 
 	var buf bytes.Buffer
 	w, _ := terminal.GetSize()
@@ -98,7 +94,7 @@ func printProgress(logMessage string) {
 		out(terminal.MoveUp)
 	}
 	// Move to the start of the block we wrote erasing all the previous lines
-	for i := 0; i < nlines-1; i++ {
+	for range nlines - 1 {
 		out(terminal.EraseLine)
 		out(terminal.MoveUp)
 	}

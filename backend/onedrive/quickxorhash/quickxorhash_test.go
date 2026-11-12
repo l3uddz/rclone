@@ -1,6 +1,7 @@
 package quickxorhash
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"hash"
@@ -129,10 +130,7 @@ func TestQuickXorHashByBlock(t *testing.T) {
 			require.NoError(t, err, what)
 			h := New()
 			for i := 0; i < len(in); i += blockSize {
-				end := i + blockSize
-				if end > len(in) {
-					end = len(in)
-				}
+				end := min(i+blockSize, len(in))
 				n, err := h.Write(in[i:end])
 				require.Equal(t, end-i, n, what)
 				require.NoError(t, err, what)
@@ -166,3 +164,18 @@ func TestReset(t *testing.T) {
 
 // check interface
 var _ hash.Hash = (*quickXorHash)(nil)
+
+func BenchmarkQuickXorHash(b *testing.B) {
+	b.SetBytes(1 << 20)
+	buf := make([]byte, 1<<20)
+	n, err := rand.Read(buf)
+	require.NoError(b, err)
+	require.Equal(b, len(buf), n)
+	h := New()
+
+	for b.Loop() {
+		h.Reset()
+		h.Write(buf)
+		h.Sum(nil)
+	}
+}

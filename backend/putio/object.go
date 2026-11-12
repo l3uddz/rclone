@@ -2,6 +2,7 @@ package putio
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -9,7 +10,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/putdotio/go-putio/putio"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
@@ -82,7 +82,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 	err := o.readEntryAndSetMetadata(ctx)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to read hash from metadata")
+		return "", fmt.Errorf("failed to read hash from metadata: %w", err)
 	}
 	return o.file.CRC32, nil
 }
@@ -151,7 +151,7 @@ func (o *Object) readEntry(ctx context.Context) (f *putio.File, err error) {
 		return nil, err
 	}
 	if resp.File.IsDir() {
-		return nil, fs.ErrorNotAFile
+		return nil, fs.ErrorIsDir
 	}
 	return &resp.File, err
 }
@@ -202,9 +202,12 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) (err error) 
 	if err != nil {
 		return err
 	}
-	o.modtime = modTime
+	// The server stores modtimes with second precision so truncate
+	// here too to keep the in-memory modtime identical to the one a
+	// fresh listing returns.
+	o.modtime = modTime.Truncate(time.Second)
 	if o.file != nil {
-		o.file.UpdatedAt.Time = modTime
+		o.file.UpdatedAt.Time = o.modtime
 	}
 	return nil
 }
@@ -241,7 +244,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 		// fs.Debugf(o, "opening file: id=%d", o.file.ID)
 		resp, err = o.fs.httpClient.Do(req)
-		return shouldRetry(ctx, err)
+		if err != nil {
+			return shouldRetry(ctx, err)
+		}
+		if err := checkStatusCode(resp, 200, 206); err != nil {
+			return shouldRetry(ctx, err)
+		}
+		return false, nil
 	})
 	if perr, ok := err.(*putio.ErrorResponse); ok && perr.Response.StatusCode >= 400 && perr.Response.StatusCode <= 499 {
 		_ = resp.Body.Close()
@@ -255,7 +264,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 // Update the already existing object
 //
-// Copy the reader into the object updating modTime and size
+// Copy the reader into the object updating modTime and size.
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
@@ -269,7 +278,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return err
 	}
-	newObj, err := o.fs.PutUnchecked(ctx, in, src, options...)
+	newObj, err := o.fs.putUnchecked(ctx, in, src, o.remote, options...)
 	if err != nil {
 		return err
 	}

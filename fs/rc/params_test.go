@@ -1,13 +1,14 @@
 package rc
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -109,7 +110,7 @@ func TestParamsGetString(t *testing.T) {
 
 func TestParamsGetInt64(t *testing.T) {
 	for _, test := range []struct {
-		value     interface{}
+		value     any
 		result    int64
 		errString string
 	}{
@@ -120,6 +121,13 @@ func TestParamsGetInt64(t *testing.T) {
 		{float64(14), 14, ""},
 		{float64(9.3e18), 0, "overflows int64"},
 		{float64(-9.3e18), 0, "overflows int64"},
+		{float64(math.MaxInt64), 0, "overflows int64"},
+		{math.Nextafter(float64(math.MaxInt64), 0), 9223372036854774784, ""},
+		{float64(math.MinInt64), math.MinInt64, ""},
+		{"3000000000", 3000000000, ""},
+		{"9223372036854775807", math.MaxInt64, ""},
+		{"-9223372036854775808", math.MinInt64, ""},
+		{"9223372036854775808", 0, "couldn't parse"},
 	} {
 		t.Run(fmt.Sprintf("%T=%v", test.value, test.value), func(t *testing.T) {
 			in := Params{
@@ -150,9 +158,44 @@ func TestParamsGetInt64(t *testing.T) {
 	assert.Equal(t, true, IsErrParamInvalid(e3), e3.Error())
 }
 
+func TestParamsGetInt(t *testing.T) {
+	in := Params{
+		"int":      "123",
+		"bad":      "123x",
+		"notInt":   []string{"a", "b"},
+		"maxInt":   int64(math.MaxInt),
+		"minInt":   int64(math.MinInt),
+		"overflow": "9223372036854775808",
+	}
+	v, err := in.GetInt("int")
+	require.NoError(t, err)
+	assert.Equal(t, 123, v)
+	v, err = in.GetInt("maxInt")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt, v)
+	v, err = in.GetInt("minInt")
+	require.NoError(t, err)
+	assert.Equal(t, math.MinInt, v)
+	for _, key := range []string{"bad", "notInt", "overflow"} {
+		v, err = in.GetInt(key)
+		assert.True(t, IsErrParamInvalid(err), key)
+		assert.Equal(t, 0, v)
+	}
+	v, err = in.GetInt("notFound")
+	assert.Equal(t, ErrParamNotFound("notFound"), err)
+	assert.Equal(t, 0, v)
+	if math.MaxInt == math.MaxInt32 {
+		in["big"] = int64(math.MaxInt32) + 1
+		v, err = in.GetInt("big")
+		assert.True(t, IsErrParamInvalid(err))
+		assert.Contains(t, err.Error(), "overflows int")
+		assert.Equal(t, 0, v)
+	}
+}
+
 func TestParamsGetFloat64(t *testing.T) {
 	for _, test := range []struct {
-		value     interface{}
+		value     any
 		result    float64
 		errString string
 	}{
@@ -193,7 +236,7 @@ func TestParamsGetFloat64(t *testing.T) {
 
 func TestParamsGetDuration(t *testing.T) {
 	for _, test := range []struct {
-		value     interface{}
+		value     any
 		result    time.Duration
 		errString string
 	}{
@@ -244,7 +287,7 @@ func TestParamsGetDuration(t *testing.T) {
 
 func TestParamsGetBool(t *testing.T) {
 	for _, test := range []struct {
-		value     interface{}
+		value     any
 		result    bool
 		errString string
 	}{

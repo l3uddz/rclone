@@ -9,7 +9,7 @@ import (
 )
 
 // returns the "%p" representation of the thing passed in
-func ptr(p interface{}) string {
+func ptr(p any) string {
 	return fmt.Sprintf("%p", p)
 }
 
@@ -21,9 +21,7 @@ func TestSetDefaults(t *testing.T) {
 	// Check functions by comparing the "%p" representations of them
 	assert.Equal(t, ptr(old.Proxy), ptr(newT.Proxy), "when checking .Proxy")
 	assert.Equal(t, ptr(old.DialContext), ptr(newT.DialContext), "when checking .DialContext")
-	// Check the other public fields
-	assert.Equal(t, ptr(old.Dial), ptr(newT.Dial), "when checking .Dial")
-	assert.Equal(t, ptr(old.DialTLS), ptr(newT.DialTLS), "when checking .DialTLS")
+	assert.Equal(t, ptr(old.DialTLSContext), ptr(newT.DialTLSContext), "when checking .DialTLSContext")
 	assert.Equal(t, old.TLSClientConfig, newT.TLSClientConfig, "when checking .TLSClientConfig")
 	assert.Equal(t, old.TLSHandshakeTimeout, newT.TLSHandshakeTimeout, "when checking .TLSHandshakeTimeout")
 	assert.Equal(t, old.DisableKeepAlives, newT.DisableKeepAlives, "when checking .DisableKeepAlives")

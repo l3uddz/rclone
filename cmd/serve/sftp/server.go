@@ -1,31 +1,35 @@
-// +build !plan9
+//go:build !plan9
 
 package sftp
 
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/cmd/serve/proxy"
-	"github.com/rclone/rclone/cmd/serve/proxy/proxyflags"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/lib/env"
+	"github.com/rclone/rclone/lib/file"
+	sdActivation "github.com/rclone/rclone/lib/sdactivation"
 	"github.com/rclone/rclone/vfs"
-	"github.com/rclone/rclone/vfs/vfsflags"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -33,35 +37,35 @@ import (
 type server struct {
 	f        fs.Fs
 	opt      Options
-	vfs      *vfs.VFS
+	provider *proxy.Provider
 	ctx      context.Context // for global config
 	config   *ssh.ServerConfig
 	listener net.Listener
-	waitChan chan struct{} // for waiting on the listener to close
-	proxy    *proxy.Proxy
+	stopped  chan struct{} // for waiting on the listener to stop
 }
 
-func newServer(ctx context.Context, f fs.Fs, opt *Options) *server {
+func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Options, proxyOpt *proxy.Options) (*server, error) {
 	s := &server{
 		f:        f,
 		ctx:      ctx,
 		opt:      *opt,
-		waitChan: make(chan struct{}),
+		provider: proxy.NewProvider(ctx, f, vfsOpt, proxyOpt),
+		stopped:  make(chan struct{}),
 	}
-	if proxyflags.Opt.AuthProxy != "" {
-		s.proxy = proxy.New(ctx, &proxyflags.Opt)
-	} else {
-		s.vfs = vfs.New(f, &vfsflags.Opt)
+	err := s.configure()
+	if err != nil {
+		s.provider.Shutdown()
+		return nil, fmt.Errorf("sftp configuration failed: %w", err)
 	}
-	return s
+	return s, nil
 }
 
 // getVFS gets the vfs from s or the proxy
 func (s *server) getVFS(what string, sshConn *ssh.ServerConn) (VFS *vfs.VFS) {
-	if s.proxy == nil {
-		return s.vfs
+	if !s.provider.IsProxy() {
+		return s.provider.VFS()
 	}
-	if sshConn.Permissions == nil && sshConn.Permissions.Extensions == nil {
+	if sshConn.Permissions == nil || sshConn.Permissions.Extensions == nil {
 		fs.Infof(what, "SSH Permissions Extensions not found")
 		return nil
 	}
@@ -70,7 +74,7 @@ func (s *server) getVFS(what string, sshConn *ssh.ServerConn) (VFS *vfs.VFS) {
 		fs.Infof(what, "VFS key not found")
 		return nil
 	}
-	VFS = s.proxy.Get(key)
+	VFS = s.provider.Proxy().Get(key)
 	if VFS == nil {
 		fs.Infof(what, "failed to read VFS from cache")
 		return nil
@@ -95,6 +99,13 @@ func (s *server) acceptConnection(nConn net.Conn) {
 	// Discard all global out-of-band Requests
 	go ssh.DiscardRequests(reqs)
 
+	if sshConn.Permissions != nil && sshConn.Permissions.Extensions != nil {
+		if vfsKey := sshConn.Permissions.Extensions["_vfsKey"]; vfsKey != "" {
+			s.provider.Pin(vfsKey)
+			defer s.provider.Unpin(vfsKey)
+		}
+	}
+
 	c := &conn{
 		what: what,
 		vfs:  s.getVFS(what, sshConn),
@@ -107,7 +118,7 @@ func (s *server) acceptConnection(nConn net.Conn) {
 	c.handlers = newVFSHandler(c.vfs)
 
 	// Accept all channels
-	go c.handleChannels(chans)
+	c.handleChannels(chans)
 }
 
 // Accept connections and call them in a go routine
@@ -125,27 +136,34 @@ func (s *server) acceptConnections() {
 	}
 }
 
+// configure the server
+//
 // Based on example server code from golang.org/x/crypto/ssh and server_standalone
-func (s *server) serve() (err error) {
+func (s *server) configure() (err error) {
 	var authorizedKeysMap map[string]struct{}
 
 	// ensure the user isn't trying to use conflicting flags
-	if proxyflags.Opt.AuthProxy != "" && s.opt.AuthorizedKeys != "" && s.opt.AuthorizedKeys != DefaultOpt.AuthorizedKeys {
+	if s.provider.IsProxy() && s.opt.AuthorizedKeys != "" && s.opt.AuthorizedKeys != Opt.AuthorizedKeys {
 		return errors.New("--auth-proxy and --authorized-keys cannot be used at the same time")
 	}
 
 	// Load the authorized keys
-	if s.opt.AuthorizedKeys != "" && proxyflags.Opt.AuthProxy == "" {
+	if s.opt.AuthorizedKeys != "" && !s.provider.IsProxy() {
 		authKeysFile := env.ShellExpand(s.opt.AuthorizedKeys)
 		authorizedKeysMap, err = loadAuthorizedKeys(authKeysFile)
 		// If user set the flag away from the default then report an error
-		if err != nil && s.opt.AuthorizedKeys != DefaultOpt.AuthorizedKeys {
-			return err
+		if s.opt.AuthorizedKeys != Opt.AuthorizedKeys {
+			if err != nil {
+				return err
+			}
+			if len(authorizedKeysMap) == 0 {
+				return fmt.Errorf("failed to parse authorized keys")
+			}
 		}
 		fs.Logf(nil, "Loaded %d authorized keys from %q", len(authorizedKeysMap), authKeysFile)
 	}
 
-	if !s.opt.NoAuth && len(authorizedKeysMap) == 0 && s.opt.User == "" && s.opt.Pass == "" && s.proxy == nil {
+	if !s.opt.NoAuth && len(authorizedKeysMap) == 0 && s.opt.User == "" && s.opt.Pass == "" && !s.provider.IsProxy() {
 		return errors.New("no authorization found, use --user/--pass or --authorized-keys or --no-auth or --auth-proxy")
 	}
 
@@ -155,9 +173,9 @@ func (s *server) serve() (err error) {
 		ServerVersion: "SSH-2.0-" + fs.GetConfig(s.ctx).UserAgent,
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			fs.Debugf(describeConn(c), "Password login attempt for %s", c.User())
-			if s.proxy != nil {
+			if s.provider.IsProxy() {
 				// query the proxy for the config
-				_, vfsKey, err := s.proxy.Call(c.User(), string(pass), false)
+				_, vfsKey, err := s.provider.Proxy().Call(c.User(), string(pass), false, c.RemoteAddr().String())
 				if err != nil {
 					return nil, err
 				}
@@ -178,12 +196,31 @@ func (s *server) serve() (err error) {
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			fs.Debugf(describeConn(c), "Public key login attempt for %s", c.User())
-			if s.proxy != nil {
+			if s.provider.IsProxy() {
+				// This is also called for keys offered without a
+				// signature, so leave asking the proxy until
+				// VerifiedPublicKeyCallback when the client has proved
+				// it holds the private key.
+				return &ssh.Permissions{}, nil
+			}
+			if _, ok := authorizedKeysMap[string(pubKey.Marshal())]; ok {
+				return &ssh.Permissions{
+					// Record the public key used for authentication.
+					Extensions: map[string]string{
+						"pubkey-fp": ssh.FingerprintSHA256(pubKey),
+					},
+				}, nil
+			}
+			return nil, fmt.Errorf("unknown public key for %q", c.User())
+		},
+		VerifiedPublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey, perms *ssh.Permissions, _ string) (*ssh.Permissions, error) {
+			if s.provider.IsProxy() {
 				//query the proxy for the config
-				_, vfsKey, err := s.proxy.Call(
+				_, vfsKey, err := s.provider.Proxy().Call(
 					c.User(),
 					base64.StdEncoding.EncodeToString(pubKey.Marshal()),
 					true,
+					c.RemoteAddr().String(),
 				)
 				if err != nil {
 					return nil, err
@@ -195,15 +232,7 @@ func (s *server) serve() (err error) {
 					},
 				}, nil
 			}
-			if _, ok := authorizedKeysMap[string(pubKey.Marshal())]; ok {
-				return &ssh.Permissions{
-					// Record the public key used for authentication.
-					Extensions: map[string]string{
-						"pubkey-fp": ssh.FingerprintSHA256(pubKey),
-					},
-				}, nil
-			}
-			return nil, fmt.Errorf("unknown public key for %q", c.User())
+			return perms, nil
 		},
 		AuthLogCallback: func(conn ssh.ConnMetadata, method string, err error) {
 			status := "OK"
@@ -217,26 +246,40 @@ func (s *server) serve() (err error) {
 
 	// Load the private key, from the cache if not explicitly configured
 	keyPaths := s.opt.HostKeys
-	cachePath := filepath.Join(config.CacheDir, "serve-sftp")
+	cachePath := filepath.Join(config.GetCacheDir(), "serve-sftp")
 	if len(keyPaths) == 0 {
-		keyPaths = []string{filepath.Join(cachePath, "id_rsa")}
+		keyPaths = []string{
+			filepath.Join(cachePath, "id_rsa"),
+			filepath.Join(cachePath, "id_ecdsa"),
+			filepath.Join(cachePath, "id_ed25519"),
+		}
 	}
 	for _, keyPath := range keyPaths {
 		private, err := loadPrivateKey(keyPath)
 		if err != nil && len(s.opt.HostKeys) == 0 {
 			fs.Debugf(nil, "Failed to load %q: %v", keyPath, err)
 			// If loading a cached key failed, make the keys and retry
-			err = os.MkdirAll(cachePath, 0700)
+			err = file.MkdirAll(cachePath, 0700)
 			if err != nil {
-				return errors.Wrap(err, "failed to create cache path")
+				return fmt.Errorf("failed to create cache path: %w", err)
 			}
-			const bits = 2048
-			fs.Logf(nil, "Generating %d bit key pair at %q", bits, keyPath)
-			err = makeSSHKeyPair(bits, keyPath+".pub", keyPath)
+			if strings.HasSuffix(keyPath, string(os.PathSeparator)+"id_rsa") {
+				const bits = 2048
+				fs.Logf(nil, "Generating %d bit key pair at %q", bits, keyPath)
+				err = makeRSASSHKeyPair(bits, keyPath+".pub", keyPath)
+			} else if strings.HasSuffix(keyPath, string(os.PathSeparator)+"id_ecdsa") {
+				fs.Logf(nil, "Generating ECDSA p256 key pair at %q", keyPath)
+				err = makeECDSASSHKeyPair(keyPath+".pub", keyPath)
+			} else if strings.HasSuffix(keyPath, string(os.PathSeparator)+"id_ed25519") {
+				fs.Logf(nil, "Generating Ed25519 key pair at %q", keyPath)
+				err = makeEd25519SSHKeyPair(keyPath+".pub", keyPath)
+			} else {
+				return fmt.Errorf("don't know how to generate key pair %q", keyPath)
+			}
 			if err != nil {
-				return errors.Wrap(err, "failed to create SSH key pair")
+				return fmt.Errorf("failed to create SSH key pair: %w", err)
 			}
-			// reload the new keys
+			// reload the new key
 			private, err = loadPrivateKey(keyPath)
 		}
 		if err != nil {
@@ -249,56 +292,67 @@ func (s *server) serve() (err error) {
 
 	// Once a ServerConfig has been configured, connections can be
 	// accepted.
-	s.listener, err = net.Listen("tcp", s.opt.ListenAddr)
+	var listener net.Listener
+
+	// In case we run in a socket-activated environment, listen on (the first)
+	// passed FD.
+	sdListeners, err := sdActivation.Listeners()
 	if err != nil {
-		return errors.Wrap(err, "failed to listen for connection")
+		return fmt.Errorf("unable to acquire listeners: %w", err)
 	}
+
+	if len(sdListeners) > 0 {
+		if len(sdListeners) > 1 {
+			fs.LogPrintf(fs.LogLevelWarning, nil, "more than one listener passed, ignoring all but the first.\n")
+		}
+		listener = sdListeners[0]
+	} else {
+		listener, err = net.Listen("tcp", s.opt.ListenAddr)
+		if err != nil {
+			return fmt.Errorf("failed to listen for connection: %w", err)
+		}
+	}
+	s.listener = listener
+	return nil
+}
+
+// Serve SFTP until the server is Shutdown
+func (s *server) Serve() (err error) {
 	fs.Logf(nil, "SFTP server listening on %v\n", s.listener.Addr())
-
-	go s.acceptConnections()
-
+	s.acceptConnections()
+	close(s.stopped)
 	return nil
 }
 
 // Addr returns the address the server is listening on
-func (s *server) Addr() string {
-	return s.listener.Addr().String()
-}
-
-// Serve runs the sftp server in the background.
-//
-// Use s.Close() and s.Wait() to shutdown server
-func (s *server) Serve() error {
-	err := s.serve()
-	if err != nil {
-		return err
-	}
-	return nil
+func (s *server) Addr() net.Addr {
+	return s.listener.Addr()
 }
 
 // Wait blocks while the listener is open.
 func (s *server) Wait() {
-	<-s.waitChan
+	<-s.stopped
 }
 
-// Close shuts the running server down
-func (s *server) Close() {
+// Shutdown shuts the running server down
+func (s *server) Shutdown() error {
 	err := s.listener.Close()
-	if err != nil {
-		fs.Errorf(nil, "Error on closing SFTP server: %v", err)
-		return
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		err = nil
 	}
-	close(s.waitChan)
+	s.provider.Shutdown()
+	s.Wait()
+	return err
 }
 
 func loadPrivateKey(keyPath string) (ssh.Signer, error) {
-	privateBytes, err := ioutil.ReadFile(keyPath)
+	privateBytes, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to load private key")
+		return nil, fmt.Errorf("failed to load private key: %w", err)
 	}
 	private, err := ssh.ParsePrivateKey(privateBytes)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse private key")
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
 	return private, nil
 }
@@ -307,28 +361,27 @@ func loadPrivateKey(keyPath string) (ssh.Signer, error) {
 // the public key of a received connection
 // with the entries in the authorized_keys file.
 func loadAuthorizedKeys(authorizedKeysPath string) (authorizedKeysMap map[string]struct{}, err error) {
-	authorizedKeysBytes, err := ioutil.ReadFile(authorizedKeysPath)
+	authorizedKeysBytes, err := os.ReadFile(authorizedKeysPath)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to load authorized keys")
+		return nil, fmt.Errorf("failed to load authorized keys: %w", err)
 	}
 	authorizedKeysMap = make(map[string]struct{})
 	for len(authorizedKeysBytes) > 0 {
 		pubKey, _, _, rest, err := ssh.ParseAuthorizedKey(authorizedKeysBytes)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to parse authorized keys")
+		if err == nil {
+			authorizedKeysMap[string(pubKey.Marshal())] = struct{}{}
+			authorizedKeysBytes = bytes.TrimSpace(rest)
 		}
-		authorizedKeysMap[string(pubKey.Marshal())] = struct{}{}
-		authorizedKeysBytes = bytes.TrimSpace(rest)
 	}
 	return authorizedKeysMap, nil
 }
 
-// makeSSHKeyPair make a pair of public and private keys for SSH access.
+// makeRSASSHKeyPair make a pair of public and private keys for SSH access.
 // Public key is encoded in the format for inclusion in an OpenSSH authorized_keys file.
 // Private Key generated is PEM encoded
 //
 // Originally from: https://stackoverflow.com/a/34347463/164234
-func makeSSHKeyPair(bits int, pubKeyPath, privateKeyPath string) (err error) {
+func makeRSASSHKeyPair(bits int, pubKeyPath, privateKeyPath string) (err error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
 		return err
@@ -350,5 +403,69 @@ func makeSSHKeyPair(bits int, pubKeyPath, privateKeyPath string) (err error) {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(pubKeyPath, ssh.MarshalAuthorizedKey(pub), 0644)
+	return os.WriteFile(pubKeyPath, ssh.MarshalAuthorizedKey(pub), 0644)
+}
+
+// makeECDSASSHKeyPair make a pair of public and private keys for ECDSA SSH access.
+// Public key is encoded in the format for inclusion in an OpenSSH authorized_keys file.
+// Private Key generated is PEM encoded
+func makeECDSASSHKeyPair(pubKeyPath, privateKeyPath string) (err error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+
+	// generate and write private key as PEM
+	privateKeyFile, err := os.OpenFile(privateKeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(privateKeyFile, &err)
+	buf, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		return err
+	}
+	privateKeyPEM := &pem.Block{Type: "EC PRIVATE KEY", Bytes: buf}
+	if err := pem.Encode(privateKeyFile, privateKeyPEM); err != nil {
+		return err
+	}
+
+	// generate and write public key
+	pub, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pubKeyPath, ssh.MarshalAuthorizedKey(pub), 0644)
+}
+
+// makeEd25519SSHKeyPair make a pair of public and private keys for Ed25519 SSH access.
+// Public key is encoded in the format for inclusion in an OpenSSH authorized_keys file.
+// Private Key generated is PEM encoded
+func makeEd25519SSHKeyPair(pubKeyPath, privateKeyPath string) (err error) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+
+	// generate and write private key as PEM
+	privateKeyFile, err := os.OpenFile(privateKeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(privateKeyFile, &err)
+	buf, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return err
+	}
+	privateKeyPEM := &pem.Block{Type: "PRIVATE KEY", Bytes: buf}
+	if err := pem.Encode(privateKeyFile, privateKeyPEM); err != nil {
+		return err
+	}
+
+	// generate and write public key
+	pub, err := ssh.NewPublicKey(publicKey)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pubKeyPath, ssh.MarshalAuthorizedKey(pub), 0644)
 }

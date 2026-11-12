@@ -1,15 +1,17 @@
 ---
 title: "Chunker"
 description: "Split-chunking overlay remote"
+versionIntroduced: "v1.50"
 ---
 
-{{< icon "fa fa-cut" >}}Chunker (BETA)
-----------------------------------------
+# Chunker
 
 The `chunker` overlay transparently splits large files into smaller chunks
 during upload to wrapped remote and transparently assembles them back
 when the file is downloaded. This allows to effectively overcome size limits
 imposed by storage providers.
+
+## Configuration
 
 To use it, first set up the underlying remote following the configuration
 instructions for that remote. You can also use a local pathname instead of
@@ -17,14 +19,14 @@ a remote.
 
 First check your chosen remote is working - we'll call it `remote:path` here.
 Note that anything inside `remote:path` will be chunked and anything outside
-won't. This means that if you are using a bucket based remote (e.g. S3, B2, swift)
+won't. This means that if you are using a bucket-based remote (e.g. S3, B2, swift)
 then you should probably put the bucket in the remote `s3:bucket`.
 
 Now configure `chunker` using `rclone config`. We will call this one `overlay`
 to separate it from the `remote` itself.
 
-```
-No remotes found - make a new one
+```text
+No remotes found, make a new one\?
 n) New remote
 s) Set configuration password
 q) Quit config
@@ -43,7 +45,7 @@ Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 Enter a string value. Press Enter for the default ("").
 remote> remote:path
 Files larger than chunk size will be split in chunks.
-Enter a size with suffix k,M,G,T. Press Enter for the default ("2G").
+Enter a size with suffix K,M,G,T. Press Enter for the default ("2G").
 chunk_size> 100M
 Choose how chunker handles hash sums. All modes but "none" require metadata.
 Enter a string value. Press Enter for the default ("md5").
@@ -89,16 +91,15 @@ So if you use a remote of `/path/to/secret/files` then rclone will
 chunk stuff in that directory. If you use a remote of `name` then rclone
 will put files in a directory called `name` in the current directory.
 
-
 ### Chunking
 
 When rclone starts a file upload, chunker checks the file size. If it
 doesn't exceed the configured chunk size, chunker will just pass the file
-to the wrapped remote. If a file is large, chunker will transparently cut
-data in pieces with temporary names and stream them one by one, on the fly.
-Each data chunk will contain the specified number of bytes, except for the
-last one which may have less data. If file size is unknown in advance
-(this is called a streaming upload), chunker will internally create
+to the wrapped remote (however, see caveat below). If a file is large, chunker
+will transparently cut data in pieces with temporary names and stream them one
+by one, on the fly. Each data chunk will contain the specified number of bytes,
+except for the last one which may have less data. If file size is unknown in
+advance (this is called a streaming upload), chunker will internally create
 a temporary copy, record its size and repeat the above process.
 
 When upload completes, temporary chunk files are finally renamed.
@@ -126,6 +127,13 @@ proceed with current command.
 You can set the `--chunker-fail-hard` flag to have commands abort with
 error message in such cases.
 
+**Caveat**: As it is now, chunker will always create a temporary file in the
+backend and then rename it, even if the file is below the chunk threshold.
+This will result in unnecessary API calls and can severely restrict throughput
+when handling transfers primarily composed of small files on some backends
+(e.g. Box). A workaround to this issue is to use chunker only for files above
+the chunk threshold via `--min-size` and then perform a separate call without
+chunker on the remaining files.
 
 #### Chunk names
 
@@ -153,7 +161,6 @@ non-chunked files.
 
 When using `norename` transactions, chunk names will additionally have a unique
 file version suffix. For example, `BIG_FILE_NAME.rclone_chunk.001_bp562k`.
-
 
 ### Metadata
 
@@ -188,7 +195,6 @@ base name and show group names as virtual composite files.
 This method is more prone to missing chunk errors (especially missing
 last chunk) than format with metadata enabled.
 
-
 ### Hashsums
 
 Chunker supports hashsums only when a compatible metadata is present.
@@ -215,7 +221,7 @@ guarantee given hash for all files. If wrapped remote doesn't support it,
 chunker will then add metadata to all files, even small. However, this can
 double the amount of small files in storage and incur additional service charges.
 You can even use chunker to force md5/sha1 support in any other remote
-at expense of sidecar meta objects by setting e.g. `chunk_type=sha1all`
+at expense of sidecar meta objects by setting e.g. `hash_type=sha1all`
 to force hashsums and `chunk_size=1P` to effectively disable chunking.
 
 Normally, when a file is copied to chunker controlled remote, chunker
@@ -232,8 +238,7 @@ hashsums at destination. Beware of consequences: the `sync` command will
 revert (sometimes silently) to time/size comparison if compatible hashsums
 between source and target are not found.
 
-
-### Modified time
+### Modification times
 
 Chunker stores modification times using the wrapped remote so support
 depends on that. For a small non-chunked file the chunker overlay simply
@@ -242,7 +247,6 @@ For a composite file with metadata chunker will get and set
 modification time of the metadata object on the wrapped remote.
 If file is chunked but metadata format is `none` then chunker will
 use modification time of the first data chunk.
-
 
 ### Migrations
 
@@ -254,7 +258,7 @@ style or chunk naming scheme is to:
 - Create another directory (most probably on the same cloud storage)
   and configure a new remote with desired metadata format,
   hash type, chunk naming etc.
-- Now run `rclone sync -i oldchunks: newchunks:` and all your data
+- Now run `rclone sync --interactive oldchunks: newchunks:` and all your data
   will be transparently converted in transfer.
   This may take some time, yet chunker will try server-side
   copy if possible.
@@ -271,7 +275,6 @@ An easy way to get rid of hidden garbage is to copy littered directory
 somewhere using the chunker remote and purge the original directory.
 The `copy` command will copy only active chunks while the `purge` will
 remove everything including garbage.
-
 
 ### Caveats and Limitations
 
@@ -309,67 +312,81 @@ to keep rclone up-to-date to avoid data corruption.
 
 Changing `transactions` is dangerous and requires explicit migration.
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/chunker/chunker.go then run make backenddocs" >}}
-### Standard Options
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/chunker/chunker.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
+### Standard options
 
-Here are the standard options specific to chunker (Transparently chunk/split large files).
+Here are the Standard options specific to chunker (Transparently chunk/split large files).
 
 #### --chunker-remote
 
 Remote to chunk/unchunk.
+
 Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 "myremote:bucket" or maybe "myremote:" (not recommended).
+
+Properties:
 
 - Config:      remote
 - Env Var:     RCLONE_CHUNKER_REMOTE
 - Type:        string
-- Default:     ""
+- Required:    true
 
 #### --chunker-chunk-size
 
 Files larger than chunk size will be split in chunks.
 
+Properties:
+
 - Config:      chunk_size
 - Env Var:     RCLONE_CHUNKER_CHUNK_SIZE
 - Type:        SizeSuffix
-- Default:     2G
+- Default:     2Gi
 
 #### --chunker-hash-type
 
-Choose how chunker handles hash sums. All modes but "none" require metadata.
+Choose how chunker handles hash sums.
+
+All modes but "none" require metadata.
+
+Properties:
 
 - Config:      hash_type
 - Env Var:     RCLONE_CHUNKER_HASH_TYPE
 - Type:        string
 - Default:     "md5"
 - Examples:
-    - "none"
-        - Pass any hash supported by wrapped remote for non-chunked files, return nothing otherwise
-    - "md5"
-        - MD5 for composite files
-    - "sha1"
-        - SHA1 for composite files
-    - "md5all"
-        - MD5 for all files
-    - "sha1all"
-        - SHA1 for all files
-    - "md5quick"
-        - Copying a file to chunker will request MD5 from the source falling back to SHA1 if unsupported
-    - "sha1quick"
-        - Similar to "md5quick" but prefers SHA1 over MD5
+  - "none"
+    - Pass any hash supported by wrapped remote for non-chunked files.
+    - Return nothing otherwise.
+  - "md5"
+    - MD5 for composite files.
+  - "sha1"
+    - SHA1 for composite files.
+  - "md5all"
+    - MD5 for all files.
+  - "sha1all"
+    - SHA1 for all files.
+  - "md5quick"
+    - Copying a file to chunker will request MD5 from the source.
+    - Falling back to SHA1 if unsupported.
+  - "sha1quick"
+    - Similar to "md5quick" but prefers SHA1 over MD5.
 
-### Advanced Options
+### Advanced options
 
-Here are the advanced options specific to chunker (Transparently chunk/split large files).
+Here are the Advanced options specific to chunker (Transparently chunk/split large files).
 
 #### --chunker-name-format
 
 String format of chunk file names.
+
 The two placeholders are: base file name (*) and chunk number (#...).
 There must be one and only one asterisk and one or more consecutive hash characters.
 If chunk number has less digits than the number of hashes, it is left-padded by zeros.
 If there are more digits in the number, they are left as is.
 Possible chunk files are ignored if their name does not match given format.
+
+Properties:
 
 - Config:      name_format
 - Env Var:     RCLONE_CHUNKER_NAME_FORMAT
@@ -379,7 +396,10 @@ Possible chunk files are ignored if their name does not match given format.
 #### --chunker-start-from
 
 Minimum valid chunk number. Usually 0 or 1.
+
 By default chunk numbers start from 1.
+
+Properties:
 
 - Config:      start_from
 - Env Var:     RCLONE_CHUNKER_START_FROM
@@ -388,55 +408,76 @@ By default chunk numbers start from 1.
 
 #### --chunker-meta-format
 
-Format of the metadata object or "none". By default "simplejson".
+Format of the metadata object or "none".
+
+By default "simplejson".
 Metadata is a small JSON file named after the composite file.
+
+Properties:
 
 - Config:      meta_format
 - Env Var:     RCLONE_CHUNKER_META_FORMAT
 - Type:        string
 - Default:     "simplejson"
 - Examples:
-    - "none"
-        - Do not use metadata files at all. Requires hash type "none".
-    - "simplejson"
-        - Simple JSON supports hash sums and chunk validation.
-        - It has the following fields: ver, size, nchunks, md5, sha1.
+  - "none"
+    - Do not use metadata files at all.
+    - Requires hash type "none".
+  - "simplejson"
+    - Simple JSON supports hash sums and chunk validation.
+    - 
+    - It has the following fields: ver, size, nchunks, md5, sha1.
 
 #### --chunker-fail-hard
 
 Choose how chunker should handle files with missing or invalid chunks.
+
+Properties:
 
 - Config:      fail_hard
 - Env Var:     RCLONE_CHUNKER_FAIL_HARD
 - Type:        bool
 - Default:     false
 - Examples:
-    - "true"
-        - Report errors and abort current command.
-    - "false"
-        - Warn user, skip incomplete file and proceed.
+  - "true"
+    - Report errors and abort current command.
+  - "false"
+    - Warn user, skip incomplete file and proceed.
 
 #### --chunker-transactions
 
 Choose how chunker should handle temporary files during transactions.
+
+Properties:
 
 - Config:      transactions
 - Env Var:     RCLONE_CHUNKER_TRANSACTIONS
 - Type:        string
 - Default:     "rename"
 - Examples:
-    - "rename"
-        - Rename temporary files after a successful transaction.
-    - "norename"
-        - Leave temporary file names and write transaction ID to metadata file.
-        - Metadata is required for no rename transactions (meta format cannot be "none").
-        - If you are using norename transactions you should be careful not to downgrade Rclone
-        - as older versions of Rclone don't support this transaction style and will misinterpret
-        - files manipulated by norename transactions.
-        - This method is EXPERIMENTAL, don't use on production systems.
-    - "auto"
-        - Rename or norename will be used depending on capabilities of the backend.
-        - If meta format is set to "none", rename transactions will always be used.
-        - This method is EXPERIMENTAL, don't use on production systems.
+  - "rename"
+    - Rename temporary files after a successful transaction.
+  - "norename"
+    - Leave temporary file names and write transaction ID to metadata file.
+    - Metadata is required for no rename transactions (meta format cannot be "none").
+    - If you are using norename transactions you should be careful not to downgrade Rclone
+    - as older versions of Rclone don't support this transaction style and will misinterpret
+    - files manipulated by norename transactions.
+    - This method is EXPERIMENTAL, don't use on production systems.
+  - "auto"
+    - Rename or norename will be used depending on capabilities of the backend.
+    - If meta format is set to "none", rename transactions will always be used.
+    - This method is EXPERIMENTAL, don't use on production systems.
 
-{{< rem autogenerated options stop >}}
+#### --chunker-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_CHUNKER_DESCRIPTION
+- Type:        string
+- Required:    false
+
+<!-- autogenerated options stop -->

@@ -1,26 +1,50 @@
 // Test AzureBlob filesystem interface
 
-// +build !plan9,!solaris,!js,go1.14
+//go:build !plan9 && !js
 
 package azureblob
 
 import (
-	"context"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/stretchr/testify/assert"
 )
 
 // TestIntegration runs integration tests against the remote
 func TestIntegration(t *testing.T) {
+	name := "TestAzureBlob"
 	fstests.Run(t, &fstests.Opt{
-		RemoteName:  "TestAzureBlob:",
+		RemoteName:  name + ":",
 		NilObject:   (*Object)(nil),
-		TiersToTest: []string{"Hot", "Cool"},
+		TiersToTest: []string{"Hot", "Cool", "Cold"},
 		ChunkedUpload: fstests.ChunkedUploadConfig{
-			MaxChunkSize: maxChunkSize,
+			MinChunkSize: defaultChunkSize,
+		},
+		ExtraConfig: []fstests.ExtraConfigItem{
+			{Name: name, Key: "use_copy_blob", Value: "false"},
+		},
+	})
+}
+
+// TestIntegration2 runs integration tests against the remote
+func TestIntegration2(t *testing.T) {
+	if *fstest.RemoteName != "" {
+		t.Skip("Skipping as -remote set")
+	}
+	name := "TestAzureBlob"
+	fstests.Run(t, &fstests.Opt{
+		RemoteName:  name + ":",
+		NilObject:   (*Object)(nil),
+		TiersToTest: []string{"Hot", "Cool", "Cold"},
+		ChunkedUpload: fstests.ChunkedUploadConfig{
+			MinChunkSize: defaultChunkSize,
+		},
+		ExtraConfig: []fstests.ExtraConfigItem{
+			{Name: name, Key: "directory_markers", Value: "true"},
+			{Name: name, Key: "use_copy_blob", Value: "false"},
 		},
 	})
 }
@@ -29,36 +53,34 @@ func (f *Fs) SetUploadChunkSize(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
 	return f.setUploadChunkSize(cs)
 }
 
+func (f *Fs) SetCopyCutoff(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
+	return f.setCopyCutoff(cs)
+}
+
 var (
 	_ fstests.SetUploadChunkSizer = (*Fs)(nil)
+	_ fstests.SetCopyCutoffer     = (*Fs)(nil)
 )
 
-// TestServicePrincipalFileSuccess checks that, given a proper JSON file, we can create a token.
-func TestServicePrincipalFileSuccess(t *testing.T) {
-	ctx := context.TODO()
-	credentials := `
-{
-    "appId": "my application (client) ID",
-    "password": "my secret",
-    "tenant": "my active directory tenant ID"
-}
-`
-	tokenRefresher, err := newServicePrincipalTokenRefresher(ctx, []byte(credentials))
-	if assert.NoError(t, err) {
-		assert.NotNil(t, tokenRefresher)
+func TestValidateAccessTier(t *testing.T) {
+	tests := map[string]struct {
+		accessTier string
+		want       bool
+	}{
+		"hot":     {"hot", true},
+		"HOT":     {"HOT", true},
+		"Hot":     {"Hot", true},
+		"cool":    {"cool", true},
+		"cold":    {"cold", true},
+		"archive": {"archive", true},
+		"empty":   {"", false},
+		"unknown": {"unknown", false},
 	}
-}
 
-// TestServicePrincipalFileFailure checks that, given a JSON file with a missing secret, it returns an error.
-func TestServicePrincipalFileFailure(t *testing.T) {
-	ctx := context.TODO()
-	credentials := `
-{
-    "appId": "my application (client) ID",
-    "tenant": "my active directory tenant ID"
-}
-`
-	_, err := newServicePrincipalTokenRefresher(ctx, []byte(credentials))
-	assert.Error(t, err)
-	assert.EqualError(t, err, "error creating service principal token: parameter 'secret' cannot be empty")
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := validateAccessTier(test.accessTier)
+			assert.Equal(t, test.want, got)
+		})
+	}
 }

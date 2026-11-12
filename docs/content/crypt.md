@@ -1,10 +1,10 @@
 ---
 title: "Crypt"
 description: "Encryption overlay remote"
+versionIntroduced: "v1.33"
 ---
 
-{{< icon "fa fa-lock" >}}Crypt
-----------------------------------------
+# Crypt
 
 Rclone `crypt` remotes encrypt and decrypt other remotes.
 
@@ -31,11 +31,11 @@ will just give you the encrypted (scrambled) format, and anything you
 upload will *not* become encrypted.
 
 The encryption is a secret-key encryption (also called symmetric key encryption)
-algorithm, where a password (or pass phrase) is used to generate real encryption key.
-The password can be supplied by user, or you may chose to let rclone
-generate one. It will be stored in the configuration file, in a lightly obscured form.
-If you are in an environment where you are not able to keep your configuration
-secured, you should add
+algorithm, where a password (or pass phrase) is used to generate real encryption
+key. The password can be supplied by user, or you may chose to let rclone
+generate one. It will be stored in the configuration file, in a lightly obscured
+form. If you are in an environment where you are not able to keep your
+configuration secured, you should add
 [configuration encryption](https://rclone.org/docs/#configuration-encryption)
 as protection. As long as you have this configuration file, you will be able to
 decrypt your data. Without the configuration file, as long as you remember
@@ -47,9 +47,9 @@ See below for guidance to [changing password](#changing-password).
 Encryption uses [cryptographic salt](https://en.wikipedia.org/wiki/Salt_(cryptography)),
 to permute the encryption key so that the same string may be encrypted in
 different ways. When configuring the crypt remote it is optional to enter a salt,
-or to let rclone generate a unique salt. If omitted, rclone uses a built-in unique string.
-Normally in cryptography, the salt is stored together with the encrypted content,
-and do not have to be memorized by the user. This is not the case in rclone,
+or to let rclone generate a unique salt. If omitted, rclone uses a built-in unique
+string. Normally in cryptography, the salt is stored together with the encrypted
+content, and do not have to be memorized by the user. This is not the case in rclone,
 because rclone does not store any additional information on the remotes. Use of
 custom salt is effectively a second password that must be memorized.
 
@@ -58,9 +58,9 @@ custom salt is effectively a second password that must be memorized.
 based on XSalsa20 cipher and Poly1305 for integrity.
 [Names](#name-encryption) (file- and directory names) are also encrypted
 by default, but this has some implications and is therefore
-possible to turned off.
+possible to be turned off.
 
-### Configuration
+## Configuration
 
 Here is an example of how to make a remote called `secret`.
 
@@ -86,8 +86,8 @@ anything you write will be unencrypted. To avoid issues it is best to
 configure a dedicated path for encrypted content, and access it
 exclusively through a crypt remote.
 
-```
-No remotes found - make a new one
+```text
+No remotes found, make a new one\?
 n) New remote
 s) Set configuration password
 q) Quit config
@@ -110,12 +110,14 @@ Enter a string value. Press Enter for the default ("").
 remote> remote:path
 How to encrypt the filenames.
 Enter a string value. Press Enter for the default ("standard").
-Choose a number from below, or type in your own value
- 1 / Encrypt the filenames see the docs for the details.
+Choose a number from below, or type in your own value.
+   / Encrypt the filenames.
+ 1 | See the docs for the details.
    \ "standard"
  2 / Very simple filename obfuscation.
    \ "obfuscate"
- 3 / Don't encrypt the file names.  Adds a ".bin" extension only.
+   / Don't encrypt the file names.
+ 3 | Adds a ".bin" extension only.
    \ "off"
 filename_encryption>
 Option to either encrypt directory names or leave them intact.
@@ -174,13 +176,14 @@ y/e/d>
 
 **Important** The crypt password stored in `rclone.conf` is lightly
 obscured. That only protects it from cursory inspection. It is not
-secure unless [configuration encryption](https://rclone.org/docs/#configuration-encryption) of `rclone.conf` is specified.
+secure unless [configuration encryption](https://rclone.org/docs/#configuration-encryption)
+of `rclone.conf` is specified.
 
 A long passphrase is recommended, or `rclone config` can generate a
 random one.
 
 The obscured password is created using AES-CTR with a static key. The
-salt is stored verbatim at the beginning of the obscured password. This
+IV (nonce) is stored verbatim at the beginning of the obscured password. This
 static key is shared between all versions of rclone.
 
 If you reconfigure rclone with the same passwords/passphrases
@@ -189,8 +192,8 @@ due to the different salt.
 
 Rclone does not encrypt
 
-  * file length - this can be calculated within 16 bytes
-  * modification time - used for syncing
+- file length - this can be calculated within 16 bytes
+- modification time - used for syncing
 
 ### Specifying the remote
 
@@ -223,8 +226,8 @@ it when needed.
 If you intend to use the wrapped remote both directly for keeping
 unencrypted content, as well as through a crypt remote for encrypted
 content, it is recommended to point the crypt remote to a separate
-directory within the wrapped remote. If you use a bucket based storage
-system (e.g. Swift, S3, Google Compute Storage, B2, Hubic) it is generally
+directory within the wrapped remote. If you use a bucket-based storage
+system (e.g. Swift, S3, Google Compute Storage, B2) it is generally
 advisable to wrap the crypt remote around a specific bucket (`s3:bucket`).
 If wrapping around the entire root of the storage (`s3:`), and use the
 optional file name encryption, rclone will encrypt the bucket name.
@@ -240,8 +243,9 @@ the password configured for an existing crypt remote means you will no longer
 able to decrypt any of the previously encrypted content. The only possibility
 is to re-upload everything via a crypt remote configured with your new password.
 
-Depending on the size of your data, your bandwith, storage quota etc, there are
+Depending on the size of your data, your bandwidth, storage quota etc, there are
 different approaches you can take:
+
 - If you have everything in a different location, for example on your local system,
 you could remove all of the prior encrypted files, change the password for your
 configured crypt remote (or delete and re-create the crypt configuration),
@@ -253,7 +257,7 @@ effectively decrypting everything on the fly using the old password and
 re-encrypting using the new password. When done, delete the original crypt
 remote directory and finally the rclone crypt configuration with the old password.
 All data will be streamed from the storage system and back, so you will
-get half the bandwith and be charged twice if you have upload and download quota
+get half the bandwidth and be charged twice if you have upload and download quota
 on the storage system.
 
 **Note**: A security problem related to the random password generator
@@ -270,7 +274,7 @@ details, and a tool you can use to check if you are affected.
 Create the following file structure using "standard" file name
 encryption.
 
-```
+```text
 plaintext/
 ├── file0.txt
 ├── file1.txt
@@ -283,7 +287,7 @@ plaintext/
 
 Copy these to the remote, and list them
 
-```
+```console
 $ rclone -q copy plaintext secret:
 $ rclone -q ls secret:
         7 file1.txt
@@ -295,7 +299,7 @@ $ rclone -q ls secret:
 
 The crypt remote looks like
 
-```
+```console
 $ rclone -q ls remote:path
        55 hagjclgavj2mbiqm6u6cnjjqcg
        54 v05749mltvv1tf4onltun46gls
@@ -306,7 +310,7 @@ $ rclone -q ls remote:path
 
 The directory structure is preserved
 
-```
+```console
 $ rclone -q ls secret:subdir
         8 file2.txt
         9 file3.txt
@@ -317,7 +321,7 @@ Without file name encryption `.bin` extensions are added to underlying
 names. This prevents the cloud provider attempting to interpret file
 content.
 
-```
+```console
 $ rclone -q ls remote:path
        54 file0.txt.bin
        57 subdir/file3.txt.bin
@@ -330,18 +334,18 @@ $ rclone -q ls remote:path
 
 Off
 
-  * doesn't hide file names or directory structure
-  * allows for longer file names (~246 characters)
-  * can use sub paths and copy single files
+- doesn't hide file names or directory structure
+- allows for longer file names (~246 characters)
+- can use sub paths and copy single files
 
 Standard
 
-  * file names encrypted
-  * file names can't be as long (~143 characters)
-  * can use sub paths and copy single files
-  * directory structure visible
-  * identical files names will have identical uploaded names
-  * can use shortcuts to shorten the directory recursion
+- file names encrypted
+- file names can't be as long (~143 characters)
+- can use sub paths and copy single files
+- directory structure visible
+- identical files names will have identical uploaded names
+- can use shortcuts to shorten the directory recursion
 
 Obfuscation
 
@@ -360,17 +364,25 @@ equivalents.
 
 Obfuscation cannot be relied upon for strong protection.
 
-  * file names very lightly obfuscated
-  * file names can be longer than standard encryption
-  * can use sub paths and copy single files
-  * directory structure visible
-  * identical files names will have identical uploaded names
+- file names very lightly obfuscated
+- file names can be longer than standard encryption
+- can use sub paths and copy single files
+- directory structure visible
+- identical files names will have identical uploaded names
 
 Cloud storage systems have limits on file name length and
 total path length which rclone is more likely to breach using
-"Standard" file name encryption.  Where file names are less thn 156
+"Standard" file name encryption.  Where file names are 143 or fewer
 characters in length issues should not be encountered, irrespective of
 cloud storage provider.
+
+An experimental advanced option `filename_encoding` is now provided to
+address this problem to a certain degree.
+For cloud storage systems with case sensitive file names (e.g. Google Drive),
+`base64` can be used to reduce file name length. 
+For cloud storage systems using UTF-16 to store file names internally
+(e.g. OneDrive, Dropbox, Box), `base32768` can be used to drastically reduce
+file name length.
 
 An alternative, future rclone file name encryption mode may tolerate
 backend provider path length limits.
@@ -394,8 +406,7 @@ Example:
 `1/12/123.txt` is encrypted to
 `1/12/qgm4avr35m5loi1th53ato71v0`
 
-
-### Modified time and hashes
+### Modification times and hashes
 
 Crypt stores modification times using the underlying remote so support
 depends on that.
@@ -404,40 +415,47 @@ Hashes are not stored for crypt. However the data integrity is
 protected by an extremely strong crypto authenticator.
 
 Use the `rclone cryptcheck` command to check the
-integrity of a crypted remote instead of `rclone check` which can't
+integrity of an encrypted remote instead of `rclone check` which can't
 check the checksums properly.
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/crypt/crypt.go then run make backenddocs" >}}
-### Standard Options
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/crypt/crypt.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
+### Standard options
 
-Here are the standard options specific to crypt (Encrypt/Decrypt a remote).
+Here are the Standard options specific to crypt (Encrypt/Decrypt a remote).
 
 #### --crypt-remote
 
 Remote to encrypt/decrypt.
+
 Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 "myremote:bucket" or maybe "myremote:" (not recommended).
+
+Properties:
 
 - Config:      remote
 - Env Var:     RCLONE_CRYPT_REMOTE
 - Type:        string
-- Default:     ""
+- Required:    true
 
 #### --crypt-filename-encryption
 
 How to encrypt the filenames.
+
+Properties:
 
 - Config:      filename_encryption
 - Env Var:     RCLONE_CRYPT_FILENAME_ENCRYPTION
 - Type:        string
 - Default:     "standard"
 - Examples:
-    - "standard"
-        - Encrypt the filenames see the docs for the details.
-    - "obfuscate"
-        - Very simple filename obfuscation.
-    - "off"
-        - Don't encrypt the file names.  Adds a ".bin" extension only.
+  - "standard"
+    - Encrypt the filenames.
+    - See the docs for the details.
+  - "obfuscate"
+    - Very simple filename obfuscation.
+  - "off"
+    - Don't encrypt the file names.
+    - Adds a ".bin", or "suffix" extension only.
 
 #### --crypt-directory-name-encryption
 
@@ -445,15 +463,17 @@ Option to either encrypt directory names or leave them intact.
 
 NB If filename_encryption is "off" then this option will do nothing.
 
+Properties:
+
 - Config:      directory_name_encryption
 - Env Var:     RCLONE_CRYPT_DIRECTORY_NAME_ENCRYPTION
 - Type:        bool
 - Default:     true
 - Examples:
-    - "true"
-        - Encrypt directory names.
-    - "false"
-        - Don't encrypt directory names, leave them intact.
+  - "true"
+    - Encrypt directory names.
+  - "false"
+    - Don't encrypt directory names, leave them intact.
 
 #### --crypt-password
 
@@ -461,28 +481,36 @@ Password or pass phrase for encryption.
 
 **NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
 
+Properties:
+
 - Config:      password
 - Env Var:     RCLONE_CRYPT_PASSWORD
 - Type:        string
-- Default:     ""
+- Required:    true
 
 #### --crypt-password2
 
-Password or pass phrase for salt. Optional but recommended.
+Password or pass phrase for salt.
+
+Optional but recommended.
 Should be different to the previous password.
 
 **NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
 
+Properties:
+
 - Config:      password2
 - Env Var:     RCLONE_CRYPT_PASSWORD2
 - Type:        string
-- Default:     ""
+- Required:    false
 
-### Advanced Options
+### Advanced options
 
-Here are the advanced options specific to crypt (Encrypt/Decrypt a remote).
+Here are the Advanced options specific to crypt (Encrypt/Decrypt a remote).
 
 #### --crypt-server-side-across-configs
+
+Deprecated: use --server-side-across-configs instead.
 
 Allow server-side operations (e.g. copy) to work across different crypt configs.
 
@@ -494,6 +522,8 @@ without re-uploading all the data. Just make two crypt backends
 pointing to two different directories with the single changed
 parameter and use rclone move to move the files between the crypt
 remotes.
+
+Properties:
 
 - Config:      server_side_across_configs
 - Env Var:     RCLONE_CRYPT_SERVER_SIDE_ACROSS_CONFIGS
@@ -512,6 +542,8 @@ This is so you can work out which encrypted names are which decrypted
 names just in case you need to do something with the encrypted file
 names, or for debugging purposes.
 
+Properties:
+
 - Config:      show_mapping
 - Env Var:     RCLONE_CRYPT_SHOW_MAPPING
 - Type:        bool
@@ -521,76 +553,171 @@ names, or for debugging purposes.
 
 Option to either encrypt file data or leave it unencrypted.
 
+Properties:
+
 - Config:      no_data_encryption
 - Env Var:     RCLONE_CRYPT_NO_DATA_ENCRYPTION
 - Type:        bool
 - Default:     false
 - Examples:
-    - "true"
-        - Don't encrypt file data, leave it unencrypted.
-    - "false"
-        - Encrypt file data.
+  - "true"
+    - Don't encrypt file data, leave it unencrypted.
+  - "false"
+    - Encrypt file data.
 
-### Backend commands
+#### --crypt-pass-bad-blocks
+
+If set this will pass bad blocks through as all 0.
+
+This should not be set in normal operation, it should only be set if
+trying to recover an encrypted file with errors and it is desired to
+recover as much of the file as possible.
+
+Properties:
+
+- Config:      pass_bad_blocks
+- Env Var:     RCLONE_CRYPT_PASS_BAD_BLOCKS
+- Type:        bool
+- Default:     false
+
+#### --crypt-strict-names
+
+If set, this will raise an error when crypt comes across a filename that can't be decrypted.
+
+(By default, rclone will just log a NOTICE and continue as normal.)
+This can happen if encrypted and unencrypted files are stored in the same
+directory (which is not recommended.) It may also indicate a more serious
+problem that should be investigated.
+
+Properties:
+
+- Config:      strict_names
+- Env Var:     RCLONE_CRYPT_STRICT_NAMES
+- Type:        bool
+- Default:     false
+
+#### --crypt-filename-encoding
+
+How to encode the encrypted filename to text string.
+
+This option could help with shortening the encrypted filename. The 
+suitable option would depend on the way your remote count the filename
+length and if it's case sensitive.
+
+Properties:
+
+- Config:      filename_encoding
+- Env Var:     RCLONE_CRYPT_FILENAME_ENCODING
+- Type:        string
+- Default:     "base32"
+- Examples:
+  - "base32"
+    - Encode using base32. Suitable for all remote.
+  - "base64"
+    - Encode using base64. Suitable for case sensitive remote.
+  - "base32768"
+    - Encode using base32768. Suitable if your remote counts UTF-16 or
+    - Unicode codepoint instead of UTF-8 byte length. (Eg. Onedrive, Dropbox)
+
+#### --crypt-suffix
+
+If this is set it will override the default suffix of ".bin".
+
+Setting suffix to "none" will result in an empty suffix. This may be useful 
+when the path length is critical.
+
+Properties:
+
+- Config:      suffix
+- Env Var:     RCLONE_CRYPT_SUFFIX
+- Type:        string
+- Default:     ".bin"
+
+#### --crypt-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_CRYPT_DESCRIPTION
+- Type:        string
+- Required:    false
+
+### Metadata
+
+Any metadata supported by the underlying remote is read and written.
+
+See the [metadata](/docs/#metadata) docs for more info.
+
+## Backend commands
 
 Here are the commands specific to the crypt backend.
 
-Run them with
+Run them with:
 
-    rclone backend COMMAND remote:
+```console
+rclone backend COMMAND remote:
+```
 
 The help below will explain what arguments each command takes.
 
-See [the "rclone backend" command](/commands/rclone_backend/) for more
+See the [backend](/commands/rclone_backend/) command for more
 info on how to pass options and arguments.
 
 These can be run on a running backend using the rc command
-[backend/command](/rc/#backend/command).
+[backend/command](/rc/#backend-command).
 
-#### encode
+### encode
 
-Encode the given filename(s)
+Encode the given filename(s).
 
-    rclone backend encode remote: [options] [<arguments>+]
+```console
+rclone backend encode remote: [options] [<arguments>+]
+```
 
 This encodes the filenames given as arguments returning a list of
 strings of the encoded results.
 
-Usage Example:
+Usage examples:
 
-    rclone backend encode crypt: file1 [file2...]
-    rclone rc backend/command command=encode fs=crypt: file1 [file2...]
+```console
+rclone backend encode crypt: file1 [file2...]
+rclone rc backend/command command=encode fs=crypt: file1 [file2...]
+```
 
+### decode
 
-#### decode
+Decode the given filename(s).
 
-Decode the given filename(s)
-
-    rclone backend decode remote: [options] [<arguments>+]
+```console
+rclone backend decode remote: [options] [<arguments>+]
+```
 
 This decodes the filenames given as arguments returning a list of
 strings of the decoded results. It will return an error if any of the
 inputs are invalid.
 
-Usage Example:
+Usage examples:
 
-    rclone backend decode crypt: encryptedfile1 [encryptedfile2...]
-    rclone rc backend/command command=decode fs=crypt: encryptedfile1 [encryptedfile2...]
+```console
+rclone backend decode crypt: encryptedfile1 [encryptedfile2...]
+rclone rc backend/command command=decode fs=crypt: encryptedfile1 [encryptedfile2...]
+```
 
+<!-- autogenerated options stop -->
 
-{{< rem autogenerated options stop >}}
+## Backing up an encrypted remote
 
-## Backing up a crypted remote
-
-If you wish to backup a crypted remote, it is recommended that you use
+If you wish to backup an encrypted remote, it is recommended that you use
 `rclone sync` on the encrypted files, and make sure the passwords are
 the same in the new encrypted remote.
 
 This will have the following advantages
 
-  * `rclone sync` will check the checksums while copying
-  * you can use `rclone check` between the encrypted remotes
-  * you don't decrypt and encrypt unnecessarily
+- `rclone sync` will check the checksums while copying
+- you can use `rclone check` between the encrypted remotes
+- you don't decrypt and encrypt unnecessarily
 
 For example, let's say you have your original remote at `remote:` with
 the encrypted version at `eremote:` with path `remote:crypt`.  You
@@ -600,11 +727,15 @@ as `eremote:`.
 
 To sync the two remotes you would do
 
-    rclone sync -i remote:crypt remote2:crypt
+```console
+rclone sync --interactive remote:crypt remote2:crypt
+```
 
 And to check the integrity you would do
 
-    rclone check remote:crypt remote2:crypt
+```console
+rclone check remote:crypt remote2:crypt
+```
 
 ## File formats
 
@@ -615,27 +746,27 @@ has a header and is divided into chunks.
 
 #### Header
 
-  * 8 bytes magic string `RCLONE\x00\x00`
-  * 24 bytes Nonce (IV)
+- 8 bytes magic string `RCLONE\x00\x00`
+- 24 bytes Nonce (IV)
 
 The initial nonce is generated from the operating systems crypto
 strong random number generator.  The nonce is incremented for each
 chunk read making sure each nonce is unique for each block written.
-The chance of a nonce being re-used is minuscule.  If you wrote an
+The chance of a nonce being reused is minuscule.  If you wrote an
 exabyte of data (10¹⁸ bytes) you would have a probability of
-approximately 2×10⁻³² of re-using a nonce.
+approximately 2×10⁻³² of reusing a nonce.
 
 #### Chunk
 
-Each chunk will contain 64kB of data, except for the last one which
+Each chunk will contain 64 KiB of data, except for the last one which
 may have less data. The data chunk is in standard NaCl SecretBox
 format. SecretBox uses XSalsa20 and Poly1305 to encrypt and
 authenticate messages.
 
 Each chunk contains:
 
-  * 16 Bytes of Poly1305 authenticator
-  * 1 - 65536 bytes XSalsa20 encrypted data
+- 16 Bytes of Poly1305 authenticator
+- 1 - 65536 bytes XSalsa20 encrypted data
 
 64k chunk size was chosen as the best performing chunk size (the
 authenticator takes too much time below this and the performance drops
@@ -648,17 +779,17 @@ This uses a 32 byte (256 bit key) key derived from the user password.
 
 1 byte file will encrypt to
 
-  * 32 bytes header
-  * 17 bytes data chunk
+- 32 bytes header
+- 17 bytes data chunk
 
 49 bytes total
 
-1MB (1048576 bytes) file will encrypt to
+1 MiB (1048576 bytes) file will encrypt to
 
-  * 32 bytes header
-  * 16 chunks of 65568 bytes
+- 32 bytes header
+- 16 chunks of 65552 bytes
 
-1049120 bytes total (a 0.05% overhead).  This is the overhead for big
+1048864 bytes total (a 0.03% overhead). This is the overhead for big
 files.
 
 ### Name encryption
@@ -679,8 +810,17 @@ it on the cloud storage system.
 
 This means that
 
-  * filenames with the same name will encrypt the same
-  * filenames which start the same won't have a common prefix
+- filenames with the same name will encrypt the same
+- filenames which start the same won't have a common prefix
+
+A version string of the form `-vYYYY-MM-DD-HHMMSS-NNN` on the end of a
+file name (as added by `--b2-versions` / `--s3-versions`) is left in
+plain text so that versioned files can be found. Directory names are
+encrypted in full. Rclone before v1.76 left such a suffix in plain
+text on directory names too, so a directory named like this created by
+an older rclone will appear in listings with a warning but can't be
+opened or removed until renamed on the underlying remote to the name
+given in the warning.
 
 This uses a 32 byte key (256 bits) and a 16 byte (128 bits) IV both of
 which are derived from the user password.
@@ -689,11 +829,11 @@ After encryption they are written out using a modified version of
 standard `base32` encoding as described in RFC4648.  The standard
 encoding is modified in two ways:
 
-  * it becomes lower case (no-one likes upper case filenames!)
-  * we strip the padding character `=`
+- it becomes lower case (no-one likes upper case filenames!)
+- we strip the padding character `=`
 
 `base32` is used rather than the more efficient `base64` so rclone can be
-used on case insensitive remotes (e.g. Windows, Amazon Drive).
+used on case insensitive remotes (e.g. Windows, Box, Dropbox, Onedrive etc).
 
 ### Key derivation
 
@@ -706,6 +846,7 @@ then rclone uses an internal one.
 encrypted data.  For full protection against this you should always use
 a salt.
 
-## SEE ALSO
+## See Also
 
-* [rclone cryptdecode](/commands/rclone_cryptdecode/)    - Show forward/reverse mapping of encrypted filenames
+- [rclone cryptdecode](/commands/rclone_cryptdecode/) - Show forward/reverse
+mapping of encrypted filenames.

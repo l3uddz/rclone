@@ -2,14 +2,15 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"math/bits"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/aalpar/deheap"
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/fserrors"
 )
 
@@ -55,7 +56,7 @@ func (p *pipe) Len() int {
 	return len(p.queue)
 }
 
-// Len satisfy heap.Interface - must be called with lock held
+// Less satisfies heap.Interface and must be called with the lock held.
 func (p *pipe) Less(i, j int) bool {
 	return p.less(p.queue[i], p.queue[j])
 }
@@ -66,12 +67,12 @@ func (p *pipe) Swap(i, j int) {
 }
 
 // Push satisfy heap.Interface - must be called with lock held
-func (p *pipe) Push(item interface{}) {
+func (p *pipe) Push(item any) {
 	p.queue = append(p.queue, item.(fs.ObjectPair))
 }
 
 // Pop satisfy heap.Interface - must be called with lock held
-func (p *pipe) Pop() interface{} {
+func (p *pipe) Pop() any {
 	old := p.queue
 	n := len(old)
 	item := old[n-1]
@@ -85,6 +86,8 @@ func (p *pipe) Pop() interface{} {
 // It returns ok = false if the context was cancelled
 //
 // It will panic if you call it after Close()
+//
+// Note that pairs where src==dst aren't counted for stats
 func (p *pipe) Put(ctx context.Context, pair fs.ObjectPair) (ok bool) {
 	if ctx.Err() != nil {
 		return false
@@ -97,7 +100,7 @@ func (p *pipe) Put(ctx context.Context, pair fs.ObjectPair) (ok bool) {
 		deheap.Push(p, pair)
 	}
 	size := pair.Src.Size()
-	if size > 0 {
+	if size > 0 && pair.Src != pair.Dst {
 		p.totalSize += size
 	}
 	p.stats(len(p.queue), p.totalSize)
@@ -141,7 +144,7 @@ func (p *pipe) GetMax(ctx context.Context, fraction int) (pair fs.ObjectPair, ok
 		pair = deheap.PopMax(p).(fs.ObjectPair)
 	}
 	size := pair.Src.Size()
-	if size > 0 {
+	if size > 0 && pair.Src != pair.Dst {
 		p.totalSize -= size
 	}
 	if p.totalSize < 0 {
@@ -185,8 +188,8 @@ func newLess(orderBy string) (less lessFn, fraction int, err error) {
 	if orderBy == "" {
 		return nil, fraction, nil
 	}
-	parts := strings.Split(strings.ToLower(orderBy), ",")
-	switch parts[0] {
+	parts := strings.Split(orderBy, ",")
+	switch strings.ToLower(parts[0]) {
 	case "name":
 		less = func(a, b fs.ObjectPair) bool {
 			return a.Src.Remote() < b.Src.Remote()
@@ -200,12 +203,44 @@ func newLess(orderBy string) (less lessFn, fraction int, err error) {
 			ctx := context.Background()
 			return a.Src.ModTime(ctx).Before(b.Src.ModTime(ctx))
 		}
+	case "pattern":
+		if len(parts) < 2 {
+			return nil, fraction, fmt.Errorf("pattern requires at least one glob")
+		}
+		matches := make([]func(string) bool, 0, len(parts)-1)
+		for _, glob := range parts[1:] {
+			if glob == "" {
+				return nil, fraction, fmt.Errorf("empty pattern glob")
+			}
+			re, err := filter.GlobPathToRegexp(glob, false)
+			if err != nil {
+				return nil, fraction, fmt.Errorf("bad pattern glob %q: %w", glob, err)
+			}
+			matches = append(matches, re.MatchString)
+		}
+		rank := func(remote string) int {
+			for i, match := range matches {
+				if match(remote) {
+					return i
+				}
+			}
+			return len(matches)
+		}
+		less = func(a, b fs.ObjectPair) bool {
+			aRemote, bRemote := a.Src.Remote(), b.Src.Remote()
+			aRank, bRank := rank(aRemote), rank(bRemote)
+			if aRank != bRank {
+				return aRank < bRank
+			}
+			return aRemote < bRemote
+		}
+		return less, fraction, nil
 	default:
-		return nil, fraction, errors.Errorf("unknown --order-by comparison %q", parts[0])
+		return nil, fraction, fmt.Errorf("unknown --order-by comparison %q", parts[0])
 	}
 	descending := false
 	if len(parts) > 1 {
-		switch parts[1] {
+		switch strings.ToLower(parts[1]) {
 		case "ascending", "asc":
 		case "descending", "desc":
 			descending = true
@@ -214,16 +249,16 @@ func newLess(orderBy string) (less lessFn, fraction int, err error) {
 			if len(parts) > 2 {
 				fraction, err = strconv.Atoi(parts[2])
 				if err != nil {
-					return nil, fraction, errors.Errorf("bad mixed fraction --order-by %q", parts[2])
+					return nil, fraction, fmt.Errorf("bad mixed fraction --order-by %q", parts[2])
 				}
 			}
 
 		default:
-			return nil, fraction, errors.Errorf("unknown --order-by sort direction %q", parts[1])
+			return nil, fraction, fmt.Errorf("unknown --order-by sort direction %q", parts[1])
 		}
 	}
 	if (fraction >= 0 && len(parts) > 3) || (fraction < 0 && len(parts) > 2) {
-		return nil, fraction, errors.Errorf("bad --order-by string %q", orderBy)
+		return nil, fraction, fmt.Errorf("bad --order-by string %q", orderBy)
 	}
 	if descending {
 		oldLess := less

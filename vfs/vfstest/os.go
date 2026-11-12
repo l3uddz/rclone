@@ -1,7 +1,6 @@
 package vfstest
 
 import (
-	"io/ioutil"
 	"os"
 	"time"
 
@@ -23,6 +22,8 @@ type Oser interface {
 	Remove(name string) error
 	Rename(oldName, newName string) error
 	Stat(path string) (os.FileInfo, error)
+	Symlink(oldname, newname string) error
+	Readlink(name string) (s string, err error)
 }
 
 // realOs is an implementation of Oser backed by the "os" package
@@ -47,6 +48,14 @@ func (f realOsFile) Release() error {
 // Node
 func (f realOsFile) Node() vfs.Node {
 	return nil
+}
+
+func (f realOsFile) Lock() error {
+	return os.ErrInvalid
+}
+
+func (f realOsFile) Unlock() error {
+	return os.ErrInvalid
 }
 
 // Chtimes
@@ -88,12 +97,24 @@ func (r realOs) OpenFile(name string, flags int, perm os.FileMode) (vfs.Handle, 
 
 // ReadDir
 func (r realOs) ReadDir(dirname string) ([]os.FileInfo, error) {
-	return ioutil.ReadDir(dirname)
+	entries, err := os.ReadDir(dirname)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]os.FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, info)
+	}
+	return infos, nil
 }
 
 // ReadFile
 func (r realOs) ReadFile(filename string) (b []byte, err error) {
-	return ioutil.ReadFile(filename)
+	return os.ReadFile(filename)
 }
 
 // Remove
@@ -109,6 +130,16 @@ func (r realOs) Rename(oldName, newName string) error {
 // Stat
 func (r realOs) Stat(path string) (os.FileInfo, error) {
 	return os.Stat(path)
+}
+
+// Symlink
+func (r realOs) Symlink(oldname, newname string) error {
+	return os.Symlink(oldname, newname)
+}
+
+// Readlink
+func (r realOs) Readlink(name string) (s string, err error) {
+	return os.Readlink(name)
 }
 
 // Check interfaces

@@ -1,8 +1,8 @@
+// Package putio provides an interface to the put.io storage system.
 package putio
 
 import (
 	"context"
-	"log"
 	"regexp"
 	"time"
 
@@ -13,7 +13,6 @@ import (
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
-	"golang.org/x/oauth2"
 )
 
 /*
@@ -34,18 +33,17 @@ const (
 	rcloneObscuredClientSecret = "cMwrjWVmrHZp3gf1ZpCrlyGAmPpB-YY5BbVnO1fj-G9evcd8"
 	minSleep                   = 10 * time.Millisecond
 	maxSleep                   = 2 * time.Second
-	decayConstant              = 2 // bigger for slower decay, exponential
-	defaultChunkSize           = 48 * fs.MebiByte
+	decayConstant              = 1 // bigger for slower decay, exponential
+	defaultChunkSize           = 48 * fs.Mebi
+	defaultRateLimitSleep      = 60 * time.Second
 )
 
 var (
 	// Description of how to auth for this app
-	putioConfig = &oauth2.Config{
-		Scopes: []string{},
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://api.put.io/v2/oauth2/authenticate",
-			TokenURL: "https://api.put.io/v2/oauth2/access_token",
-		},
+	putioConfig = &oauthutil.Config{
+		Scopes:       []string{},
+		AuthURL:      "https://api.put.io/v2/oauth2/authenticate",
+		TokenURL:     "https://api.put.io/v2/oauth2/access_token",
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneObscuredClientSecret),
 		RedirectURL:  oauthutil.RedirectLocalhostURL,
@@ -60,16 +58,13 @@ func init() {
 		Name:        "putio",
 		Description: "Put.io",
 		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper) {
-			opt := oauthutil.Options{
-				NoOffline: true,
-			}
-			err := oauthutil.Config(ctx, "putio", name, m, putioConfig, &opt)
-			if err != nil {
-				log.Fatalf("Failed to configure token: %v", err)
-			}
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+			return oauthutil.ConfigOut("", &oauthutil.Options{
+				OAuth2Config: putioConfig,
+				NoOffline:    true,
+			})
 		},
-		Options: []fs.Option{{
+		Options: append(oauthutil.SharedOptions, []fs.Option{{
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -79,7 +74,7 @@ func init() {
 			Default: (encoder.Display |
 				encoder.EncodeBackSlash |
 				encoder.EncodeInvalidUtf8),
-		}},
+		}}...),
 	})
 }
 

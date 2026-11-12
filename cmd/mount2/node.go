@@ -1,4 +1,4 @@
-// +build linux darwin,amd64
+//go:build linux || (darwin && amd64)
 
 package mount2
 
@@ -30,7 +30,7 @@ var _ fusefs.InodeEmbedder = (*Node)(nil)
 func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 	// Check the vfsNode to see if it has a fuse Node cached
 	// We must return the same fuse nodes for vfs Nodes
-	node, ok := vfsNode.Sys().(*Node)
+	node, ok := vfsNode.Aux(fsys).(*Node)
 	if ok {
 		return node
 	}
@@ -39,7 +39,7 @@ func newNode(fsys *FS, vfsNode vfs.Node) (node *Node) {
 		fsys: fsys,
 	}
 	// Cache the node for later
-	vfsNode.SetSys(node)
+	vfsNode.SetAux(fsys, node)
 	return node
 }
 
@@ -84,17 +84,16 @@ func (n *Node) lookupVfsNodeInDir(leaf string) (vfsNode vfs.Node, errno syscall.
 // will not work.
 func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	defer log.Trace(n, "")("out=%+v", &out)
-	out = new(fuse.StatfsOut)
 	const blockSize = 4096
-	const fsBlocks = (1 << 50) / blockSize
-	out.Blocks = fsBlocks  // Total data blocks in file system.
-	out.Bfree = fsBlocks   // Free blocks in file system.
-	out.Bavail = fsBlocks  // Free blocks in file system if you're not root.
-	out.Files = 1e9        // Total files in file system.
-	out.Ffree = 1e9        // Free files in file system.
-	out.Bsize = blockSize  // Block size
-	out.NameLen = 255      // Maximum file name length?
-	out.Frsize = blockSize // Fragment size, smallest addressable data size in the file system.
+	total, _, free := n.fsys.VFS.Statfs()
+	out.Blocks = uint64(total) / blockSize // Total data blocks in file system.
+	out.Bfree = uint64(free) / blockSize   // Free blocks in file system.
+	out.Bavail = out.Bfree                 // Free blocks in file system if you're not root.
+	out.Files = 1e9                        // Total files in file system.
+	out.Ffree = 1e9                        // Free files in file system.
+	out.Bsize = blockSize                  // Block size
+	out.NameLen = 255                      // Maximum file name length?
+	out.Frsize = blockSize                 // Fragment size, smallest addressable data size in the file system.
 	mountlib.ClipBlocks(&out.Blocks)
 	mountlib.ClipBlocks(&out.Bfree)
 	mountlib.ClipBlocks(&out.Bavail)
@@ -158,6 +157,9 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fu
 	if entry := n.node.DirEntry(); entry != nil && entry.Size() < 0 {
 		fuseFlags |= fuse.FOPEN_DIRECT_IO
 	}
+	if n.fsys.opt.DirectIO {
+		fuseFlags |= fuse.FOPEN_DIRECT_IO
+	}
 	return newFileHandle(handle, n.fsys), fuseFlags, 0
 }
 
@@ -199,7 +201,7 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (ino
 	// out.SetAttrTimeout(dt time.Duration)
 	n.fsys.setEntryOut(vfsNode, out)
 
-	return n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode}), 0
+	return n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()}), 0
 }
 
 var _ = (fusefs.NodeLookuper)((*Node)(nil))
@@ -225,7 +227,7 @@ type dirStream struct {
 // HasNext indicates if there are further entries. HasNext
 // might be called on already closed streams.
 func (ds *dirStream) HasNext() bool {
-	return ds.i < len(ds.nodes)
+	return ds.i < len(ds.nodes)+2
 }
 
 // Next retrieves the next entry. It is only called if HasNext
@@ -233,7 +235,22 @@ func (ds *dirStream) HasNext() bool {
 // indicate I/O errors
 func (ds *dirStream) Next() (de fuse.DirEntry, errno syscall.Errno) {
 	// defer log.Trace(nil, "")("de=%+v, errno=%v", &de, &errno)
-	fi := ds.nodes[ds.i]
+	if ds.i == 0 {
+		ds.i++
+		return fuse.DirEntry{
+			Mode: fuse.S_IFDIR,
+			Name: ".",
+			Ino:  0, // FIXME
+		}, 0
+	} else if ds.i == 1 {
+		ds.i++
+		return fuse.DirEntry{
+			Mode: fuse.S_IFDIR,
+			Name: "..",
+			Ino:  0, // FIXME
+		}, 0
+	}
+	fi := ds.nodes[ds.i-2]
 	de = fuse.DirEntry{
 		// Mode is the file's mode. Only the high bits (e.g. S_IFDIR)
 		// are considered.
@@ -254,7 +271,26 @@ func (ds *dirStream) Next() (de fuse.DirEntry, errno syscall.Errno) {
 func (ds *dirStream) Close() {
 }
 
+// Seekdir implements fusefs.FileSeekdirer so go-fuse can reposition the
+// directory stream. The kernel calls this both to rewind (lseek(fd, 0,
+// SEEK_SET) before a second getdents) and, for a kernel-NFS-exported mount,
+// to resume from a previously returned directory cookie: nfsd is stateless,
+// so it opens a fresh handle and seeks to the last offset on every readdir
+// continuation. Handling only offset 0 made go-fuse return ENOTSUP for those
+// resumes, so any listing spanning more than one readdir batch failed over NFS.
+//
+// dirStream is a snapshot taken at Readdir time and go-fuse assigns each entry
+// a sequential offset in Next() order (the entry yielded at index i carries
+// offset i+1), so repositioning to off means the next entry is the one at
+// index off. Values past the end clamp to EOF via HasNext.
+// See: https://github.com/hanwen/go-fuse/issues/549
+func (ds *dirStream) Seekdir(_ context.Context, off uint64) syscall.Errno {
+	ds.i = int(off)
+	return 0
+}
+
 var _ fusefs.DirStream = (*dirStream)(nil)
+var _ fusefs.FileSeekdirer = (*dirStream)(nil)
 
 // Readdir opens a stream of directory entries.
 //
@@ -307,7 +343,7 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	}
 	newNode := newNode(n.fsys, newDir)
 	n.fsys.setEntryOut(newNode.node, out)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode})
+	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()})
 	return newInode, 0
 }
 
@@ -349,11 +385,44 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	n.fsys.setEntryOut(vfsNode, out)
 	newNode := newNode(n.fsys, vfsNode)
 	fs.Debugf(nil, "attr=%#v", out.Attr)
-	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode})
+	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()})
 	return newInode, fh, 0, 0
 }
 
 var _ = (fusefs.NodeCreater)((*Node)(nil))
+
+// Mknod creates a regular file. The kernel NFS server creates regular files
+// with MKNOD (it creates-then-opens, so vfs_create routes through fuse_create
+// which sends FUSE_MKNOD when there is no open intent), so without this an
+// NFS-exported mount fails every file creation with ENOTSUPP. Local and SMB
+// clients create via Create (FUSE_CREATE) and are unaffected. This mirrors the
+// cmd/mount (bazil) backend, which implements mknod for the same reason
+// (see #2115).
+//
+// Device/special files are not supported by the VFS, so a non-zero rdev is
+// rejected. Mknod returns no open handle (unlike Create), so the handle Create
+// opens is flushed (to instantiate the file and surface any I/O error) and
+// released before returning.
+func (n *Node) Mknod(ctx context.Context, name string, mode uint32, rdev uint32, out *fuse.EntryOut) (node *fusefs.Inode, errno syscall.Errno) {
+	defer log.Trace(n, "name=%q, mode=%#o, rdev=%d", name, mode, rdev)("node=%v, errno=%v", &node, &errno)
+	if rdev != 0 {
+		fs.Errorf(n, "Can't create device node %q", name)
+		return nil, syscall.EIO
+	}
+	node, fh, _, errno := n.Create(ctx, name, uint32(os.O_CREATE|os.O_WRONLY), mode, out)
+	if errno != 0 {
+		return nil, errno
+	}
+	if fh != nil {
+		if errno := fh.(fusefs.FileFlusher).Flush(ctx); errno != 0 {
+			return nil, errno
+		}
+		_ = fh.(fusefs.FileReleaser).Release(ctx)
+	}
+	return node, 0
+}
+
+var _ = (fusefs.NodeMknoder)((*Node)(nil))
 
 // Unlink should remove a child from this directory.  If the
 // return status is OK, the Inode is removed as child in the
@@ -404,3 +473,68 @@ func (n *Node) Rename(ctx context.Context, oldName string, newParent fusefs.Inod
 }
 
 var _ = (fusefs.NodeRenamer)((*Node)(nil))
+
+// Getxattr should read data for the given attribute into
+// `dest` and return the number of bytes. If `dest` is too
+// small, it should return ERANGE and the size of the attribute.
+// If not defined, Getxattr will return ENOATTR.
+func (n *Node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	return 0, syscall.ENOSYS // we never implement this
+}
+
+var _ fusefs.NodeGetxattrer = (*Node)(nil)
+
+// Setxattr should store data for the given attribute.  See
+// setxattr(2) for information about flags.
+// If not defined, Setxattr will return ENOATTR.
+func (n *Node) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	return syscall.ENOSYS // we never implement this
+}
+
+var _ fusefs.NodeSetxattrer = (*Node)(nil)
+
+// Removexattr should delete the given attribute.
+// If not defined, Removexattr will return ENOATTR.
+func (n *Node) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	return syscall.ENOSYS // we never implement this
+}
+
+var _ fusefs.NodeRemovexattrer = (*Node)(nil)
+
+// Listxattr should read all attributes (null terminated) into
+// `dest`. If the `dest` buffer is too small, it should return ERANGE
+// and the correct size.  If not defined, return an empty list and
+// success.
+func (n *Node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	return 0, syscall.ENOSYS // we never implement this
+}
+
+var _ fusefs.NodeListxattrer = (*Node)(nil)
+
+var _ fusefs.NodeReadlinker = (*Node)(nil)
+
+// Readlink read symbolic link target.
+func (n *Node) Readlink(ctx context.Context) (ret []byte, err syscall.Errno) {
+	defer log.Trace(n, "")("ret=%v, err=%v", &ret, &err)
+	path := n.node.Path()
+	s, serr := n.node.VFS().Readlink(path)
+	return []byte(s), translateError(serr)
+}
+
+var _ fusefs.NodeSymlinker = (*Node)(nil)
+
+// Symlink create symbolic link.
+func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (node *fusefs.Inode, err syscall.Errno) {
+	defer log.Trace(n, "name=%v, target=%v", name, target)("node=%v, err=%v", &node, &err)
+	fullPath := path.Join(n.node.Path(), name)
+	vfsNode, serr := n.node.VFS().CreateSymlink(target, fullPath)
+	if serr != nil {
+		return nil, translateError(serr)
+	}
+
+	n.fsys.setEntryOut(vfsNode, out)
+	newNode := newNode(n.fsys, vfsNode)
+	newInode := n.NewInode(ctx, newNode, fusefs.StableAttr{Mode: out.Attr.Mode, Ino: newNode.node.Inode()})
+
+	return newInode, 0
+}

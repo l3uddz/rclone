@@ -2,34 +2,43 @@ package fserrors
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
-	"os"
-	"syscall"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 )
 
-var errUseOfClosedNetworkConnection = errors.New("use of closed network connection")
+// withMessage wraps an error with a message
+//
+// This is for backwards compatibility with the now removed github.com/pkg/errors
+type withMessage struct {
+	cause error
+	msg   string
+}
 
-// make a plausible network error with the underlying errno
-func makeNetErr(errno syscall.Errno) error {
-	return &net.OpError{
-		Op:     "write",
-		Net:    "tcp",
-		Source: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 123},
-		Addr:   &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080},
-		Err: &os.SyscallError{
-			Syscall: "write",
-			Err:     errno,
-		},
+func (w *withMessage) Error() string { return w.msg + ": " + w.cause.Error() }
+func (w *withMessage) Cause() error  { return w.cause }
+
+// wrap returns an error annotating err with a stack trace
+// at the point Wrap is called, and the supplied message.
+// If err is nil, Wrap returns nil.
+func wrap(err error, message string) error {
+	if err == nil {
+		return nil
+	}
+	return &withMessage{
+		cause: err,
+		msg:   message,
 	}
 }
+
+var errUseOfClosedNetworkConnection = errors.New("use of closed network connection")
+
+var errHTTP2GoAway = errors.New(`http2: server sent GOAWAY and closed the connection; LastStreamID=19999, ErrCode=NO_ERROR, debug=""`)
 
 type myError1 struct {
 	Err error
@@ -94,11 +103,9 @@ func TestCause(t *testing.T) {
 	}{
 		{nil, false, nil},
 		{errPotato, false, errPotato},
-		{errors.Wrap(errPotato, "potato"), false, errPotato},
-		{errors.Wrap(errors.Wrap(errPotato, "potato2"), "potato"), false, errPotato},
+		{fmt.Errorf("potato: %w", errPotato), false, errPotato},
+		{fmt.Errorf("potato2: %w", wrap(errPotato, "potato")), false, errPotato},
 		{errUseOfClosedNetworkConnection, false, errUseOfClosedNetworkConnection},
-		{makeNetErr(syscall.EAGAIN), true, syscall.EAGAIN},
-		{makeNetErr(syscall.Errno(123123123)), false, syscall.Errno(123123123)},
 		{eNil1, false, eNil1},
 		{eNil2, false, eNil2.Err},
 		{myError1{io.EOF}, false, io.EOF},
@@ -124,30 +131,14 @@ func TestShouldRetry(t *testing.T) {
 	}{
 		{nil, false},
 		{errors.New("potato"), false},
-		{errors.Wrap(errUseOfClosedNetworkConnection, "connection"), true},
+		{fmt.Errorf("connection: %w", errUseOfClosedNetworkConnection), true},
 		{io.EOF, true},
 		{io.ErrUnexpectedEOF, true},
-		{makeNetErr(syscall.EAGAIN), true},
-		{makeNetErr(syscall.Errno(123123123)), false},
 		{&url.Error{Op: "post", URL: "/", Err: io.EOF}, true},
 		{&url.Error{Op: "post", URL: "/", Err: errUseOfClosedNetworkConnection}, true},
 		{&url.Error{Op: "post", URL: "/", Err: fmt.Errorf("net/http: HTTP/1.x transport connection broken: %v", fmt.Errorf("http: ContentLength=%d with Body length %d", 100663336, 99590598))}, true},
-		{
-			errors.Wrap(&url.Error{
-				Op:  "post",
-				URL: "http://localhost/",
-				Err: makeNetErr(syscall.EPIPE),
-			}, "potato error"),
-			true,
-		},
-		{
-			errors.Wrap(&url.Error{
-				Op:  "post",
-				URL: "http://localhost/",
-				Err: makeNetErr(syscall.Errno(123123123)),
-			}, "listing error"),
-			false,
-		},
+		{errHTTP2GoAway, true},
+		{fmt.Errorf("operation error S3: ListObjectsV2, deserialization failed, failed to decode response body: %w", errHTTP2GoAway), true},
 	} {
 		got := ShouldRetry(test.err)
 		assert.Equal(t, test.want, got, fmt.Sprintf("test #%d: %v", i, test.err))
@@ -157,7 +148,7 @@ func TestShouldRetry(t *testing.T) {
 func TestRetryAfter(t *testing.T) {
 	e := NewErrorRetryAfter(time.Second)
 	after := e.RetryAfter()
-	dt := after.Sub(time.Now())
+	dt := time.Until(after)
 	assert.True(t, dt >= 900*time.Millisecond && dt <= 1100*time.Millisecond)
 	assert.True(t, IsRetryAfterError(e))
 	assert.False(t, IsRetryAfterError(io.EOF))
@@ -166,7 +157,7 @@ func TestRetryAfter(t *testing.T) {
 	assert.Contains(t, e.Error(), "try again after")
 
 	t0 := time.Now()
-	err := errors.Wrap(ErrorRetryAfter(t0), "potato")
+	err := fmt.Errorf("potato: %w", ErrorRetryAfter(t0))
 	assert.Equal(t, t0, RetryAfterErrorTime(err))
 	assert.True(t, IsRetryAfterError(err))
 	assert.Contains(t, e.Error(), "try again after")

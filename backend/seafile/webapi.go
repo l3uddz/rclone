@@ -3,17 +3,18 @@ package seafile
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/seafile/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -26,7 +27,7 @@ const (
 
 // Errors specific to seafile fs
 var (
-	ErrorInternalDuringUpload = errors.New("Internal server error during file upload")
+	ErrorInternalDuringUpload = errors.New("internal server error during file upload")
 )
 
 // ==================== Seafile API ====================
@@ -61,9 +62,9 @@ func getAuthorizationToken(ctx context.Context, srv *rest.Client, user, password
 	_, err := srv.CallJSON(ctx, &opts, &request, &result)
 	if err != nil {
 		// This is only going to be http errors here
-		return "", errors.Wrap(err, "failed to authenticate")
+		return "", fmt.Errorf("failed to authenticate: %w", err)
 	}
-	if result.Errors != nil && len(result.Errors) > 0 {
+	if len(result.Errors) > 0 {
 		return "", errors.New(strings.Join(result.Errors, ", "))
 	}
 	if result.Token == "" {
@@ -94,7 +95,7 @@ func (f *Fs) getServerInfo(ctx context.Context) (account *api.ServerInfo, err er
 				return nil, fs.ErrorPermissionDenied
 			}
 		}
-		return nil, errors.Wrap(err, "failed to get server info")
+		return nil, fmt.Errorf("failed to get server info: %w", err)
 	}
 	return &result, nil
 }
@@ -120,7 +121,7 @@ func (f *Fs) getUserAccountInfo(ctx context.Context) (account *api.AccountInfo, 
 				return nil, fs.ErrorPermissionDenied
 			}
 		}
-		return nil, errors.Wrap(err, "failed to get account info")
+		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
 	return &result, nil
 }
@@ -147,7 +148,7 @@ func (f *Fs) getLibraries(ctx context.Context) ([]api.Library, error) {
 				return nil, fs.ErrorPermissionDenied
 			}
 		}
-		return nil, errors.Wrap(err, "failed to get libraries")
+		return nil, fmt.Errorf("failed to get libraries: %w", err)
 	}
 	return result, nil
 }
@@ -178,7 +179,7 @@ func (f *Fs) createLibrary(ctx context.Context, libraryName, password string) (l
 				return nil, fs.ErrorPermissionDenied
 			}
 		}
-		return nil, errors.Wrap(err, "failed to create library")
+		return nil, fmt.Errorf("failed to create library: %w", err)
 	}
 	return result, nil
 }
@@ -205,7 +206,7 @@ func (f *Fs) deleteLibrary(ctx context.Context, libraryID string) error {
 				return fs.ErrorPermissionDenied
 			}
 		}
-		return errors.Wrap(err, "failed to delete library")
+		return fmt.Errorf("failed to delete library: %w", err)
 	}
 	return nil
 }
@@ -240,7 +241,7 @@ func (f *Fs) decryptLibrary(ctx context.Context, libraryID, password string) err
 				return nil
 			}
 		}
-		return errors.Wrap(err, "failed to decrypt library")
+		return fmt.Errorf("failed to decrypt library: %w", err)
 	}
 	return nil
 }
@@ -286,7 +287,7 @@ func (f *Fs) getDirectoryEntriesAPIv21(ctx context.Context, libraryID, dirPath s
 				return nil, fs.ErrorPermissionDenied
 			}
 		}
-		return nil, errors.Wrap(err, "failed to get directory contents")
+		return nil, fmt.Errorf("failed to get directory contents: %w", err)
 	}
 
 	// Clean up encoded names
@@ -327,7 +328,7 @@ func (f *Fs) getDirectoryDetails(ctx context.Context, libraryID, dirPath string)
 				return nil, fs.ErrorDirNotFound
 			}
 		}
-		return nil, errors.Wrap(err, "failed to get directory details")
+		return nil, fmt.Errorf("failed to get directory details: %w", err)
 	}
 	result.Name = f.opt.Enc.ToStandardName(result.Name)
 	result.Path = f.opt.Enc.ToStandardPath(result.Path)
@@ -366,7 +367,7 @@ func (f *Fs) createDir(ctx context.Context, libraryID, dirPath string) error {
 				return fs.ErrorPermissionDenied
 			}
 		}
-		return errors.Wrap(err, "failed to create directory")
+		return fmt.Errorf("failed to create directory: %w", err)
 	}
 	return nil
 }
@@ -406,7 +407,7 @@ func (f *Fs) renameDir(ctx context.Context, libraryID, dirPath, newName string) 
 				return fs.ErrorPermissionDenied
 			}
 		}
-		return errors.Wrap(err, "failed to rename directory")
+		return fmt.Errorf("failed to rename directory: %w", err)
 	}
 	return nil
 }
@@ -449,7 +450,7 @@ func (f *Fs) moveDir(ctx context.Context, srcLibraryID, srcDir, srcName, dstLibr
 				return fs.ErrorObjectNotFound
 			}
 		}
-		return errors.Wrap(err, fmt.Sprintf("failed to move directory '%s' from '%s' to '%s'", srcName, srcDir, dstPath))
+		return fmt.Errorf("failed to move directory '%s' from '%s' to '%s': %w", srcName, srcDir, dstPath, err)
 	}
 
 	return nil
@@ -482,7 +483,7 @@ func (f *Fs) deleteDir(ctx context.Context, libraryID, filePath string) error {
 				return fs.ErrorPermissionDenied
 			}
 		}
-		return errors.Wrap(err, "failed to delete directory")
+		return fmt.Errorf("failed to delete directory: %w", err)
 	}
 	return nil
 }
@@ -516,7 +517,7 @@ func (f *Fs) getFileDetails(ctx context.Context, libraryID, filePath string) (*a
 				return nil, fs.ErrorPermissionDenied
 			}
 		}
-		return nil, errors.Wrap(err, "failed to get file details")
+		return nil, fmt.Errorf("failed to get file details: %w", err)
 	}
 	result.Name = f.opt.Enc.ToStandardName(result.Name)
 	result.Parent = f.opt.Enc.ToStandardPath(result.Parent)
@@ -542,7 +543,7 @@ func (f *Fs) deleteFile(ctx context.Context, libraryID, filePath string) error {
 		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return errors.Wrap(err, "failed to delete file")
+		return fmt.Errorf("failed to delete file: %w", err)
 	}
 	return nil
 }
@@ -573,12 +574,12 @@ func (f *Fs) getDownloadLink(ctx context.Context, libraryID, filePath string) (s
 				return "", fs.ErrorObjectNotFound
 			}
 		}
-		return "", errors.Wrap(err, "failed to get download link")
+		return "", fmt.Errorf("failed to get download link: %w", err)
 	}
 	return result, nil
 }
 
-func (f *Fs) download(ctx context.Context, url string, size int64, options ...fs.OpenOption) (io.ReadCloser, error) {
+func (f *Fs) download(ctx context.Context, downloadLink string, size int64, options ...fs.OpenOption) (io.ReadCloser, error) {
 	// Check if we need to download partial content
 	var start, end int64 = 0, size
 	partialContent := false
@@ -607,11 +608,18 @@ func (f *Fs) download(ctx context.Context, url string, size int64, options ...fs
 	// Build the http request
 	opts := rest.Opts{
 		Method:  "GET",
-		RootURL: url,
 		Options: options,
 	}
+	parsedURL, err := url.Parse(downloadLink)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse download url: %w", err)
+	}
+	if parsedURL.IsAbs() {
+		opts.RootURL = downloadLink
+	} else {
+		opts.Path = downloadLink
+	}
 	var resp *http.Response
-	var err error
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
 		return f.shouldRetry(ctx, resp, err)
@@ -619,7 +627,7 @@ func (f *Fs) download(ctx context.Context, url string, size int64, options ...fs
 	if err != nil {
 		if resp != nil {
 			if resp.StatusCode == 404 {
-				return nil, fmt.Errorf("file not found '%s'", url)
+				return nil, fmt.Errorf("file not found '%s'", downloadLink)
 			}
 		}
 		return nil, err
@@ -633,7 +641,7 @@ func (f *Fs) download(ctx context.Context, url string, size int64, options ...fs
 		})
 		if start > 0 {
 			// We need to read and discard the beginning of the data...
-			_, err = io.CopyN(ioutil.Discard, resp.Body, start)
+			_, err = io.CopyN(io.Discard, resp.Body, start)
 			if err != nil {
 				return nil, err
 			}
@@ -667,12 +675,12 @@ func (f *Fs) getUploadLink(ctx context.Context, libraryID string) (string, error
 				return "", fs.ErrorPermissionDenied
 			}
 		}
-		return "", errors.Wrap(err, "failed to get upload link")
+		return "", fmt.Errorf("failed to get upload link: %w", err)
 	}
 	return result, nil
 }
 
-func (f *Fs) upload(ctx context.Context, in io.Reader, uploadLink, filePath string) (*api.FileDetail, error) {
+func (f *Fs) upload(ctx context.Context, in io.Reader, uploadLink, filePath string, modTime time.Time) (*api.FileDetail, error) {
 	// API Documentation
 	// https://download.seafile.com/published/web-api/v2.1/file-upload.md
 	fileDir, filename := path.Split(filePath)
@@ -682,17 +690,30 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, uploadLink, filePath stri
 		"need_idx_progress": {"true"},
 		"replace":           {"1"},
 	}
-	formReader, contentType, _, err := rest.MultipartUpload(ctx, in, parameters, "file", f.opt.Enc.FromStandardName(filename))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to make multipart upload")
+	if f.uploadModTime && !modTime.IsZero() {
+		parameters.Set("last_modify", modTime.UTC().Format(time.RFC3339))
 	}
+	formReader, contentType, _, err := rest.MultipartUpload(ctx, in, parameters, "file", f.opt.Enc.FromStandardName(filename), "application/octet-stream")
+	if err != nil {
+		return nil, fmt.Errorf("failed to make multipart upload: %w", err)
+	}
+	// Stop the form writer reading in if the request fails before sending it all
+	defer func() { _ = formReader.Close() }()
 
 	opts := rest.Opts{
 		Method:      "POST",
-		RootURL:     uploadLink,
 		Body:        formReader,
 		ContentType: contentType,
 		Parameters:  url.Values{"ret-json": {"1"}}, // It needs to be on the url, not in the body parameters
+	}
+	parsedURL, err := url.Parse(uploadLink)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse upload url: %w", err)
+	}
+	if parsedURL.IsAbs() {
+		opts.RootURL = uploadLink
+	} else {
+		opts.Path = uploadLink
 	}
 	result := make([]api.FileDetail, 1)
 	var resp *http.Response
@@ -707,11 +728,11 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, uploadLink, filePath stri
 				return nil, fs.ErrorPermissionDenied
 			}
 			if resp.StatusCode == 500 {
-				// This is a temporary error - we will get a new upload link before retrying
-				return nil, ErrorInternalDuringUpload
+				// This is a temporary error - the caller will get a new upload link when it retries
+				return nil, fserrors.RetryError(ErrorInternalDuringUpload)
 			}
 		}
-		return nil, errors.Wrap(err, "failed to upload file")
+		return nil, fmt.Errorf("failed to upload file: %w", err)
 	}
 	if len(result) > 0 {
 		result[0].Parent = f.opt.Enc.ToStandardPath(result[0].Parent)
@@ -750,7 +771,7 @@ func (f *Fs) listShareLinks(ctx context.Context, libraryID, remote string) ([]ap
 				return nil, fs.ErrorObjectNotFound
 			}
 		}
-		return nil, errors.Wrap(err, "failed to list shared links")
+		return nil, fmt.Errorf("failed to list shared links: %w", err)
 	}
 	return result, nil
 }
@@ -788,7 +809,7 @@ func (f *Fs) createShareLink(ctx context.Context, libraryID, remote string) (*ap
 				return nil, fs.ErrorObjectNotFound
 			}
 		}
-		return nil, errors.Wrap(err, "failed to create a shared link")
+		return nil, fmt.Errorf("failed to create a shared link: %w", err)
 	}
 	return result, nil
 }
@@ -830,7 +851,7 @@ func (f *Fs) copyFile(ctx context.Context, srcLibraryID, srcPath, dstLibraryID, 
 				return nil, fs.ErrorObjectNotFound
 			}
 		}
-		return nil, errors.Wrap(err, fmt.Sprintf("failed to copy file %s:'%s' to %s:'%s'", srcLibraryID, srcPath, dstLibraryID, dstPath))
+		return nil, fmt.Errorf("failed to copy file %s:'%s' to %s:'%s': %w", srcLibraryID, srcPath, dstLibraryID, dstPath, err)
 	}
 	return f.decodeFileInfo(result), nil
 }
@@ -872,7 +893,7 @@ func (f *Fs) moveFile(ctx context.Context, srcLibraryID, srcPath, dstLibraryID, 
 				return nil, fs.ErrorObjectNotFound
 			}
 		}
-		return nil, errors.Wrap(err, fmt.Sprintf("failed to move file %s:'%s' to %s:'%s'", srcLibraryID, srcPath, dstLibraryID, dstPath))
+		return nil, fmt.Errorf("failed to move file %s:'%s' to %s:'%s': %w", srcLibraryID, srcPath, dstLibraryID, dstPath, err)
 	}
 	return f.decodeFileInfo(result), nil
 }
@@ -912,7 +933,7 @@ func (f *Fs) renameFile(ctx context.Context, libraryID, filePath, newname string
 				return nil, fs.ErrorObjectNotFound
 			}
 		}
-		return nil, errors.Wrap(err, fmt.Sprintf("failed to rename file '%s' to '%s'", filePath, newname))
+		return nil, fmt.Errorf("failed to rename file '%s' to '%s': %w", filePath, newname, err)
 	}
 	return f.decodeFileInfo(result), nil
 }
@@ -949,16 +970,14 @@ func (f *Fs) emptyLibraryTrash(ctx context.Context, libraryID string) error {
 				return fs.ErrorObjectNotFound
 			}
 		}
-		return errors.Wrap(err, "failed empty the library trash")
+		return fmt.Errorf("failed empty the library trash: %w", err)
 	}
 	return nil
 }
 
-// === API v2 from the official documentation, but that have been replaced by the much better v2.1 (undocumented as of Apr 2020)
-// === getDirectoryEntriesAPIv2 is needed to keep compatibility with seafile v6,
-// === the others can probably be removed after the API v2.1 is documented
-
 func (f *Fs) getDirectoryEntriesAPIv2(ctx context.Context, libraryID, dirPath string) ([]api.DirEntry, error) {
+	// API v2 from the official documentation, but that have been replaced by the much better v2.1 (undocumented as of Apr 2020)
+	// getDirectoryEntriesAPIv2 is needed to keep compatibility with seafile v6.
 	// API Documentation
 	// https://download.seafile.com/published/web-api/v2.1/directories.md#user-content-List%20Items%20in%20Directory
 	if libraryID == "" {
@@ -991,7 +1010,7 @@ func (f *Fs) getDirectoryEntriesAPIv2(ctx context.Context, libraryID, dirPath st
 				return nil, fs.ErrorPermissionDenied
 			}
 		}
-		return nil, errors.Wrap(err, "failed to get directory contents")
+		return nil, fmt.Errorf("failed to get directory contents: %w", err)
 	}
 
 	// Clean up encoded names
@@ -1001,96 +1020,4 @@ func (f *Fs) getDirectoryEntriesAPIv2(ctx context.Context, libraryID, dirPath st
 		result[index] = fileInfo
 	}
 	return result, nil
-}
-
-func (f *Fs) copyFileAPIv2(ctx context.Context, srcLibraryID, srcPath, dstLibraryID, dstPath string) (*api.FileInfo, error) {
-	// API Documentation
-	// https://download.seafile.com/published/web-api/v2.1/file.md#user-content-Copy%20File
-	if srcLibraryID == "" || dstLibraryID == "" {
-		return nil, errors.New("libraryID and/or file path argument(s) missing")
-	}
-	srcPath = path.Join("/", srcPath)
-	dstPath = path.Join("/", dstPath)
-
-	// Older API does not seem to accept JSON input here either
-	postParameters := url.Values{
-		"operation": {"copy"},
-		"dst_repo":  {dstLibraryID},
-		"dst_dir":   {f.opt.Enc.FromStandardPath(dstPath)},
-	}
-	opts := rest.Opts{
-		Method:      "POST",
-		Path:        APIv20 + srcLibraryID + "/file/",
-		Parameters:  url.Values{"p": {f.opt.Enc.FromStandardPath(srcPath)}},
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        bytes.NewBuffer([]byte(postParameters.Encode())),
-	}
-	result := &api.FileInfo{}
-	var resp *http.Response
-	var err error
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.Call(ctx, &opts)
-		return f.shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		if resp != nil {
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
-				return nil, fs.ErrorPermissionDenied
-			}
-		}
-		return nil, errors.Wrap(err, fmt.Sprintf("failed to copy file %s:'%s' to %s:'%s'", srcLibraryID, srcPath, dstLibraryID, dstPath))
-	}
-	err = rest.DecodeJSON(resp, &result)
-	if err != nil {
-		return nil, err
-	}
-	return f.decodeFileInfo(result), nil
-}
-
-func (f *Fs) renameFileAPIv2(ctx context.Context, libraryID, filePath, newname string) error {
-	// API Documentation
-	// https://download.seafile.com/published/web-api/v2.1/file.md#user-content-Rename%20File
-	if libraryID == "" || newname == "" {
-		return errors.New("libraryID and/or file path argument(s) missing")
-	}
-	filePath = path.Join("/", filePath)
-
-	// No luck with JSON input with the older api2
-	postParameters := url.Values{
-		"operation": {"rename"},
-		"reloaddir": {"true"}, // This is an undocumented trick to avoid an http code 301 response (found in https://github.com/haiwen/seahub/blob/master/seahub/api2/views.py)
-		"newname":   {f.opt.Enc.FromStandardName(newname)},
-	}
-
-	opts := rest.Opts{
-		Method:      "POST",
-		Path:        APIv20 + libraryID + "/file/",
-		Parameters:  url.Values{"p": {f.opt.Enc.FromStandardPath(filePath)}},
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        bytes.NewBuffer([]byte(postParameters.Encode())),
-		NoRedirect:  true,
-		NoResponse:  true,
-	}
-	var resp *http.Response
-	var err error
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.Call(ctx, &opts)
-		return f.shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		if resp != nil {
-			if resp.StatusCode == 301 {
-				// This is the normal response from the server
-				return nil
-			}
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
-				return fs.ErrorPermissionDenied
-			}
-			if resp.StatusCode == 404 {
-				return fs.ErrorObjectNotFound
-			}
-		}
-		return errors.Wrap(err, "failed to rename file")
-	}
-	return nil
 }

@@ -2,15 +2,16 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/vfs/vfscache/writeback"
 )
 
 const getVFSHelp = ` 
@@ -44,9 +45,9 @@ func getVFS(in rc.Params) (vfs *VFS, err error) {
 	fsString = cache.Canonicalize(fsString)
 	activeVFS := active[fsString]
 	if len(activeVFS) == 0 {
-		return nil, errors.Errorf("no VFS found with name %q", fsString)
+		return nil, fmt.Errorf("no VFS found with name %q", fsString)
 	} else if len(activeVFS) > 1 {
-		return nil, errors.Errorf("more than one VFS active with name %q", fsString)
+		return nil, fmt.Errorf("more than one VFS active with name %q", fsString)
 	}
 	delete(in, "fs") // delete the fs parameter
 	return activeVFS[0], nil
@@ -111,11 +112,11 @@ func rcRefresh(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		if v, ok := in[k]; ok {
 			s, ok := v.(string)
 			if !ok {
-				return out, errors.Errorf("value must be string %q=%v", k, v)
+				return out, fmt.Errorf("value must be string %q=%v", k, v)
 			}
 			recursive, err = strconv.ParseBool(s)
 			if err != nil {
-				return out, errors.Errorf("invalid value %q=%v", k, v)
+				return out, fmt.Errorf("invalid value %q=%v", k, v)
 			}
 			delete(in, k)
 		}
@@ -137,7 +138,7 @@ func rcRefresh(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		for k, v := range in {
 			path, ok := v.(string)
 			if !ok {
-				return out, errors.Errorf("value must be string %q=%v", k, v)
+				return out, fmt.Errorf("value must be string %q=%v", k, v)
 			}
 			if strings.HasPrefix(k, "dir") {
 				dir, err := getDir(path)
@@ -156,7 +157,7 @@ func rcRefresh(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 					}
 				}
 			} else {
-				return out, errors.Errorf("unknown key %q", k)
+				return out, fmt.Errorf("unknown key %q", k)
 			}
 		}
 	}
@@ -208,7 +209,7 @@ func rcForget(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		for k, v := range in {
 			path, ok := v.(string)
 			if !ok {
-				return out, errors.Errorf("value must be string %q=%v", k, v)
+				return out, fmt.Errorf("value must be string %q=%v", k, v)
 			}
 			path = strings.Trim(path, "/")
 			if strings.HasPrefix(k, "file") {
@@ -216,7 +217,7 @@ func rcForget(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 			} else if strings.HasPrefix(k, "dir") {
 				root.ForgetPath(path, fs.EntryDirectory)
 			} else {
-				return out, errors.Errorf("unknown key %q", k)
+				return out, fmt.Errorf("unknown key %q", k)
 			}
 			forgotten = append(forgotten, path)
 		}
@@ -227,14 +228,14 @@ func rcForget(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	return out, nil
 }
 
-func getDuration(k string, v interface{}) (time.Duration, error) {
+func getDuration(k string, v any) (time.Duration, error) {
 	s, ok := v.(string)
 	if !ok {
-		return 0, errors.Errorf("value must be string %q=%v", k, v)
+		return 0, fmt.Errorf("value must be string %q=%v", k, v)
 	}
 	interval, err := fs.ParseDuration(s)
 	if err != nil {
-		return 0, errors.Wrap(err, "parse duration")
+		return 0, fmt.Errorf("parse duration: %w", err)
 	}
 	return interval, nil
 }
@@ -272,17 +273,45 @@ func getTimeout(in rc.Params) (time.Duration, error) {
 
 func getStatus(vfs *VFS, in rc.Params) (out rc.Params, err error) {
 	for k, v := range in {
-		return nil, errors.Errorf("invalid parameter: %s=%s", k, v)
+		return nil, fmt.Errorf("invalid parameter: %s=%s", k, v)
 	}
+	vfs.pollMu.Lock()
+	defer vfs.pollMu.Unlock()
 	return rc.Params{
 		"enabled":   vfs.Opt.PollInterval != 0,
 		"supported": vfs.pollChan != nil,
-		"interval": map[string]interface{}{
+		"interval": map[string]any{
 			"raw":     vfs.Opt.PollInterval,
-			"seconds": vfs.Opt.PollInterval / time.Second,
+			"seconds": time.Duration(vfs.Opt.PollInterval) / time.Second,
 			"string":  vfs.Opt.PollInterval.String(),
 		},
 	}, nil
+}
+
+func setPollInterval(vfs *VFS, interval, timeout time.Duration) (timeoutHit bool, err error) {
+	vfs.pollMu.Lock()
+	defer vfs.pollMu.Unlock()
+	if vfs.ctx.Err() != nil {
+		return false, errors.New("VFS is shutting down")
+	}
+	if vfs.pollChan == nil {
+		return false, errors.New("poll-interval is not supported by this remote")
+	}
+	var timeoutChan <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutChan = timer.C
+	}
+	select {
+	case vfs.pollChan <- interval:
+		vfs.Opt.PollInterval = fs.Duration(interval)
+	case <-timeoutChan:
+		timeoutHit = true
+	case <-vfs.ctx.Done():
+		return false, errors.New("VFS is shutting down")
+	}
+	return timeoutHit, nil
 }
 
 func init() {
@@ -329,27 +358,20 @@ func rcPollInterval(ctx context.Context, in rc.Params) (out rc.Params, err error
 		return nil, err
 	}
 	for k, v := range in {
-		return nil, errors.Errorf("invalid parameter: %s=%s", k, v)
+		return nil, fmt.Errorf("invalid parameter: %s=%s", k, v)
 	}
-	if vfs.pollChan == nil {
-		return nil, errors.New("poll-interval is not supported by this remote")
-	}
-
 	if !intervalPresent {
+		vfs.pollMu.Lock()
+		supported := vfs.pollChan != nil
+		vfs.pollMu.Unlock()
+		if !supported {
+			return nil, errors.New("poll-interval is not supported by this remote")
+		}
 		return getStatus(vfs, in)
 	}
-	var timeoutHit bool
-	var timeoutChan <-chan time.Time
-	if timeout > 0 {
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-		timeoutChan = timer.C
-	}
-	select {
-	case vfs.pollChan <- interval:
-		vfs.Opt.PollInterval = interval
-	case <-timeoutChan:
-		timeoutHit = true
+	timeoutHit, err := setPollInterval(vfs, interval, timeout)
+	if err != nil {
+		return nil, err
 	}
 	out, err = getStatus(vfs, in)
 	if out != nil {
@@ -360,8 +382,9 @@ func rcPollInterval(ctx context.Context, in rc.Params) (out rc.Params, err error
 
 func init() {
 	rc.Add(rc.Call{
-		Path:  "vfs/list",
-		Title: "List active VFSes.",
+		Path:   "vfs/list",
+		NoAuth: true,
+		Title:  "List active VFSes.",
 		Help: `
 This lists the active VFSes.
 
@@ -388,4 +411,170 @@ func rcList(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	out = rc.Params{}
 	out["vfses"] = names
 	return out, nil
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:   "vfs/stats",
+		NoAuth: true,
+		Title:  "Stats for a VFS.",
+		Help: `
+This returns stats for the selected VFS.
+
+    {
+        // Status of the disk cache - only present if --vfs-cache-mode > off
+        "diskCache": {
+            "bytesUsed": 0,
+            "erroredFiles": 0,
+            "files": 0,
+            "hashType": 1,
+            "outOfSpace": false,
+            "path": "/home/user/.cache/rclone/vfs/local/mnt/a",
+            "pathMeta": "/home/user/.cache/rclone/vfsMeta/local/mnt/a",
+            "uploadsInProgress": 0,
+            "uploadsQueued": 0
+        },
+        "fs": "/mnt/a",
+        "inUse": 1,
+        // Status of the in memory metadata cache
+        "metadataCache": {
+            "dirs": 1,
+            "files": 0
+        },
+        // Options as returned by options/get
+        "opt": {
+            "CacheMaxAge": 3600000000000,
+            // ...
+            "WriteWait": 1000000000
+        }
+    }
+
+` + getVFSHelp,
+		Fn: rcStats,
+	})
+}
+
+func rcStats(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+	return vfs.Stats(), nil
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:   "vfs/queue",
+		NoAuth: true,
+		Title:  "Queue info for a VFS.",
+		Help: strings.ReplaceAll(`
+This returns info about the upload queue for the selected VFS.
+
+This is only useful if |--vfs-cache-mode| > off. If you call it when
+the |--vfs-cache-mode| is off, it will return an empty result.
+
+    {
+        "queue": // an array of files queued for upload
+        [
+            {
+                "name":      "file",   // string: name (full path) of the file,
+                "id":        123,      // integer: id of this item in the queue,
+                "size":      79,       // integer: size of the file in bytes
+                "expiry":    1.5       // float: time until file is eligible for transfer, lowest goes first
+                "tries":     1,        // integer: number of times we have tried to upload
+                "delay":     5.0,      // float: seconds between upload attempts
+                "uploading": false,    // boolean: true if item is being uploaded
+            },
+       ],
+    }
+
+The |expiry| time is the time until the file is eligible for being
+uploaded in floating point seconds. This may go negative. As rclone
+only transfers |--transfers| files at once, only the lowest
+|--transfers| expiry times will have |uploading| as |true|. So there
+may be files with negative expiry times for which |uploading| is
+|false|.
+
+`, "|", "`") + getVFSHelp,
+		Fn: rcQueue,
+	})
+}
+
+func rcQueue(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+	if vfs.cache == nil {
+		return nil, nil
+	}
+	return vfs.cache.Queue(), nil
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:  "vfs/queue-set-expiry",
+		Title: "Set the expiry time for an item queued for upload.",
+		Help: strings.ReplaceAll(`
+
+Use this to adjust the |expiry| time for an item in the upload queue.
+You will need to read the |id| of the item using |vfs/queue| before
+using this call.
+
+You can then set |expiry| to a floating point number of seconds from
+now when the item is eligible for upload. If you want the item to be
+uploaded as soon as possible then set it to a large negative number (eg
+-1000000000). If you want the upload of the item to be delayed
+for a long time then set it to a large positive number.
+
+Setting the |expiry| of an item which has already has started uploading
+will have no effect - the item will carry on being uploaded.
+
+This will return an error if called with |--vfs-cache-mode| off or if
+the |id| passed is not found.
+
+This takes the following parameters
+
+- |fs| - select the VFS in use (optional)
+- |id| - a numeric ID as returned from |vfs/queue|
+- |expiry| - a new expiry time as floating point seconds
+- |relative| - if set, expiry is to be treated as relative to the current expiry (optional, boolean)
+
+This returns an empty result on success, or an error.
+
+`, "|", "`") + getVFSHelp,
+		Fn: rcQueueSetExpiry,
+	})
+}
+
+func rcQueueSetExpiry(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	vfs, err := getVFS(in)
+	if err != nil {
+		return nil, err
+	}
+	if vfs.cache == nil {
+		return nil, rc.NewErrParamInvalid(errors.New("can't call this unless using the VFS cache"))
+	}
+
+	// Read input values
+	id, err := in.GetInt64("id")
+	if err != nil {
+		return nil, err
+	}
+	expiry, err := in.GetFloat64("expiry")
+	if err != nil {
+		return nil, err
+	}
+	relative, err := in.GetBool("relative")
+	if err != nil && !rc.IsErrParamNotFound(err) {
+		return nil, err
+	}
+
+	// Set expiry
+	var refTime time.Time
+	if !relative {
+		refTime = time.Now()
+	}
+	err = vfs.cache.QueueSetExpiry(writeback.Handle(id), refTime, time.Duration(float64(time.Second)*expiry))
+	return nil, err
 }

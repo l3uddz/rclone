@@ -1,6 +1,6 @@
 // Test HDFS filesystem interface
 
-// +build !plan9
+//go:build !plan9
 
 package hdfs_test
 

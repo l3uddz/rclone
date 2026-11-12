@@ -4,11 +4,10 @@ package configmap
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"unicode"
-
-	"github.com/pkg/errors"
 )
 
 // Priority of getters
@@ -137,9 +136,11 @@ func (c Simple) Set(key, value string) {
 	c[key] = value
 }
 
-// String the map value the same way the config parser does, but with
-// sorted keys for reproducability.
-func (c Simple) String() string {
+// string the map value the same way the config parser does, but with
+// sorted keys for reproducibility.
+//
+// If human is set then use fewer quotes.
+func (c Simple) string(human bool) string {
 	var ks = make([]string, 0, len(c))
 	for k := range c {
 		ks = append(ks, k)
@@ -151,18 +152,39 @@ func (c Simple) String() string {
 			out.WriteRune(',')
 		}
 		out.WriteString(k)
-		out.WriteRune('=')
-		out.WriteRune('\'')
-		for _, ch := range c[k] {
-			out.WriteRune(ch)
-			// Escape ' as ''
-			if ch == '\'' {
-				out.WriteRune(ch)
-			}
+		v := c[k]
+		if human && v == "true" {
+			continue
 		}
-		out.WriteRune('\'')
+		out.WriteRune('=')
+		if !human || strings.ContainsAny(v, `'":=,`) {
+			out.WriteRune('\'')
+			for _, ch := range v {
+				out.WriteRune(ch)
+				// Escape ' as ''
+				if ch == '\'' {
+					out.WriteRune(ch)
+				}
+			}
+			out.WriteRune('\'')
+		} else {
+			out.WriteString(v)
+		}
 	}
 	return out.String()
+}
+
+// Human converts the map value the same way the config parser does,
+// but with sorted keys for reproducibility. This does it in human
+// readable form with fewer quotes.
+func (c Simple) Human() string {
+	return c.string(true)
+}
+
+// String the map value the same way the config parser does, but with
+// sorted keys for reproducibility.
+func (c Simple) String() string {
+	return c.string(false)
 }
 
 // Encode from c into a string suitable for putting on the command line
@@ -172,7 +194,7 @@ func (c Simple) Encode() (string, error) {
 	}
 	buf, err := json.Marshal(c)
 	if err != nil {
-		return "", errors.Wrap(err, "encode simple map")
+		return "", fmt.Errorf("encode simple map: %w", err)
 	}
 	return base64.RawStdEncoding.EncodeToString(buf), nil
 }
@@ -191,11 +213,11 @@ func (c Simple) Decode(in string) error {
 	}
 	decodedM, err := base64.RawStdEncoding.DecodeString(in)
 	if err != nil {
-		return errors.Wrap(err, "decode simple map")
+		return fmt.Errorf("decode simple map: %w", err)
 	}
 	err = json.Unmarshal(decodedM, &c)
 	if err != nil {
-		return errors.Wrap(err, "parse simple map")
+		return fmt.Errorf("parse simple map: %w", err)
 	}
 	return nil
 }

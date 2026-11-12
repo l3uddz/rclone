@@ -3,7 +3,6 @@ package filter
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
@@ -24,13 +23,46 @@ func TestNewFilterDefault(t *testing.T) {
 	assert.Equal(t, fs.SizeSuffix(-1), f.Opt.MaxSize)
 	assert.Len(t, f.fileRules.rules, 0)
 	assert.Len(t, f.dirRules.rules, 0)
+	assert.Len(t, f.metaRules.rules, 0)
 	assert.Nil(t, f.files)
 	assert.True(t, f.InActive())
 }
 
+func TestParseHashFilter(t *testing.T) {
+	for _, test := range []struct {
+		hashFilter string
+		n          uint64
+		k          uint64
+		err        string
+	}{
+		{hashFilter: "", err: "no / found"},
+		{hashFilter: "17", err: "no / found"},
+		{hashFilter: "-1/2", err: "can't parse K="},
+		{hashFilter: "1/-2", err: "can't parse N="},
+		{hashFilter: "0/0", err: "N must be greater than 0"},
+		{hashFilter: "0/18446744073709551615", k: 0, n: 18446744073709551615},
+		{hashFilter: "0/18446744073709551616", err: "can't parse N="},
+		{hashFilter: "18446744073709551615/1", k: 0, n: 1},
+		{hashFilter: "18446744073709551616/1", err: "can't parse K="},
+		{hashFilter: "1/2", k: 1, n: 2},
+		{hashFilter: "17/3", k: 2, n: 3},
+		{hashFilter: "@/1", k: 0, n: 1},
+	} {
+		gotK, gotN, gotErr := parseHashFilter(test.hashFilter)
+		if test.err != "" {
+			assert.Error(t, gotErr)
+			assert.ErrorContains(t, gotErr, test.err, test.hashFilter)
+		} else {
+			assert.Equal(t, test.k, gotK, test.hashFilter)
+			assert.Equal(t, test.n, gotN, test.hashFilter)
+			assert.NoError(t, gotErr, test.hashFilter)
+		}
+	}
+}
+
 // testFile creates a temp file with the contents
 func testFile(t *testing.T, contents string) string {
-	out, err := ioutil.TempFile("", "filter_test")
+	out, err := os.CreateTemp("", "filter_test")
 	require.NoError(t, err)
 	defer func() {
 		err := out.Close()
@@ -43,7 +75,7 @@ func testFile(t *testing.T, contents string) string {
 }
 
 func TestNewFilterForbiddenMixOfFilesFromAndFilterRule(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilterRule = []string{"- filter1", "- filter1b"}
@@ -62,11 +94,11 @@ func TestNewFilterForbiddenMixOfFilesFromAndFilterRule(t *testing.T) {
 
 	_, err := NewFilter(&Opt)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "The usage of --files-from overrides all other filters")
+	require.Contains(t, err.Error(), "the usage of --files-from overrides all other filters")
 }
 
 func TestNewFilterForbiddenMixOfFilesFromRawAndFilterRule(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilterRule = []string{"- filter1", "- filter1b"}
@@ -85,11 +117,11 @@ func TestNewFilterForbiddenMixOfFilesFromRawAndFilterRule(t *testing.T) {
 
 	_, err := NewFilter(&Opt)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "The usage of --files-from-raw overrides all other filters")
+	require.Contains(t, err.Error(), "the usage of --files-from-raw overrides all other filters")
 }
 
 func TestNewFilterWithFilesFromAlone(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilesFrom = []string{testFile(t, "#comment\nfiles1\nfiles2\n")}
@@ -117,7 +149,7 @@ func TestNewFilterWithFilesFromAlone(t *testing.T) {
 }
 
 func TestNewFilterWithFilesFromRaw(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilesFromRaw = []string{testFile(t, "#comment\nfiles1\nfiles2\n")}
@@ -144,8 +176,59 @@ func TestNewFilterWithFilesFromRaw(t *testing.T) {
 	}
 }
 
+func TestNewFilterForbiddenMixOfFilesFrom0AndFilterRule(t *testing.T) {
+	Opt := Opt
+
+	// Set up the input
+	Opt.FilterRule = []string{"- filter1", "- filter1b"}
+	Opt.FilesFrom0 = []string{testFile(t, "#comment\x00files1\x00files2\x00")}
+
+	rm := func(p string) {
+		err := os.Remove(p)
+		if err != nil {
+			t.Logf("error removing %q: %v", p, err)
+		}
+	}
+	// Reset the input
+	defer func() {
+		rm(Opt.FilesFrom0[0])
+	}()
+
+	_, err := NewFilter(&Opt)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "the usage of --files-from0 overrides all other filters")
+}
+
+func TestNewFilterWithFilesFrom0(t *testing.T) {
+	Opt := Opt
+
+	// Set up the input: NUL-separated, with an embedded newline in one entry
+	Opt.FilesFrom0 = []string{testFile(t, "#comment\x00files1\nmore\x00files2\x00")}
+
+	rm := func(p string) {
+		err := os.Remove(p)
+		if err != nil {
+			t.Logf("error removing %q: %v", p, err)
+		}
+	}
+	// Reset the input
+	defer func() {
+		rm(Opt.FilesFrom0[0])
+	}()
+
+	f, err := NewFilter(&Opt)
+	require.NoError(t, err)
+	assert.Len(t, f.files, 3)
+	for _, name := range []string{"#comment", "files1\nmore", "files2"} {
+		_, ok := f.files[name]
+		if !ok {
+			t.Errorf("Didn't find file %q in f.files", name)
+		}
+	}
+}
+
 func TestNewFilterFullExceptFilesFromOpt(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	mins := fs.SizeSuffix(100 * 1024)
 	maxs := fs.SizeSuffix(1000 * 1024)
@@ -180,7 +263,9 @@ func TestNewFilterFullExceptFilesFromOpt(t *testing.T) {
 	assert.Equal(t, f.Opt.MinSize, mins)
 	assert.Equal(t, f.Opt.MaxSize, maxs)
 	got := f.DumpFilters()
-	want := `--- File filter rules ---
+	want := `Minimum size is: 100 KiB
+Maximum size is: 1000 KiB
+--- File filter rules ---
 + (^|/)include1$
 + (^|/)include2$
 + (^|/)include3$
@@ -207,8 +292,9 @@ type includeTest struct {
 }
 
 func testInclude(t *testing.T, f *Filter, tests []includeTest) {
+	t.Helper()
 	for _, test := range tests {
-		got := f.Include(test.in, test.size, time.Unix(test.modTime, 0))
+		got := f.Include(test.in, test.size, time.Unix(test.modTime, 0), nil)
 		assert.Equal(t, test.want, got, fmt.Sprintf("in=%q, size=%v, modTime=%v", test.in, test.size, time.Unix(test.modTime, 0)))
 	}
 }
@@ -356,10 +442,22 @@ func TestNewFilterMakeListR(t *testing.T) {
 	assert.Equal(t, want, newObjects)
 	assert.Equal(t, want, listRObjects)
 
-	// Now check an error is returned from NewObject
+	// Check that a file which errors on NewObject doesn't stop the
+	// others being listed - the error is counted and logged rather than
+	// being returned.
 	require.NoError(t, f.AddFile("error"))
 	err = listR(context.Background(), "", listRcallback)
-	require.EqualError(t, err, assert.AnError.Error())
+	require.NoError(t, err)
+	assert.Equal(t, want, listRObjects)
+
+	// The same with a single checker
+	ci := fs.GetConfig(context.Background())
+	ci.Checkers = 1
+
+	require.NoError(t, f.AddFile("error"))
+	err = listR(context.Background(), "", listRcallback)
+	require.NoError(t, err)
+	assert.Equal(t, want, listRObjects)
 }
 
 func TestNewFilterMinSize(t *testing.T) {
@@ -503,6 +601,140 @@ func TestNewFilterMatchesIgnoreCase(t *testing.T) {
 	assert.False(t, f.InActive())
 }
 
+func TestNewFilterMatchesRegexp(t *testing.T) {
+	f, err := NewFilter(nil)
+	require.NoError(t, err)
+	add := func(s string) {
+		err := f.AddRule(s)
+		require.NoError(t, err)
+	}
+	add(`+ /{{file\d+\.png}}`)
+	add(`+ *.{{(?i)jpg}}`)
+	add(`- *`)
+	testInclude(t, f, []includeTest{
+		{"file2.png", 100, 0, true},
+		{"sub/file2.png", 100, 0, false},
+		{"file123.png", 100, 0, true},
+		{"File123.png", 100, 0, false},
+		{"something.jpg", 100, 0, true},
+		{"deep/path/something.JPG", 100, 0, true},
+		{"something.gif", 100, 0, false},
+	})
+	testDirInclude(t, f, []includeDirTest{
+		{"anything at all", true},
+	})
+	assert.False(t, f.InActive())
+}
+
+func TestNewFilterMatchesNegatedCharacterClass(t *testing.T) {
+	for _, negate := range []string{"!", "^"} {
+		t.Run(negate, func(t *testing.T) {
+			f, err := NewFilter(nil)
+			require.NoError(t, err)
+			add := func(s string) {
+				err := f.AddRule(s)
+				require.NoError(t, err)
+			}
+			add("+ file[" + negate + "a].txt")
+			add("- *")
+			testInclude(t, f, []includeTest{
+				{"fileb.txt", 100, 0, true},
+				{"sub/fileb.txt", 100, 0, true},
+				{"filea.txt", 100, 0, false},
+				{"file" + negate + ".txt", 100, 0, true},
+				{"file/.txt", 100, 0, false},
+			})
+			assert.False(t, f.InActive())
+		})
+	}
+}
+
+func TestNewFilterHashFilter(t *testing.T) {
+	const e1 = "filé1.jpg" // one of the unicode E characters
+	const e2 = "filé1.jpg"  // a different unicode E character
+	assert.NotEqual(t, e1, e2)
+	for i := 0; i <= 4; i++ {
+		opt := Opt
+		opt.HashFilter = fmt.Sprintf("%d/4", i)
+		opt.ExcludeRule = []string{"*.bin"}
+		f, err := NewFilter(&opt)
+		require.NoError(t, err)
+		t.Run(opt.HashFilter, func(t *testing.T) {
+			testInclude(t, f, []includeTest{
+				{"file1.jpg", 0, 0, i == 0 || i == 4},
+				{"FILE1.jpg", 0, 0, i == 0 || i == 4},
+				{"file2.jpg", 1, 0, i == 2},
+				{"File2.jpg", 1, 0, i == 2},
+				{"file3.jpg", 2, 0, i == 1},
+				{"file4.jpg", 3, 0, i == 2},
+				{"file5.jpg", 4, 0, i == 0 || i == 4},
+				{"file6.jpg", 5, 0, i == 1},
+				{"file7.jpg", 6, 0, i == 3},
+				{"file8.jpg", 7, 0, i == 3},
+				{"file9.jpg", 7, 0, i == 1},
+				{e1, 0, 0, i == 3},
+				{e2, 0, 0, i == 3},
+				{"hello" + e1, 0, 0, i == 2},
+				{"HELLO" + e2, 0, 0, i == 2},
+				{"hello1" + e1, 0, 0, i == 1},
+				{"Hello1" + e2, 0, 0, i == 1},
+				{"exclude.bin", 8, 0, false},
+			})
+		})
+		assert.False(t, f.InActive())
+	}
+}
+
+type includeTestMetadata struct {
+	in       string
+	metadata fs.Metadata
+	want     bool
+}
+
+func testIncludeMetadata(t *testing.T, f *Filter, tests []includeTestMetadata) {
+	for _, test := range tests {
+		got := f.Include(test.in, 0, time.Time{}, test.metadata)
+		assert.Equal(t, test.want, got, fmt.Sprintf("in=%q, metadata=%+v", test.in, test.metadata))
+	}
+}
+
+func TestNewFilterMetadataInclude(t *testing.T) {
+	f, err := NewFilter(nil)
+	require.NoError(t, err)
+	add := func(s string) {
+		err := f.metaRules.AddRule(s)
+		require.NoError(t, err)
+	}
+	add(`+ t*=t*`)
+	add(`- *`)
+	testIncludeMetadata(t, f, []includeTestMetadata{
+		{"nil", nil, false},
+		{"empty", fs.Metadata{}, false},
+		{"ok1", fs.Metadata{"thing": "thang"}, true},
+		{"ok2", fs.Metadata{"thing1": "thang1"}, true},
+		{"missing", fs.Metadata{"Thing1": "Thang1"}, false},
+	})
+	assert.False(t, f.InActive())
+}
+
+func TestNewFilterMetadataExclude(t *testing.T) {
+	f, err := NewFilter(nil)
+	require.NoError(t, err)
+	add := func(s string) {
+		err := f.metaRules.AddRule(s)
+		require.NoError(t, err)
+	}
+	add(`- thing=thang`)
+	add(`+ *`)
+	testIncludeMetadata(t, f, []includeTestMetadata{
+		{"nil", nil, true},
+		{"empty", fs.Metadata{}, true},
+		{"ok1", fs.Metadata{"thing": "thang"}, false},
+		{"missing1", fs.Metadata{"thing1": "thang1"}, true},
+	})
+	assert.False(t, f.InActive())
+}
+
 func TestFilterAddDirRuleOrFileRule(t *testing.T) {
 	for _, test := range []struct {
 		included bool
@@ -612,7 +844,7 @@ five
 		}()
 		fileName = "-"
 	}
-	err := forEachLine(fileName, raw, func(s string) error {
+	err := forEachLine(fileName, raw, false, func(s string) error {
 		lines = append(lines, s)
 		return nil
 	})
@@ -639,6 +871,71 @@ func TestFilterForEachLineWithRaw(t *testing.T) {
 
 func TestFilterForEachLineStdinWithRaw(t *testing.T) {
 	testFilterForEachLine(t, true, true)
+}
+
+func testFilterForEachLineNul(t *testing.T, useStdin bool) {
+	file := testFile(t, "one\x00two\nthree\x00four\x00five\x00")
+	defer func() {
+		err := os.Remove(file)
+		require.NoError(t, err)
+	}()
+	lines := []string{}
+	fileName := file
+	if useStdin {
+		in, err := os.Open(file)
+		require.NoError(t, err)
+		oldStdin := os.Stdin
+		os.Stdin = in
+		defer func() {
+			os.Stdin = oldStdin
+			_ = in.Close()
+		}()
+		fileName = "-"
+	}
+	err := forEachLine(fileName, true, true, func(s string) error {
+		lines = append(lines, s)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"one", "two\nthree", "four", "five"}, lines)
+}
+
+func TestFilterForEachLineNul(t *testing.T) {
+	testFilterForEachLineNul(t, false)
+}
+
+func TestFilterForEachLineNulStdin(t *testing.T) {
+	testFilterForEachLineNul(t, true)
+}
+
+func TestFilterForEachLineNulNoTrailing(t *testing.T) {
+	file := testFile(t, "one\x00two\x00three")
+	defer func() {
+		err := os.Remove(file)
+		require.NoError(t, err)
+	}()
+	var lines []string
+	err := forEachLine(file, true, true, func(s string) error {
+		lines = append(lines, s)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"one", "two", "three"}, lines)
+}
+
+func TestFilterForEachLineNulConsecutive(t *testing.T) {
+	file := testFile(t, "one\x00\x00two\x00")
+	defer func() {
+		err := os.Remove(file)
+		require.NoError(t, err)
+	}()
+	var lines []string
+	err := forEachLine(file, true, true, func(s string) error {
+		lines = append(lines, s)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"one", "", "two"}, lines)
 }
 
 func TestFilterMatchesFromDocs(t *testing.T) {
@@ -689,7 +986,7 @@ func TestFilterMatchesFromDocs(t *testing.T) {
 		require.NoError(t, err)
 		err = f.Add(false, "*")
 		require.NoError(t, err)
-		included := f.Include(test.file, 0, time.Unix(0, 0))
+		included := f.Include(test.file, 0, time.Unix(0, 0), nil)
 		if included != test.included {
 			t.Errorf("%q match %q: want %v got %v", test.glob, test.file, test.included, included)
 		}
@@ -769,10 +1066,45 @@ func TestNewFilterUsesDirectoryFilters(t *testing.T) {
 	}
 }
 
+func TestAddConfigRulesIndependent(t *testing.T) {
+	for _, ignoreCase := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ignoreCase=%t", ignoreCase), func(t *testing.T) {
+			opt := Opt
+			opt.IgnoreCase = ignoreCase
+			for i := range minIndexedRules {
+				opt.FilterRule = append(opt.FilterRule, fmt.Sprintf("- /old_%d/**", i))
+				opt.MetaRules.FilterRule = append(opt.MetaRules.FilterRule, fmt.Sprintf("- /old_%d/**", i))
+			}
+			original, err := NewFilter(&opt)
+			require.NoError(t, err)
+			ctx := ReplaceConfig(context.Background(), original)
+			_, cloned := AddConfig(ctx)
+			require.NoError(t, cloned.Add(false, "/new/**"))
+			require.NoError(t, cloned.metaRules.Add(false, "/new/**"))
+			assert.False(t, cloned.IncludeRemote("new/file"))
+			assert.True(t, original.IncludeRemote("new/file"))
+			assert.False(t, cloned.metaRules.include("new/file"))
+			assert.True(t, original.metaRules.include("new/file"))
+			include := original.IncludeDirectory(ctx, nil)
+			got, err := include("new")
+			require.NoError(t, err)
+			assert.True(t, got)
+			// The original must not inherit the clone's deduplication state.
+			require.NoError(t, original.Add(false, "/new/**"))
+			assert.False(t, original.IncludeRemote("new/file"))
+			cloned.Clear()
+			assert.True(t, cloned.IncludeRemote("old_0/file"))
+			assert.False(t, original.IncludeRemote("old_0/file"))
+		})
+	}
+}
+
 func TestGetConfig(t *testing.T) {
 	ctx := context.Background()
 
 	// Check nil
+	//lint:ignore SA1012 false positive when running staticcheck, we want to test passing a nil Context and therefore ignore lint suggestion to use context.TODO
+	//nolint:staticcheck // Don't include staticcheck when running golangci-lint to avoid SA1012
 	config := GetConfig(nil)
 	assert.Equal(t, globalConfig, config)
 

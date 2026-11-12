@@ -7,10 +7,13 @@ description: "Rclone Bugs and Limitations"
 
 ## Limitations
 
-### Directory timestamps aren't preserved
+### Directory timestamps aren't preserved on some backends
 
-Rclone doesn't currently preserve the timestamps of directories.  This
-is because rclone only really considers objects when syncing.
+As of `v1.66`, rclone supports syncing directory modtimes, if the backend
+supports it. Some backends do not support it -- see
+[overview](https://rclone.org/overview/) for a complete list. Additionally, note
+that empty directories are not synced by default (this can be enabled with
+`--create-empty-src-dirs`.)
 
 ### Rclone struggles with millions of files in a directory/bucket
 
@@ -22,11 +25,11 @@ Millions of files in a directory tends to occur on bucket-based remotes
 (e.g. S3 buckets) since those remotes do not segregate subdirectories within
 the bucket.
 
-### Bucket based remotes and folders
+### Bucket-based remotes and folders
 
-Bucket based remotes (e.g. S3/GCS/Swift/B2) do not have a concept of
+Bucket-based remotes (e.g. S3/GCS/Swift/B2) do not have a concept of
 directories.  Rclone therefore cannot create directories in them which
-means that empty directories on a bucket based remote will tend to
+means that empty directories on a bucket-based remote will tend to
 disappear.
 
 Some software creates empty keys ending in `/` as directory markers.
@@ -38,6 +41,5 @@ flag/option).
 
 Bugs are stored in rclone's GitHub project:
 
-* [Reported bugs](https://github.com/rclone/rclone/issues?q=is%3Aopen+is%3Aissue+label%3Abug)
-* [Known issues](https://github.com/rclone/rclone/issues?q=is%3Aopen+is%3Aissue+milestone%3A%22Known+Problem%22)
-
+- [Reported bugs](https://github.com/rclone/rclone/issues?q=is%3Aopen+is%3Aissue+label%3Abug)
+- [Known issues](https://github.com/rclone/rclone/issues?q=is%3Aopen+is%3Aissue+milestone%3A%22Known+Problem%22)

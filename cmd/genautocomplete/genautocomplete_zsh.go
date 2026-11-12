@@ -1,10 +1,11 @@
 package genautocomplete
 
 import (
-	"log"
+	"fmt"
 	"os"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
 	"github.com/spf13/cobra"
 )
 
@@ -15,24 +16,26 @@ func init() {
 var zshCommandDefinition = &cobra.Command{
 	Use:   "zsh [output_file]",
 	Short: `Output zsh completion script for rclone.`,
-	Long: `
-Generates a zsh autocompletion script for rclone.
+	Long: `Generates a zsh autocompletion script for rclone.
 
 This writes to /usr/share/zsh/vendor-completions/_rclone by default so will
 probably need to be run with sudo or as root, e.g.
 
-    sudo rclone genautocomplete zsh
+` + "```console" + `
+sudo rclone completion zsh
+` + "```" + `
 
 Logout and login again to use the autocompletion scripts, or source
 them directly
 
-    autoload -U compinit && compinit
+` + "```console" + `
+autoload -U compinit && compinit
+` + "```" + `
 
 If you supply a command line argument the script will be written
 there.
 
-If output_file is "-", then the output will be written to stdout.
-`,
+If output_file is "-", then the output will be written to stdout.`,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(0, 1, command, args)
 		out := "/usr/share/zsh/vendor-completions/_rclone"
@@ -40,7 +43,7 @@ If output_file is "-", then the output will be written to stdout.
 			if args[0] == "-" {
 				err := cmd.Root.GenZshCompletion(os.Stdout)
 				if err != nil {
-					log.Fatal(err)
+					fs.Fatal(nil, fmt.Sprint(err))
 				}
 				return
 			}
@@ -48,12 +51,12 @@ If output_file is "-", then the output will be written to stdout.
 		}
 		outFile, err := os.Create(out)
 		if err != nil {
-			log.Fatal(err)
+			fs.Fatal(nil, fmt.Sprint(err))
 		}
 		defer func() { _ = outFile.Close() }()
 		err = cmd.Root.GenZshCompletion(outFile)
 		if err != nil {
-			log.Fatal(err)
+			fs.Fatal(nil, fmt.Sprint(err))
 		}
 	},
 }

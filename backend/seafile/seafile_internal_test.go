@@ -1,10 +1,26 @@
 package seafile
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"path"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/asyncreader"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/readers"
+	"github.com/rclone/rclone/lib/rest"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/text/unicode/norm"
 )
 
 type pathData struct {
@@ -19,82 +35,104 @@ type pathData struct {
 // from a mix of configuration data and path command line argument
 func TestSplitPath(t *testing.T) {
 	testData := []pathData{
-		pathData{
+		{
 			configLibrary:   "",
 			configRoot:      "",
 			argumentPath:    "",
 			expectedLibrary: "",
 			expectedPath:    "",
 		},
-		pathData{
+		{
 			configLibrary:   "",
 			configRoot:      "",
 			argumentPath:    "Library",
 			expectedLibrary: "Library",
 			expectedPath:    "",
 		},
-		pathData{
+		{
 			configLibrary:   "",
 			configRoot:      "",
 			argumentPath:    path.Join("Library", "path", "to", "file"),
 			expectedLibrary: "Library",
 			expectedPath:    path.Join("path", "to", "file"),
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      "",
 			argumentPath:    "",
 			expectedLibrary: "Library",
 			expectedPath:    "",
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      "",
 			argumentPath:    "path",
 			expectedLibrary: "Library",
 			expectedPath:    "path",
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      "",
 			argumentPath:    path.Join("path", "to", "file"),
 			expectedLibrary: "Library",
 			expectedPath:    path.Join("path", "to", "file"),
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      "root",
 			argumentPath:    "",
 			expectedLibrary: "Library",
 			expectedPath:    "root",
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      path.Join("root", "path"),
 			argumentPath:    "",
 			expectedLibrary: "Library",
 			expectedPath:    path.Join("root", "path"),
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      "root",
 			argumentPath:    "path",
 			expectedLibrary: "Library",
 			expectedPath:    path.Join("root", "path"),
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      "root",
 			argumentPath:    path.Join("path", "to", "file"),
 			expectedLibrary: "Library",
 			expectedPath:    path.Join("root", "path", "to", "file"),
 		},
-		pathData{
+		{
 			configLibrary:   "Library",
 			configRoot:      path.Join("root", "path"),
 			argumentPath:    path.Join("subpath", "to", "file"),
 			expectedLibrary: "Library",
 			expectedPath:    path.Join("root", "path", "subpath", "to", "file"),
+		},
+		// paths inside a library are returned in NFC, library names are kept as they are
+		{
+			configLibrary:   "Library",
+			configRoot:      "",
+			argumentPath:    norm.NFD.String("path/to/équivalent.txt"),
+			expectedLibrary: "Library",
+			expectedPath:    norm.NFC.String("path/to/équivalent.txt"),
+		},
+		{
+			configLibrary:   "Library",
+			configRoot:      norm.NFD.String("répertoire"),
+			argumentPath:    norm.NFD.String("équivalent.txt"),
+			expectedLibrary: "Library",
+			expectedPath:    norm.NFC.String("répertoire/équivalent.txt"),
+		},
+		{
+			configLibrary:   "",
+			configRoot:      "",
+			argumentPath:    norm.NFD.String("Bibliothèque/équivalent.txt"),
+			expectedLibrary: norm.NFD.String("Bibliothèque"),
+			expectedPath:    norm.NFC.String("équivalent.txt"),
 		},
 	}
 	for _, test := range testData {
@@ -120,4 +158,239 @@ func TestSplitPathIntoSlice(t *testing.T) {
 		output := splitPath(input)
 		assert.Equal(t, expected, output)
 	}
+}
+
+func Test2FAStateMachine(t *testing.T) {
+	fixtures := []struct {
+		name               string
+		mapper             configmap.Mapper
+		input              fs.ConfigIn
+		expectState        string
+		expectErrorMessage string
+		expectResult       string
+		expectFail         bool
+		expectNil          bool
+	}{
+		{
+			name:       "no url",
+			mapper:     configmap.Simple{},
+			input:      fs.ConfigIn{State: ""},
+			expectFail: true,
+		},
+		{
+			name:       "unknown state",
+			mapper:     configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:      fs.ConfigIn{State: "unknown"},
+			expectFail: true,
+		},
+		{
+			name:      "2fa not set",
+			mapper:    configmap.Simple{"url": "http://localhost/"},
+			input:     fs.ConfigIn{State: ""},
+			expectNil: true,
+		},
+		{
+			name:        "no password in config",
+			mapper:      configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:       fs.ConfigIn{State: ""},
+			expectState: "password",
+		},
+		{
+			name:        "config ready for 2fa token",
+			mapper:      configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username", "pass": obscure.MustObscure("password")},
+			input:       fs.ConfigIn{State: ""},
+			expectState: "2fa",
+		},
+		{
+			name:               "password not entered",
+			mapper:             configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:              fs.ConfigIn{State: "password"},
+			expectState:        "",
+			expectErrorMessage: "Password can't be blank",
+		},
+		{
+			name:        "password entered",
+			mapper:      configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:       fs.ConfigIn{State: "password", Result: "password"},
+			expectState: "2fa",
+		},
+		{
+			name:        "ask for a 2fa code",
+			mapper:      configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:       fs.ConfigIn{State: "2fa"},
+			expectState: "2fa_do",
+		},
+		{
+			name:               "no 2fa code entered",
+			mapper:             configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:              fs.ConfigIn{State: "2fa_do"},
+			expectState:        "2fa", // ask for a code again
+			expectErrorMessage: "2FA codes can't be blank",
+		},
+		{
+			name:        "2fa error and retry",
+			mapper:      configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:       fs.ConfigIn{State: "2fa_error", Result: "true"},
+			expectState: "2fa", // ask for a code again
+		},
+		{
+			name:       "2fa error and fail",
+			mapper:     configmap.Simple{"url": "http://localhost/", "2fa": "true", "user": "username"},
+			input:      fs.ConfigIn{State: "2fa_error"},
+			expectFail: true,
+		},
+	}
+
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			output, err := Config(context.Background(), "test", fixture.mapper, fixture.input)
+			if fixture.expectFail {
+				require.Error(t, err)
+				t.Log(err)
+				return
+			}
+			if fixture.expectNil {
+				require.Nil(t, output)
+				return
+			}
+			assert.Equal(t, fixture.expectState, output.State)
+			assert.Equal(t, fixture.expectErrorMessage, output.Error)
+			assert.Equal(t, fixture.expectResult, output.Result)
+		})
+	}
+}
+
+// Test that a failed upload stops reading the source so it can be closed
+func TestUploadErrorReleasesSource(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reply without reading the body, like a server rejecting the upload early
+		http.Error(w, "rejected", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		srv:   rest.NewClient(server.Client()),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault()),
+	}
+	// An AsyncReader holds its lock while writing to the upload
+	in, err := asyncreader.New(ctx, io.NopCloser(readers.NewPatternReader(64<<20)), 4)
+	require.NoError(t, err)
+
+	_, err = f.upload(ctx, in, server.URL+"/upload", "/file.bin", time.Time{})
+	require.Error(t, err)
+
+	closed := make(chan struct{})
+	go func() {
+		_ = in.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("source still in use after upload returned")
+	}
+}
+
+// testPassword is the password the downgrade tests look for on the
+// plaintext hop. It is distinctive so that it can't match the JSON
+// field names of the authentication request.
+const testPassword = "s3cret-pass-4242"
+
+// Test2FAGetToken checks the 2FA config flow posts the credentials to
+// the auth token endpoint without doubling the slash when the
+// configured URL ends in one, and saves the token it gets back.
+func Test2FAGetToken(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"token":"token123"}`))
+	}))
+	defer srv.Close()
+
+	m := configmap.Simple{"url": srv.URL + "/", "2fa": "true", "user": "username", "pass": obscure.MustObscure(testPassword)}
+	out, err := Config(context.Background(), "test", m, fs.ConfigIn{State: "2fa_do", Result: "123456"})
+	require.NoError(t, err)
+	assert.Nil(t, out)
+	assert.Equal(t, "/api2/auth-token/", gotPath)
+	assert.Equal(t, "token123", m["auth_token"])
+	assert.Equal(t, "", m["pass"])
+}
+
+// newDowngradeServers returns an HTTPS server which answers the server
+// info request itself and redirects every other request to a plaintext
+// HTTP server on the same machine. The returned flags record whether
+// the plaintext server ever received an Authorization header or
+// testPassword in a request body.
+func newDowngradeServers(t *testing.T) (tlsSrv *httptest.Server, sawAuth, sawPassword *atomic.Bool) {
+	t.Helper()
+	sawAuth, sawPassword = new(atomic.Bool), new(atomic.Bool)
+
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			sawAuth.Store(true)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), testPassword) {
+			sawPassword.Store(true)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("[]"))
+	}))
+	t.Cleanup(plain.Close)
+
+	tlsSrv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api2/server-info/" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"version":"9.0.0"}`))
+			return
+		}
+		http.Redirect(w, r, plain.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(tlsSrv.Close)
+
+	return tlsSrv, sawAuth, sawPassword
+}
+
+// TestRefuseHTTPSDowngradeRedirect checks that neither the
+// authorization token nor the password is sent over plaintext HTTP
+// when the server redirects an HTTPS request to an http:// URL.
+func TestRefuseHTTPSDowngradeRedirect(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.InsecureSkipVerify = true // trust the httptest certificate
+
+	// Every API call made through the Fs carries the token.
+	t.Run("Token", func(t *testing.T) {
+		tlsSrv, sawAuth, _ := newDowngradeServers(t)
+		m := configmap.Simple{"url": tlsSrv.URL, "user": "username", "auth_token": "secret"}
+		fsys, err := NewFs(ctx, "test", "", m)
+		require.NoError(t, err)
+		f := fsys.(*Fs)
+		_, err = f.getLibraries(ctx)
+		assert.False(t, sawAuth.Load(), "authorization token was sent over plaintext HTTP")
+		assert.ErrorIs(t, err, rest.ErrHTTPSDowngrade)
+	})
+
+	// Without a token NewFs posts the user's password to get one.
+	t.Run("Login", func(t *testing.T) {
+		tlsSrv, _, sawPassword := newDowngradeServers(t)
+		m := configmap.Simple{"url": tlsSrv.URL, "user": "username", "pass": obscure.MustObscure(testPassword)}
+		_, err := NewFs(ctx, "test", "", m)
+		assert.False(t, sawPassword.Load(), "password was sent over plaintext HTTP")
+		assert.ErrorIs(t, err, rest.ErrHTTPSDowngrade)
+	})
+
+	// The 2FA config flow posts the user's password to get a token.
+	t.Run("Password", func(t *testing.T) {
+		tlsSrv, _, sawPassword := newDowngradeServers(t)
+		m := configmap.Simple{"url": tlsSrv.URL, "2fa": "true", "user": "username", "pass": obscure.MustObscure(testPassword)}
+		out, err := Config(ctx, "test", m, fs.ConfigIn{State: "2fa_do", Result: "123456"})
+		require.NoError(t, err)
+		require.NotNil(t, out)
+		assert.False(t, sawPassword.Load(), "password was sent over plaintext HTTP")
+		assert.Equal(t, "2fa_error", out.State)
+		require.NotNil(t, out.Option)
+		assert.Contains(t, out.Option.Help, rest.ErrHTTPSDowngrade.Error())
+	})
 }

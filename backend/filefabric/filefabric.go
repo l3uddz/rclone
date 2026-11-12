@@ -17,9 +17,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -32,7 +32,6 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/random"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/filefabric/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -65,7 +64,7 @@ func init() {
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:     "url",
-			Help:     "URL of the Enterprise File Fabric to connect to",
+			Help:     "URL of the Enterprise File Fabric to connect to.",
 			Required: true,
 			Examples: []fs.OptionExample{{
 				Value: "https://storagemadeeasy.com",
@@ -79,14 +78,16 @@ func init() {
 			}},
 		}, {
 			Name: "root_folder_id",
-			Help: `ID of the root folder
+			Help: `ID of the root folder.
+
 Leave blank normally.
 
 Fill in to make rclone start with directory of a given ID.
 `,
+			Sensitive: true,
 		}, {
 			Name: "permanent_token",
-			Help: `Permanent Authentication Token
+			Help: `Permanent Authentication Token.
 
 A Permanent Authentication Token can be created in the Enterprise File
 Fabric, on the users Dashboard under Security, there is an entry
@@ -97,26 +98,28 @@ These tokens are normally valid for several years.
 
 For more info see: https://docs.storagemadeeasy.com/organisationcloud/api-tokens
 `,
+			Sensitive: true,
 		}, {
 			Name: "token",
-			Help: `Session Token
+			Help: `Session Token.
 
 This is a session token which rclone caches in the config file. It is
 usually valid for 1 hour.
 
 Don't set this value - rclone will set it automatically.
 `,
-			Advanced: true,
+			Advanced:  true,
+			Sensitive: true,
 		}, {
 			Name: "token_expiry",
-			Help: `Token expiry time
+			Help: `Token expiry time.
 
 Don't set this value - rclone will set it automatically.
 `,
 			Advanced: true,
 		}, {
 			Name: "version",
-			Help: `Version read from the file fabric
+			Help: `Version read from the file fabric.
 
 Don't set this value - rclone will set it automatically.
 `,
@@ -149,15 +152,15 @@ type Fs struct {
 	opt             Options            // parsed options
 	features        *fs.Features       // optional features
 	m               configmap.Mapper   // to save config
-	srv             *rest.Client       // the connection to the one drive server
+	srv             *rest.Client       // the connection to the server
 	dirCache        *dircache.DirCache // Map of directory path to directory id
 	pacer           *fs.Pacer          // pacer for API calls
 	tokenMu         sync.Mutex         // hold when reading the token
 	token           string             // current access token
 	tokenExpiry     time.Time          // time the current token expires
-	tokenExpired    int32              // read and written with atomic
-	canCopyWithName bool               // set if detected that can use fi_name in copy
-	precision       time.Duration      // precision reported
+	tokenExpired    atomic.Int32
+	canCopyWithName bool          // set if detected that can use fi_name in copy
+	precision       time.Duration // precision reported
 }
 
 // Object describes a filefabric object
@@ -222,13 +225,14 @@ var retryStatusCodes = []struct {
 		// delete in that folder. Please try again later or use
 		// another name. (error_background)
 		code:  "error_background",
-		sleep: 6 * time.Second,
+		sleep: 1 * time.Second,
 	},
 }
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error, status api.OKError) (bool, error) {
+// try should be the number of the tries so far, counting up from 1
+func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error, status api.OKError, try int) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
@@ -239,14 +243,15 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error, st
 		err = status // return the error from the RPC
 		code := status.GetCode()
 		if code == "login_token_expired" {
-			atomic.AddInt32(&f.tokenExpired, 1)
+			f.tokenExpired.Add(1)
 		} else {
 			for _, retryCode := range retryStatusCodes {
 				if code == retryCode.code {
 					if retryCode.sleep > 0 {
-						// make this thread only sleep extra time
-						fs.Debugf(f, "Sleeping for %v to wait for %q error to clear", retryCode.sleep, retryCode.code)
-						time.Sleep(retryCode.sleep)
+						// make this thread only sleep exponentially increasing extra time
+						sleepTime := retryCode.sleep << (try - 1)
+						fs.Debugf(f, "Sleeping for %v to wait for %q error to clear", sleepTime, retryCode.code)
+						time.Sleep(sleepTime)
 					}
 					return true, err
 				}
@@ -264,7 +269,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, rootID string, path string
 		"pid":  rootID,
 	}, &resp, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to check path exists")
+		return nil, fmt.Errorf("failed to check path exists: %w", err)
 	}
 	if resp.Exists != "y" {
 		return nil, fs.ErrorObjectNotFound
@@ -305,7 +310,7 @@ func (f *Fs) getApplianceInfo(ctx context.Context) error {
 		"token": "*",
 	}, &applianceInfo, nil)
 	if err != nil {
-		return errors.Wrap(err, "failed to read appliance version")
+		return fmt.Errorf("failed to read appliance version: %w", err)
 	}
 	f.opt.Version = applianceInfo.SoftwareVersionLabel
 	f.m.Set("version", f.opt.Version)
@@ -318,12 +323,12 @@ func (f *Fs) getToken(ctx context.Context) (token string, err error) {
 	var refreshed = false
 	defer func() {
 		if refreshed {
-			atomic.StoreInt32(&f.tokenExpired, 0)
+			f.tokenExpired.Store(0)
 		}
 		f.tokenMu.Unlock()
 	}()
 
-	expired := atomic.LoadInt32(&f.tokenExpired) != 0
+	expired := f.tokenExpired.Load() != 0
 	if expired {
 		fs.Debugf(f, "Token invalid - refreshing")
 	}
@@ -346,7 +351,7 @@ func (f *Fs) getToken(ctx context.Context) (token string, err error) {
 		"authtoken": f.opt.PermanentToken,
 	}, &info, nil)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to get session token")
+		return "", fmt.Errorf("failed to get session token: %w", err)
 	}
 	refreshed = true
 	now = now.Add(tokenLifeTime)
@@ -366,11 +371,11 @@ func (f *Fs) getToken(ctx context.Context) (token string, err error) {
 }
 
 // params for rpc
-type params map[string]interface{}
+type params map[string]any
 
 // rpc calls the rpc.php method of the SME file fabric
 //
-// This is an entry point to all the method calls
+// This is an entry point to all the method calls.
 //
 // If result is nil then resp.Body will need closing
 func (f *Fs) rpc(ctx context.Context, function string, p params, result api.OKError, options []fs.OpenOption) (resp *http.Response, err error) {
@@ -400,11 +405,13 @@ func (f *Fs) rpc(ctx context.Context, function string, p params, result api.OKEr
 		ContentType: "application/x-www-form-urlencoded",
 		Options:     options,
 	}
+	try := 0
 	err = f.pacer.Call(func() (bool, error) {
+		try++
 		// Refresh the body each retry
 		opts.Body = strings.NewReader(data.Encode())
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, result)
-		return f.shouldRetry(ctx, resp, err, result)
+		return f.shouldRetry(ctx, resp, err, result, try)
 	})
 	if err != nil {
 		return resp, err
@@ -485,7 +492,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				// Root is a dir - cache its ID
 				f.dirCache.Put(f.root, info.ID)
 			}
-		} else {
+			//} else {
 			// Root is not found so a directory
 		}
 	}
@@ -557,7 +564,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		"fi_name": f.opt.Enc.FromStandardName(leaf),
 	}, &info, nil)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to create directory")
+		return "", fmt.Errorf("failed to create directory: %w", err)
 	}
 	// fmt.Printf("...Id %q\n", *info.Id)
 	return info.Item.ID, nil
@@ -590,7 +597,7 @@ OUTER:
 		var info api.GetFolderContentsResponse
 		_, err = f.rpc(ctx, "getFolderContents", p, &info, nil)
 		if err != nil {
-			return false, errors.Wrap(err, "failed to list directory")
+			return false, fmt.Errorf("failed to list directory: %w", err)
 		}
 		for i := range info.Items {
 			item := &info.Items[i]
@@ -673,7 +680,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // Creates from the parameters passed in a half finished Object which
 // must have setMetaData called on it
 //
-// Returns the object, leaf, directoryID and error
+// Returns the object, leaf, directoryID and error.
 //
 // Used to create new objects
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
@@ -692,7 +699,7 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 
 // Put the object
 //
-// Copy the reader in to the new object which is returned
+// Copy the reader in to the new object which is returned.
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -721,7 +728,7 @@ func (f *Fs) deleteObject(ctx context.Context, id string) (err error) {
 		"completedeletion": "n",
 	}, &info, nil)
 	if err != nil {
-		return errors.Wrap(err, "failed to delete file")
+		return fmt.Errorf("failed to delete file: %w", err)
 	}
 	return nil
 }
@@ -758,7 +765,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	}, &info, nil)
 	f.dirCache.FlushDir(dir)
 	if err != nil {
-		return errors.Wrap(err, "failed to remove directory")
+		return fmt.Errorf("failed to remove directory: %w", err)
 	}
 	return nil
 }
@@ -778,9 +785,9 @@ func (f *Fs) Precision() time.Duration {
 
 // Copy src to this remote using server side copy operations.
 //
-// This is stored with the remote path given
+// This is stored with the remote path given.
 //
-// It returns the destination Object and a possible error
+// It returns the destination Object and a possible error.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -820,7 +827,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 	_, err = f.rpc(ctx, "doCopyFile", p, &info, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to copy file")
+		return nil, fmt.Errorf("failed to copy file: %w", err)
 	}
 	err = dstObj.setMetaData(&info.Item)
 	if err != nil {
@@ -838,8 +845,8 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.purgeCheck(ctx, dir, false)
 }
 
-// Wait for the the background task to complete if necessary
-func (f *Fs) waitForBackgroundTask(ctx context.Context, taskID string) (err error) {
+// Wait for the background task to complete if necessary
+func (f *Fs) waitForBackgroundTask(ctx context.Context, taskID api.String) (err error) {
 	if taskID == "" || taskID == "0" {
 		// No task to wait for
 		return nil
@@ -852,7 +859,7 @@ func (f *Fs) waitForBackgroundTask(ctx context.Context, taskID string) (err erro
 			"taskid": taskID,
 		}, &info, nil)
 		if err != nil {
-			return errors.Wrapf(err, "failed to wait for task %s to complete", taskID)
+			return fmt.Errorf("failed to wait for task %s to complete: %w", taskID, err)
 		}
 		if len(info.Tasks) == 0 {
 			// task has finished
@@ -885,7 +892,7 @@ func (f *Fs) renameLeaf(ctx context.Context, isDir bool, id string, newLeaf stri
 		"fi_name": newLeaf,
 	}, &info, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to rename leaf")
+		return nil, fmt.Errorf("failed to rename leaf: %w", err)
 	}
 	err = f.waitForBackgroundTask(ctx, info.Status.TaskID)
 	if err != nil {
@@ -929,7 +936,7 @@ func (f *Fs) move(ctx context.Context, isDir bool, id, oldLeaf, newLeaf, oldDire
 			"dir_id": newDirectoryID,
 		}, &info, nil)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to move file to new directory")
+			return nil, fmt.Errorf("failed to move file to new directory: %w", err)
 		}
 		item = &info.Item
 		err = f.waitForBackgroundTask(ctx, info.Status.TaskID)
@@ -951,9 +958,9 @@ func (f *Fs) move(ctx context.Context, isDir bool, id, oldLeaf, newLeaf, oldDire
 
 // Move src to this remote using server side move operations.
 //
-// This is stored with the remote path given
+// This is stored with the remote path given.
 //
-// It returns the destination Object and a possible error
+// It returns the destination Object and a possible error.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -1032,7 +1039,7 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 	var info api.EmptyResponse
 	_, err = f.rpc(ctx, "emptyTrashInBackground", params{}, &info, nil)
 	if err != nil {
-		return errors.Wrap(err, "failed to empty trash")
+		return fmt.Errorf("failed to empty trash: %w", err)
 	}
 	return nil
 }
@@ -1089,7 +1096,7 @@ func (o *Object) Size() int64 {
 // setMetaData sets the metadata from info
 func (o *Object) setMetaData(info *api.Item) (err error) {
 	if info.Type != api.ItemTypeFile {
-		return errors.Wrapf(fs.ErrorNotAFile, "%q is %q", o.remote, info.Type)
+		return fs.ErrorIsDir
 	}
 	o.hasMetaData = true
 	o.size = info.Size
@@ -1130,7 +1137,6 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 
 // ModTime returns the modification time of the object
 //
-//
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime(ctx context.Context) time.Time {
@@ -1159,7 +1165,7 @@ func (o *Object) modifyFile(ctx context.Context, keyValues [][2]string) error {
 		"data":  data.String(),
 	}, &info, nil)
 	if err != nil {
-		return errors.Wrap(err, "failed to update metadata")
+		return fmt.Errorf("failed to update metadata: %w", err)
 	}
 	return o.setMetaData(&info.Item)
 }
@@ -1182,7 +1188,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return nil, errors.New("can't download - no id")
 	}
 	if o.contentType == emptyMimeType {
-		return ioutil.NopCloser(bytes.NewReader([]byte{})), nil
+		return io.NopCloser(bytes.NewReader([]byte{})), nil
 	}
 	fs.FixRangeOption(options, o.size)
 	resp, err := o.fs.rpc(ctx, "getFile", params{
@@ -1196,7 +1202,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 // Update the object with the contents of the io.Reader, modTime and size
 //
-// If existing is set then it updates the object rather than creating a new one
+// If existing is set then it updates the object rather than creating a new one.
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
@@ -1242,7 +1248,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	_, err = o.fs.rpc(ctx, "doInitUpload", p, &upload, nil)
 	if err != nil {
-		return errors.Wrap(err, "failed to initialize upload")
+		return fmt.Errorf("failed to initialize upload: %w", err)
 	}
 
 	// Cancel the upload if aborted or it fails
@@ -1278,18 +1284,20 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		var contentLength = size
 		opts.ContentLength = &contentLength // NB CallJSON scribbles on this which is naughty
 	}
+	try := 0
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
+		try++
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &uploader)
-		return o.fs.shouldRetry(ctx, resp, err, nil)
+		return o.fs.shouldRetry(ctx, resp, err, nil, try)
 	})
 	if err != nil {
-		return errors.Wrap(err, "failed to upload")
+		return fmt.Errorf("failed to upload: %w", err)
 	}
 	if uploader.Success != "y" {
-		return errors.Errorf("upload failed")
+		return fmt.Errorf("upload failed")
 	}
 	if size > 0 && uploader.FileSize != size {
-		return errors.Errorf("upload failed: size mismatch: want %d got %d", size, uploader.FileSize)
+		return fmt.Errorf("upload failed: size mismatch: want %d got %d", size, uploader.FileSize)
 	}
 
 	// Now finalize the file
@@ -1301,7 +1309,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	_, err = o.fs.rpc(ctx, "doCompleteUpload", p, &finalize, nil)
 	if err != nil {
-		return errors.Wrap(err, "failed to finalize upload")
+		return fmt.Errorf("failed to finalize upload: %w", err)
 	}
 	finalized = true
 

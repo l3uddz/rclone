@@ -17,10 +17,13 @@ type TransferSnapshot struct {
 	Size        int64     `json:"size"`
 	Bytes       int64     `json:"bytes"`
 	Checked     bool      `json:"checked"`
+	What        string    `json:"what"`
 	StartedAt   time.Time `json:"started_at"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
+	CompletedAt time.Time `json:"completed_at"`
 	Error       error     `json:"-"`
 	Group       string    `json:"group"`
+	SrcFs       string    `json:"srcFs,omitempty"`
+	DstFs       string    `json:"dstFs,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler interface.
@@ -50,6 +53,9 @@ type Transfer struct {
 	size      int64
 	startedAt time.Time
 	checking  bool
+	what      string // what kind of transfer this is
+	srcFs     fs.Fs  // source Fs - may be nil
+	dstFs     fs.Fs  // destination Fs - may be nil
 
 	// Protects all below
 	//
@@ -60,27 +66,41 @@ type Transfer struct {
 	acc         *Account
 	err         error
 	completedAt time.Time
+	doneBytes   int64
 }
 
 // newCheckingTransfer instantiates new checking of the object.
-func newCheckingTransfer(stats *StatsInfo, obj fs.Object) *Transfer {
-	return newTransferRemoteSize(stats, obj.Remote(), obj.Size(), true)
+func newCheckingTransfer(stats *StatsInfo, obj fs.DirEntry, what string) *Transfer {
+	return newTransferRemoteSize(stats, obj.Remote(), obj.Size(), true, what, nil, nil, false)
+}
+
+// newCheckingTransferNoHistory instantiates new checking of the
+// object which is not kept in the completed transfers history.
+func newCheckingTransferNoHistory(stats *StatsInfo, obj fs.DirEntry, what string) *Transfer {
+	return newTransferRemoteSize(stats, obj.Remote(), obj.Size(), true, what, nil, nil, true)
 }
 
 // newTransfer instantiates new transfer.
-func newTransfer(stats *StatsInfo, obj fs.Object) *Transfer {
-	return newTransferRemoteSize(stats, obj.Remote(), obj.Size(), false)
+func newTransfer(stats *StatsInfo, obj fs.DirEntry, srcFs, dstFs fs.Fs) *Transfer {
+	return newTransferRemoteSize(stats, obj.Remote(), obj.Size(), false, "", srcFs, dstFs, false)
 }
 
-func newTransferRemoteSize(stats *StatsInfo, remote string, size int64, checking bool) *Transfer {
+// If noHistory is set the transfer is not kept in the completed
+// transfers history after it is done.
+func newTransferRemoteSize(stats *StatsInfo, remote string, size int64, checking bool, what string, srcFs, dstFs fs.Fs, noHistory bool) *Transfer {
 	tr := &Transfer{
 		stats:     stats,
 		remote:    remote,
 		size:      size,
 		startedAt: time.Now(),
 		checking:  checking,
+		what:      what,
+		srcFs:     srcFs,
+		dstFs:     dstFs,
 	}
-	stats.AddTransfer(tr)
+	if !noHistory {
+		stats.AddTransfer(tr)
+	}
 	return tr
 }
 
@@ -107,12 +127,20 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 		}
 		// Signal done with accounting
 		acc.Done()
-		// free the account since we may keep the transfer
-		acc = nil
+	}
+
+	var doneBytes int64
+	if acc != nil {
+		doneBytes, _ = acc.progress()
 	}
 
 	tr.mu.Lock()
 	tr.completedAt = time.Now()
+	if acc != nil {
+		tr.doneBytes = doneBytes
+	}
+	// free the account since we may keep the transfer
+	tr.acc = nil
 	tr.mu.Unlock()
 
 	if tr.checking {
@@ -132,6 +160,7 @@ func (tr *Transfer) Reset(ctx context.Context) {
 	ci := fs.GetConfig(ctx)
 
 	if acc != nil {
+		acc.Done()
 		if err := acc.Close(); err != nil {
 			fs.LogLevelPrintf(ci.StatsLogLevel, nil, "can't close account: %+v\n", err)
 		}
@@ -146,6 +175,7 @@ func (tr *Transfer) Account(ctx context.Context, in io.ReadCloser) *Account {
 	} else {
 		tr.acc.UpdateReader(ctx, in)
 	}
+	tr.acc.checking = tr.checking
 	tr.mu.Unlock()
 	return tr.acc
 }
@@ -170,26 +200,47 @@ func (tr *Transfer) Snapshot() TransferSnapshot {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
 
-	var s, b int64 = tr.size, 0
+	b, s := tr.doneBytes, tr.size
 	if tr.acc != nil {
 		b, s = tr.acc.progress()
 	}
-	return TransferSnapshot{
+
+	what := tr.what
+	if what == "" {
+		what = "transferring"
+	}
+
+	snapshot := TransferSnapshot{
 		Name:        tr.remote,
-		Checked:     tr.checking,
 		Size:        s,
 		Bytes:       b,
+		Checked:     tr.checking,
+		What:        what,
 		StartedAt:   tr.startedAt,
 		CompletedAt: tr.completedAt,
 		Error:       tr.err,
 		Group:       tr.stats.group,
 	}
+	if tr.srcFs != nil {
+		snapshot.SrcFs = fs.ConfigString(tr.srcFs)
+	}
+	if tr.dstFs != nil {
+		snapshot.DstFs = fs.ConfigString(tr.dstFs)
+	}
+	return snapshot
 }
 
 // rcStats returns stats for the transfer suitable for the rc
 func (tr *Transfer) rcStats() rc.Params {
-	return rc.Params{
-		"name": tr.remote, // no locking needed to access thess
+	out := rc.Params{
+		"name": tr.remote, // no locking needed to access this
 		"size": tr.size,
 	}
+	if tr.srcFs != nil {
+		out["srcFs"] = fs.ConfigString(tr.srcFs)
+	}
+	if tr.dstFs != nil {
+		out["dstFs"] = fs.ConfigString(tr.dstFs)
+	}
+	return out
 }

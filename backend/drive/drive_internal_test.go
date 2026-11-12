@@ -4,28 +4,137 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"mime"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/filter"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/sync"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
+	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 )
+
+func newPermissionTestFs(t *testing.T, handler http.Handler) *Fs {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	service, err := drive.NewService(
+		context.Background(),
+		option.WithHTTPClient(server.Client()),
+		option.WithEndpoint(server.URL+"/"),
+	)
+	require.NoError(t, err)
+	return &Fs{
+		svc:           service,
+		pacer:         fs.NewPacer(context.Background(), pacer.NewGoogleDrive()),
+		permissionsMu: new(stdsync.Mutex),
+		permissions:   make(map[string]*drive.Permission),
+	}
+}
+
+func TestInternalGetPermissionConcurrent(t *testing.T) {
+	const requestCount = 2
+	arrived := make(chan string, requestCount)
+	release := make(chan struct{})
+	var releaseOnce stdsync.Once
+	releaseRequests := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	defer releaseRequests()
+
+	f := newPermissionTestFs(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		permissionID := path.Base(r.URL.Path)
+		arrived <- permissionID
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, err := fmt.Fprintf(w, `{"id":%q,"role":"reader","type":"user"}`, permissionID)
+		assert.NoError(t, err)
+	}))
+
+	type permissionResult struct {
+		permission *drive.Permission
+		inherited  bool
+		err        error
+	}
+	results := make(chan permissionResult, requestCount)
+	permissionIDs := []string{"permission-1", "permission-2"}
+	for _, permissionID := range permissionIDs {
+		go func() {
+			permission, inherited, err := f.getPermission(context.Background(), "file-id", permissionID, false)
+			results <- permissionResult{permission: permission, inherited: inherited, err: err}
+		}()
+	}
+
+	arrivedIDs := make(map[string]bool, requestCount)
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for len(arrivedIDs) < requestCount {
+		select {
+		case permissionID := <-arrived:
+			arrivedIDs[permissionID] = true
+		case <-timer.C:
+			releaseRequests()
+			t.Fatalf("timed out waiting for concurrent permission requests: got %d of %d", len(arrivedIDs), requestCount)
+		}
+	}
+	releaseRequests()
+
+	assert.Equal(t, map[string]bool{"permission-1": true, "permission-2": true}, arrivedIDs)
+	returnedIDs := make(map[string]bool, requestCount)
+	for range requestCount {
+		result := <-results
+		require.NoError(t, result.err)
+		require.NotNil(t, result.permission)
+		assert.False(t, result.inherited)
+		returnedIDs[result.permission.Id] = true
+	}
+	assert.Equal(t, arrivedIDs, returnedIDs)
+}
+
+func TestInternalGetPermissionCacheHit(t *testing.T) {
+	var requests atomic.Int32
+	f := newPermissionTestFs(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		permissionID := path.Base(r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, err := fmt.Fprintf(w, `{"id":%q,"role":"reader","type":"user"}`, permissionID)
+		assert.NoError(t, err)
+	}))
+
+	first, inherited, err := f.getPermission(context.Background(), "file-id", "permission-1", true)
+	require.NoError(t, err)
+	assert.False(t, inherited)
+	second, inherited, err := f.getPermission(context.Background(), "file-id", "permission-1", true)
+	require.NoError(t, err)
+	assert.False(t, inherited)
+
+	assert.Same(t, first, second)
+	assert.Equal(t, int32(1), requests.Load())
+}
 
 func TestDriveScopes(t *testing.T) {
 	for _, test := range []struct {
@@ -73,7 +182,7 @@ var additionalMimeTypes = map[string]string{
 // Load the example export formats into exportFormats for testing
 func TestInternalLoadExampleFormats(t *testing.T) {
 	fetchFormatsOnce.Do(func() {})
-	buf, err := ioutil.ReadFile(filepath.FromSlash("test/about.json"))
+	buf, err := os.ReadFile(filepath.FromSlash("test/about.json"))
 	var about struct {
 		ExportFormats map[string][]string `json:"exportFormats,omitempty"`
 		ImportFormats map[string][]string `json:"importFormats,omitempty"`
@@ -91,7 +200,7 @@ func TestInternalParseExtensions(t *testing.T) {
 		wantErr error
 	}{
 		{"doc", []string{".doc"}, nil},
-		{" docx ,XLSX, 	pptx,svg", []string{".docx", ".xlsx", ".pptx", ".svg"}, nil},
+		{" docx ,XLSX, 	pptx,svg,md", []string{".docx", ".xlsx", ".pptx", ".svg", ".md"}, nil},
 		{"docx,svg,Docx", []string{".docx", ".svg"}, nil},
 		{"docx,potato,docx", []string{".docx"}, errors.New(`couldn't find MIME type for extension ".potato"`)},
 	} {
@@ -141,6 +250,34 @@ func TestInternalFindExportFormat(t *testing.T) {
 	}
 }
 
+func TestShortcutLoop(t *testing.T) {
+	f := &Fs{}
+	f.dirCache = dircache.New("", "root", f)
+	// root is FolderX with ID "X"
+	f.dirCache.Put("", "X")
+	// a real subfolder
+	f.dirCache.Put("sub", "sub-id")
+	// a nested subfolder reached via a shortcut, composite ID
+	f.dirCache.Put("sub/nested", joinID("nested-id", "shortcut-id"))
+
+	for _, test := range []struct {
+		name     string
+		remote   string
+		targetID string
+		want     bool
+	}{
+		{"shortcut to the root itself", "loop", "X", true},
+		{"shortcut to the parent", "sub/loop", "sub-id", true},
+		{"shortcut to a grandparent", "sub/nested/loop", "X", true},
+		{"shortcut to a composite ancestor", "sub/nested/loop", "nested-id", true},
+		{"shortcut to an unrelated folder", "sub/loop", "other-id", false},
+		{"shortcut to a sibling", "sub/loop", "sub-id2", false},
+	} {
+		got := f.shortcutLoop(test.remote, test.targetID)
+		assert.Equal(t, test.want, got, test.name)
+	}
+}
+
 func TestMimeTypesToExtension(t *testing.T) {
 	for mimeType, extension := range _mimeTypeToExtension {
 		extensions, err := mime.ExtensionsByType(mimeType)
@@ -185,6 +322,69 @@ func TestExtensionsForImportFormats(t *testing.T) {
 			assert.NotEmpty(t, extensions, "No extension found for %q", fromMT)
 		}
 	}
+}
+
+func (f *Fs) InternalTestShouldRetry(t *testing.T) {
+	ctx := context.Background()
+	gatewayTimeout := googleapi.Error{
+		Code: 503,
+	}
+	timeoutRetry, timeoutError := f.shouldRetry(ctx, &gatewayTimeout)
+	assert.True(t, timeoutRetry)
+	assert.Equal(t, &gatewayTimeout, timeoutError)
+	generic403 := googleapi.Error{
+		Code: 403,
+	}
+	rLEItem := googleapi.ErrorItem{
+		Reason:  "rateLimitExceeded",
+		Message: "User rate limit exceeded.",
+	}
+	generic403.Errors = append(generic403.Errors, rLEItem)
+	oldStopUpload := f.opt.StopOnUploadLimit
+	oldStopDownload := f.opt.StopOnDownloadLimit
+	f.opt.StopOnUploadLimit = true
+	f.opt.StopOnDownloadLimit = true
+	defer func() {
+		f.opt.StopOnUploadLimit = oldStopUpload
+		f.opt.StopOnDownloadLimit = oldStopDownload
+	}()
+	expectedRLError := fserrors.FatalError(&generic403)
+	rateLimitRetry, rateLimitErr := f.shouldRetry(ctx, &generic403)
+	assert.False(t, rateLimitRetry)
+	assert.Equal(t, rateLimitErr, expectedRLError)
+	dQEItem := googleapi.ErrorItem{
+		Reason: "downloadQuotaExceeded",
+	}
+	generic403.Errors[0] = dQEItem
+	expectedDQError := fserrors.FatalError(&generic403)
+	downloadQuotaRetry, downloadQuotaError := f.shouldRetry(ctx, &generic403)
+	assert.False(t, downloadQuotaRetry)
+	assert.Equal(t, downloadQuotaError, expectedDQError)
+	tDFLEItem := googleapi.ErrorItem{
+		Reason: "teamDriveFileLimitExceeded",
+	}
+	generic403.Errors[0] = tDFLEItem
+	expectedTDFLError := fserrors.FatalError(&generic403)
+	teamDriveFileLimitRetry, teamDriveFileLimitError := f.shouldRetry(ctx, &generic403)
+	assert.False(t, teamDriveFileLimitRetry)
+	assert.Equal(t, teamDriveFileLimitError, expectedTDFLError)
+	qEItem := googleapi.ErrorItem{
+		Reason: "quotaExceeded",
+	}
+	generic403.Errors[0] = qEItem
+	expectedQuotaError := fserrors.FatalError(&generic403)
+	quotaExceededRetry, quotaExceededError := f.shouldRetry(ctx, &generic403)
+	assert.False(t, quotaExceededRetry)
+	assert.Equal(t, quotaExceededError, expectedQuotaError)
+
+	sqEItem := googleapi.ErrorItem{
+		Reason: "storageQuotaExceeded",
+	}
+	generic403.Errors[0] = sqEItem
+	expectedStorageQuotaError := fserrors.FatalError(&generic403)
+	storageQuotaExceededRetry, storageQuotaExceededError := f.shouldRetry(ctx, &generic403)
+	assert.False(t, storageQuotaExceededRetry)
+	assert.Equal(t, storageQuotaExceededError, expectedStorageQuotaError)
 }
 
 func (f *Fs) InternalTestDocumentImport(t *testing.T) {
@@ -375,9 +575,9 @@ func (f *Fs) InternalTestUnTrash(t *testing.T) {
 	// Make some objects, one in a subdir
 	contents := random.String(100)
 	file1 := fstest.NewItem("trashDir/toBeTrashed", contents, time.Now())
-	_, obj1 := fstests.PutTestContents(ctx, t, f, &file1, contents, false)
+	obj1 := fstests.PutTestContents(ctx, t, f, &file1, contents, false)
 	file2 := fstest.NewItem("trashDir/subdir/toBeTrashed", contents, time.Now())
-	_, _ = fstests.PutTestContents(ctx, t, f, &file2, contents, false)
+	_ = fstests.PutTestContents(ctx, t, f, &file2, contents, false)
 
 	// Check objects
 	checkObjects := func() {
@@ -412,18 +612,14 @@ func (f *Fs) InternalTestUnTrash(t *testing.T) {
 	require.NoError(t, f.Purge(ctx, "trashDir"))
 }
 
-// TestIntegration/FsMkdir/FsPutFiles/Internal/CopyID
-func (f *Fs) InternalTestCopyID(t *testing.T) {
+// TestIntegration/FsMkdir/FsPutFiles/Internal/CopyOrMoveID
+func (f *Fs) InternalTestCopyOrMoveID(t *testing.T) {
 	ctx := context.Background()
 	obj, err := f.NewObject(ctx, existingFile)
 	require.NoError(t, err)
 	o := obj.(*Object)
 
-	dir, err := ioutil.TempDir("", "rclone-drive-copyid-test")
-	require.NoError(t, err)
-	defer func() {
-		_ = os.RemoveAll(dir)
-	}()
+	dir := t.TempDir()
 
 	checkFile := func(name string) {
 		filePath := filepath.Join(dir, name)
@@ -435,7 +631,7 @@ func (f *Fs) InternalTestCopyID(t *testing.T) {
 	}
 
 	t.Run("BadID", func(t *testing.T) {
-		err = f.copyID(ctx, "ID-NOT-FOUND", dir+"/")
+		err = f.copyOrMoveID(ctx, "moveid", "ID-NOT-FOUND", dir+"/")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "couldn't find id")
 	})
@@ -443,22 +639,256 @@ func (f *Fs) InternalTestCopyID(t *testing.T) {
 	t.Run("Directory", func(t *testing.T) {
 		rootID, err := f.dirCache.RootID(ctx, false)
 		require.NoError(t, err)
-		err = f.copyID(ctx, rootID, dir+"/")
+		err = f.copyOrMoveID(ctx, "moveid", rootID, dir+"/")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "can't copy directory")
+		assert.Contains(t, err.Error(), "can't moveid directory")
 	})
 
-	t.Run("WithoutDestName", func(t *testing.T) {
-		err = f.copyID(ctx, o.id, dir+"/")
+	t.Run("MoveWithoutDestName", func(t *testing.T) {
+		err = f.copyOrMoveID(ctx, "moveid", o.id, dir+"/")
 		require.NoError(t, err)
 		checkFile(path.Base(existingFile))
 	})
 
-	t.Run("WithDestName", func(t *testing.T) {
-		err = f.copyID(ctx, o.id, dir+"/potato.txt")
+	t.Run("CopyWithoutDestName", func(t *testing.T) {
+		err = f.copyOrMoveID(ctx, "copyid", o.id, dir+"/")
+		require.NoError(t, err)
+		checkFile(path.Base(existingFile))
+	})
+
+	t.Run("MoveWithDestName", func(t *testing.T) {
+		err = f.copyOrMoveID(ctx, "moveid", o.id, dir+"/potato.txt")
 		require.NoError(t, err)
 		checkFile("potato.txt")
 	})
+
+	t.Run("CopyWithDestName", func(t *testing.T) {
+		err = f.copyOrMoveID(ctx, "copyid", o.id, dir+"/potato.txt")
+		require.NoError(t, err)
+		checkFile("potato.txt")
+	})
+}
+
+// TestIntegration/FsMkdir/FsPutFiles/Internal/Query
+func (f *Fs) InternalTestQuery(t *testing.T) {
+	ctx := context.Background()
+	var err error
+	t.Run("BadQuery", func(t *testing.T) {
+		_, err = f.query(ctx, "this is a bad query")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to execute query")
+	})
+
+	t.Run("NoMatch", func(t *testing.T) {
+		results, err := f.query(ctx, fmt.Sprintf("name='%s' and name!='%s'", existingSubDir, existingSubDir))
+		require.NoError(t, err)
+		assert.Len(t, results, 0)
+	})
+
+	t.Run("GoodQuery", func(t *testing.T) {
+		pathSegments := strings.Split(existingFile, "/")
+		var parent string
+		for _, item := range pathSegments {
+			// the file name contains ' characters which must be escaped
+			escapedItem := f.opt.Enc.FromStandardName(item)
+			escapedItem = strings.ReplaceAll(escapedItem, `\`, `\\`)
+			escapedItem = strings.ReplaceAll(escapedItem, `'`, `\'`)
+
+			results, err := f.query(ctx, fmt.Sprintf("%strashed=false and name='%s'", parent, escapedItem))
+			require.NoError(t, err)
+			require.True(t, len(results) > 0)
+			for _, result := range results {
+				assert.True(t, len(result.Id) > 0)
+				assert.Equal(t, result.Name, item)
+			}
+			parent = fmt.Sprintf("'%s' in parents and ", results[0].Id)
+		}
+	})
+}
+
+// TestIntegration/FsMkdir/FsPutFiles/Internal/AgeQuery
+func (f *Fs) InternalTestAgeQuery(t *testing.T) {
+	// Check set up for filtering
+	assert.True(t, f.Features().FilterAware)
+
+	opt := &filter.Options{}
+	err := opt.MaxAge.Set("1h")
+	assert.NoError(t, err)
+	flt, err := filter.NewFilter(opt)
+	assert.NoError(t, err)
+
+	defCtx := context.Background()
+	fltCtx := filter.ReplaceConfig(defCtx, flt)
+
+	testCtx1 := fltCtx
+	testCtx2 := filter.SetUseFilter(testCtx1, true)
+	testCtx3, testCancel := context.WithCancel(testCtx2)
+	testCtx4 := filter.SetUseFilter(testCtx3, false)
+	testCancel()
+	assert.False(t, filter.GetUseFilter(testCtx1))
+	assert.True(t, filter.GetUseFilter(testCtx2))
+	assert.True(t, filter.GetUseFilter(testCtx3))
+	assert.False(t, filter.GetUseFilter(testCtx4))
+
+	subRemote := fmt.Sprintf("%s:%s/%s", f.Name(), f.Root(), "agequery-testdir")
+	subFsResult, err := fs.NewFs(defCtx, subRemote)
+	require.NoError(t, err)
+	subFs, isDriveFs := subFsResult.(*Fs)
+	require.True(t, isDriveFs)
+
+	tempDir1 := t.TempDir()
+	tempFs1, err := fs.NewFs(defCtx, tempDir1)
+	require.NoError(t, err)
+
+	tempDir2 := t.TempDir()
+	tempFs2, err := fs.NewFs(defCtx, tempDir2)
+	require.NoError(t, err)
+
+	file1 := fstest.Item{ModTime: time.Now(), Path: "agequery.txt"}
+	_ = fstests.PutTestContents(defCtx, t, tempFs1, &file1, "abcxyz", true)
+
+	// validate sync/copy
+	const timeQuery = "(modifiedTime >= '"
+
+	assert.NoError(t, sync.CopyDir(defCtx, subFs, tempFs1, false))
+	assert.NotContains(t, subFs.lastQuery, timeQuery)
+
+	assert.NoError(t, sync.CopyDir(fltCtx, subFs, tempFs1, false))
+	assert.Contains(t, subFs.lastQuery, timeQuery)
+
+	assert.NoError(t, sync.CopyDir(fltCtx, tempFs2, subFs, false))
+	assert.Contains(t, subFs.lastQuery, timeQuery)
+
+	assert.NoError(t, sync.CopyDir(defCtx, tempFs2, subFs, false))
+	assert.NotContains(t, subFs.lastQuery, timeQuery)
+
+	// validate list/walk
+	devNull, errOpen := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	require.NoError(t, errOpen)
+	defer func() {
+		_ = devNull.Close()
+	}()
+
+	assert.NoError(t, operations.List(defCtx, subFs, devNull))
+	assert.NotContains(t, subFs.lastQuery, timeQuery)
+
+	assert.NoError(t, operations.List(fltCtx, subFs, devNull))
+	assert.Contains(t, subFs.lastQuery, timeQuery)
+}
+
+// TestIntegration/FsMkdir/FsPutFiles/Internal/SingleQuoteFolder
+func (f *Fs) InternalTestSingleQuoteFolder(t *testing.T) {
+	ctx := context.Background()
+
+	// Test various folder names containing single quotes
+	for _, name := range []string{
+		"'",
+		"''",
+		"'a'",
+		"it's a test",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := "singleQuoteTest/" + name
+			err := f.Mkdir(ctx, dir)
+			require.NoError(t, err)
+			defer func() {
+				err := f.Rmdir(ctx, dir)
+				assert.NoError(t, err)
+			}()
+
+			entries, err := f.List(ctx, "singleQuoteTest")
+			require.NoError(t, err)
+
+			found := false
+			for _, entry := range entries {
+				if entry.Remote() == dir {
+					found = true
+					break
+				}
+			}
+			assert.True(t, found, "directory %q not found in listing", name)
+		})
+	}
+
+	err := f.Rmdir(ctx, "singleQuoteTest")
+	assert.NoError(t, err)
+}
+
+// TestIntegration/FsMkdir/FsPutFiles/Internal/MoveDuplicateParent
+//
+// Check that moving a file removes it from its real parent even when there
+// are two directories with the same name and the directory cache resolves the
+// path to the wrong duplicate. Otherwise the file ends up with two parents
+// which fails on shared drives with a teamDrivesParentLimit error (#9472).
+func (f *Fs) InternalTestMoveDuplicateParent(t *testing.T) {
+	ctx := context.Background()
+	if f.Features().Move == nil {
+		t.Skip("Move not supported")
+	}
+
+	rootID, err := f.dirCache.RootID(ctx, false)
+	require.NoError(t, err)
+
+	const dupName = "dup9472"
+	const dstName = "dst9472"
+	const fileName = "michael.txt"
+
+	// Create the first "dup9472" directory - this is the one the directory
+	// cache will resolve the path to.
+	dirA, err := f.createDir(ctx, rootID, dupName, nil)
+	require.NoError(t, err)
+	f.dirCache.Put(dupName, dirA.Id)
+
+	// Create a second directory with the SAME name and parent: a duplicate
+	// the directory cache does not know about.
+	dirB, err := f.createDir(ctx, rootID, dupName, nil)
+	require.NoError(t, err)
+
+	// Destination directory
+	dirDst, err := f.createDir(ctx, rootID, dstName, nil)
+	require.NoError(t, err)
+
+	defer func() {
+		_ = f.delete(ctx, dirA.Id, false)
+		_ = f.delete(ctx, dirB.Id, false)
+		_ = f.delete(ctx, dirDst.Id, false)
+		f.dirCache.Flush()
+	}()
+
+	// Upload a file directly into dirB (the duplicate the cache doesn't know).
+	createInfo := &drive.File{
+		Name:    fileName,
+		Parents: []string{dirB.Id},
+	}
+	var fileInfo *drive.File
+	err = f.pacer.Call(func() (bool, error) {
+		fileInfo, err = f.svc.Files.Create(createInfo).
+			Media(strings.NewReader("9472 duplicate parent test")).
+			Fields(f.getFileFields(ctx)).
+			SupportsAllDrives(true).
+			Context(ctx).Do()
+		return f.shouldRetry(ctx, err)
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{dirB.Id}, fileInfo.Parents)
+
+	// Sanity check: the directory cache resolves the path to dirA, not the
+	// dirB the file actually lives in.
+	gotDirID, err := f.dirCache.FindDir(ctx, dupName, false)
+	require.NoError(t, err)
+	require.Equal(t, dirA.Id, gotDirID, "directory cache should resolve to the wrong duplicate")
+
+	// Build the source object pointing at the file in dirB and move it.
+	srcObj, err := f.newObjectWithInfo(ctx, dupName+"/"+fileName, fileInfo)
+	require.NoError(t, err)
+
+	dstObj, err := f.Move(ctx, srcObj, dstName+"/"+fileName)
+	require.NoError(t, err)
+
+	// The moved file must have exactly one parent: the destination.
+	movedInfo, err := f.getFile(ctx, dstObj.(fs.IDer).ID(), "id,parents")
+	require.NoError(t, err)
+	assert.Equal(t, []string{dirDst.Id}, movedInfo.Parents)
 }
 
 func (f *Fs) InternalTest(t *testing.T) {
@@ -477,7 +907,60 @@ func (f *Fs) InternalTest(t *testing.T) {
 	})
 	t.Run("Shortcuts", f.InternalTestShortcuts)
 	t.Run("UnTrash", f.InternalTestUnTrash)
-	t.Run("CopyID", f.InternalTestCopyID)
+	t.Run("CopyOrMoveID", f.InternalTestCopyOrMoveID)
+	t.Run("Query", f.InternalTestQuery)
+	t.Run("AgeQuery", f.InternalTestAgeQuery)
+	t.Run("SingleQuoteFolder", f.InternalTestSingleQuoteFolder)
+	t.Run("MoveDuplicateParent", f.InternalTestMoveDuplicateParent)
+	t.Run("ShouldRetry", f.InternalTestShouldRetry)
 }
 
 var _ fstests.InternalTester = (*Fs)(nil)
+
+func TestRefillListRInputStopsWhenInputClosed(t *testing.T) {
+	mu := stdsync.Mutex{}
+	wg := stdsync.WaitGroup{}
+	in := make(chan listREntry, listRInputBuffer)
+	overflow := []listREntry{{id: "folder", path: "folder"}}
+
+	mu.Lock()
+	close(in)
+	in = nil
+	mu.Unlock()
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- refillListRInput(&mu, &in, &overflow, &wg)
+	}()
+	select {
+	case ok := <-done:
+		require.False(t, ok, "refill continued after the input channel was closed")
+	case <-time.After(time.Second):
+		t.Fatal("refill blocked after the input channel was closed")
+	}
+	require.Len(t, overflow, 1)
+
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("refill incremented the wait group after the input channel was closed")
+	}
+}
+
+func TestRefillListRInputSendsQueuedDirectory(t *testing.T) {
+	mu := stdsync.Mutex{}
+	wg := stdsync.WaitGroup{}
+	in := make(chan listREntry, listRInputBuffer)
+	overflow := []listREntry{{id: "folder", path: "folder"}}
+
+	require.True(t, refillListRInput(&mu, &in, &overflow, &wg), "refill stopped while the input channel was open")
+	require.Empty(t, overflow)
+	got := <-in
+	require.Equal(t, listREntry{id: "folder", path: "folder"}, got)
+	wg.Done()
+}

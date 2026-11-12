@@ -1,45 +1,76 @@
 package http
 
 import (
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"flag"
-	"io/ioutil"
+	"io"
+	stdfs "io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/rclone/rclone/backend/local"
-	"github.com/rclone/rclone/cmd/serve/httplib"
+	"github.com/rclone/rclone/cmd/serve/proxy"
+	"github.com/rclone/rclone/cmd/serve/servetest"
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/filter"
+	"github.com/rclone/rclone/fs/rc"
+	libhttp "github.com/rclone/rclone/lib/http"
+	"github.com/rclone/rclone/lib/random"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+type zipEntry struct {
+	IsDir    bool
+	Contents string
+}
+
 var (
 	updateGolden = flag.Bool("updategolden", false, "update golden files for regression test")
-	httpServer   *server
-	testURL      string
 )
 
 const (
 	testBindAddress = "localhost:0"
+	testUser        = "user"
+	testPass        = "pass"
 	testTemplate    = "testdata/golden/testindex.html"
 )
 
-func startServer(t *testing.T, f fs.Fs) {
-	opt := httplib.DefaultOpt
-	opt.ListenAddr = testBindAddress
-	opt.Template = testTemplate
-	httpServer = newServer(f, &opt)
-	assert.NoError(t, httpServer.Serve())
-	testURL = httpServer.Server.URL()
+func start(ctx context.Context, t *testing.T, f fs.Fs) (s *HTTP, testURL string) {
+	opts := Options{
+		HTTP: libhttp.DefaultCfg(),
+		Template: libhttp.TemplateConfig{
+			Path: testTemplate,
+		},
+	}
+	opts.HTTP.ListenAddr = []string{testBindAddress}
+	if proxy.Opt.AuthProxy == "" {
+		opts.Auth.BasicUser = testUser
+		opts.Auth.BasicPass = testPass
+	}
+
+	s, err := newServer(ctx, f, &opts, &vfscommon.Opt, &proxy.Opt)
+	require.NoError(t, err, "failed to start server")
+	go func() {
+		require.NoError(t, s.Serve())
+	}()
+
+	urls := s.server.URLs()
+	require.Len(t, urls, 1, "expected one URL")
+
+	testURL = urls[0]
 
 	// try to connect to the test server
 	pause := time.Millisecond
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		resp, err := http.Head(testURL)
 		if err == nil {
 			_ = resp.Body.Close()
@@ -51,6 +82,17 @@ func startServer(t *testing.T, f fs.Fs) {
 	}
 	t.Fatal("couldn't connect to server")
 
+	return s, testURL
+}
+
+// setAllModTimes walks root and sets atime/mtime to t for every file & directory.
+func setAllModTimes(root string, t time.Time) error {
+	return filepath.WalkDir(root, func(path string, d stdfs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(path, t, t)
+	})
 }
 
 var (
@@ -58,48 +100,94 @@ var (
 	expectedTime = time.Date(2000, 1, 2, 3, 4, 5, 0, time.UTC)
 )
 
-func TestInit(t *testing.T) {
-	ctx := context.Background()
-	// Configure the remote
-	configfile.LoadConfig(context.Background())
-	// fs.Config.LogLevel = fs.LogLevelDebug
-	// fs.Config.DumpHeaders = true
-	// fs.Config.DumpBodies = true
-
-	// exclude files called hidden.txt and directories called hidden
-	fi := filter.GetConfig(ctx)
-	require.NoError(t, fi.AddRule("- hidden.txt"))
-	require.NoError(t, fi.AddRule("- hidden/**"))
-
-	// Create a test Fs
-	f, err := fs.NewFs(context.Background(), "testdata/files")
-	require.NoError(t, err)
-
-	// set date of datedObject to expectedTime
-	obj, err := f.NewObject(context.Background(), datedObject)
-	require.NoError(t, err)
-	require.NoError(t, obj.SetModTime(context.Background(), expectedTime))
-
-	startServer(t, f)
-}
-
 // check body against the file, or re-write body if -updategolden is
 // set.
 func checkGolden(t *testing.T, fileName string, got []byte) {
 	if *updateGolden {
 		t.Logf("Updating golden file %q", fileName)
-		err := ioutil.WriteFile(fileName, got, 0666)
+		err := os.WriteFile(fileName, got, 0666)
 		require.NoError(t, err)
 	} else {
-		want, err := ioutil.ReadFile(fileName)
+		want, err := os.ReadFile(fileName)
 		require.NoError(t, err)
+		if strings.HasSuffix(fileName, ".zip") {
+			assert.Equal(t, readZip(t, want), readZip(t, got), fileName)
+			return
+		}
 		wants := strings.Split(string(want), "\n")
 		gots := strings.Split(string(got), "\n")
 		assert.Equal(t, wants, gots, fileName)
 	}
 }
 
-func TestGET(t *testing.T) {
+func readZip(t *testing.T, data []byte) map[string]zipEntry {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	require.NoError(t, err)
+
+	entries := make(map[string]zipEntry, len(zr.File))
+	for _, f := range zr.File {
+		entry := zipEntry{
+			IsDir: f.FileInfo().IsDir(),
+		}
+		if !entry.IsDir {
+			rc, err := f.Open()
+			require.NoError(t, err)
+			contents, err := io.ReadAll(rc)
+			require.NoError(t, err)
+			require.NoError(t, rc.Close())
+			entry.Contents = string(contents)
+		}
+		entries[f.Name] = entry
+	}
+	return entries
+}
+
+func testGET(t *testing.T, useProxy bool) {
+	ctx := context.Background()
+	// ci := fs.GetConfig(ctx)
+	// ci.LogLevel = fs.LogLevelDebug
+
+	// exclude files called hidden.txt and directories called hidden
+	fi := filter.GetConfig(ctx)
+	require.NoError(t, fi.AddRule("- hidden.txt"))
+	require.NoError(t, fi.AddRule("- hidden/**"))
+
+	var f fs.Fs
+	if useProxy {
+		// the backend config will be made by the proxy
+		prog, err := filepath.Abs("../servetest/proxy_code.go")
+		require.NoError(t, err)
+		files, err := filepath.Abs("testdata/files")
+		require.NoError(t, err)
+		cmd := "go run " + prog + " " + files
+
+		// FIXME this is untidy setting a global variable!
+		proxy.Opt.AuthProxy = cmd
+		defer func() {
+			proxy.Opt.AuthProxy = ""
+		}()
+
+		f = nil
+	} else {
+		// set all the mod times to expectedTime
+		require.NoError(t, setAllModTimes("testdata/files", expectedTime))
+		// Create a test Fs
+		var err error
+		f, err = fs.NewFs(context.Background(), "testdata/files")
+		require.NoError(t, err)
+
+		// set date of datedObject to expectedTime
+		obj, err := f.NewObject(context.Background(), datedObject)
+		require.NoError(t, err)
+		require.NoError(t, obj.SetModTime(context.Background(), expectedTime))
+	}
+
+	s, testURL := start(ctx, t, f)
+	defer func() {
+		assert.NoError(t, s.server.Shutdown())
+	}()
+
 	for _, test := range []struct {
 		URL    string
 		Status int
@@ -194,6 +282,16 @@ func TestGET(t *testing.T) {
 			Range:  "bytes=3-",
 			Golden: "testdata/golden/two3-.txt",
 		},
+		{
+			URL:    "/?download=zip",
+			Status: http.StatusOK,
+			Golden: "testdata/golden/root.zip",
+		},
+		{
+			URL:    "/three/?download=zip",
+			Status: http.StatusOK,
+			Golden: "testdata/golden/three.zip",
+		},
 	} {
 		method := test.Method
 		if method == "" {
@@ -204,10 +302,11 @@ func TestGET(t *testing.T) {
 		if test.Range != "" {
 			req.Header.Add("Range", test.Range)
 		}
+		req.SetBasicAuth(testUser, testPass)
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
 		assert.Equal(t, test.Status, resp.StatusCode, test.Golden)
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		// Check we got a Last-Modified header and that it is a valid date
@@ -226,7 +325,275 @@ func TestGET(t *testing.T) {
 	}
 }
 
-func TestFinalise(t *testing.T) {
-	httpServer.Close()
-	httpServer.Wait()
+func TestGET(t *testing.T) {
+	testGET(t, false)
+}
+
+func TestAuthProxy(t *testing.T) {
+	testGET(t, true)
+}
+
+func TestFavicon(t *testing.T) {
+	ctx := context.Background()
+
+	doGet := func(testURL, path string) *http.Response {
+		req, err := http.NewRequest("GET", testURL+path, nil)
+		require.NoError(t, err)
+		req.SetBasicAuth(testUser, testPass)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	t.Run("fallback", func(t *testing.T) {
+		// testdata/files has no favicon.ico, so the embedded fallback is served
+		f, err := fs.NewFs(ctx, "testdata/files")
+		require.NoError(t, err)
+		s, testURL := start(ctx, t, f)
+		defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+		resp := doGet(testURL, "favicon.ico")
+		defer func() { _ = resp.Body.Close() }()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
+		assert.Equal(t, "max-age=86400", resp.Header.Get("Cache-Control"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, faviconData, body)
+	})
+
+	t.Run("remote override", func(t *testing.T) {
+		// Start a server on a temp dir that already contains a custom favicon.ico,
+		// so the VFS sees it at init time and serves it instead of the fallback.
+		dir := t.TempDir()
+		customFavicon := []byte("custom favicon data")
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "favicon.ico"), customFavicon, 0666))
+
+		f, err := fs.NewFs(ctx, dir)
+		require.NoError(t, err)
+		s, testURL := start(ctx, t, f)
+		defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+		resp := doGet(testURL, "favicon.ico")
+		defer func() { _ = resp.Body.Close() }()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, customFavicon, body)
+	})
+}
+
+func TestCompressedDirectoryListing(t *testing.T) {
+	ctx := context.Background()
+	require.NoError(t, setAllModTimes("testdata/files", expectedTime))
+	f, err := fs.NewFs(ctx, "testdata/files")
+	require.NoError(t, err)
+
+	s, testURL := start(ctx, t, f)
+	defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+	req, err := http.NewRequest("GET", testURL, nil)
+	require.NoError(t, err)
+	req.SetBasicAuth(testUser, testPass)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+
+	gr, err := gzip.NewReader(resp.Body)
+	require.NoError(t, err)
+	defer func() { _ = gr.Close() }()
+
+	body, err := io.ReadAll(gr)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "Directory listing of /")
+}
+
+func TestCompressedTextFile(t *testing.T) {
+	ctx := context.Background()
+	require.NoError(t, setAllModTimes("testdata/files", expectedTime))
+	f, err := fs.NewFs(ctx, "testdata/files")
+	require.NoError(t, err)
+
+	s, testURL := start(ctx, t, f)
+	defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+	req, err := http.NewRequest("GET", testURL+"two.txt", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth(testUser, testPass)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+
+	gr, err := gzip.NewReader(resp.Body)
+	require.NoError(t, err)
+	defer func() { _ = gr.Close() }()
+
+	body, err := io.ReadAll(gr)
+	require.NoError(t, err)
+	assert.Equal(t, "0123456789\n", string(body))
+}
+
+func TestDisableDirList(t *testing.T) {
+	ctx := context.Background()
+	require.NoError(t, setAllModTimes("testdata/files", expectedTime))
+	f, err := fs.NewFs(ctx, "testdata/files")
+	require.NoError(t, err)
+
+	do := func(t *testing.T, disableDirList bool, url string) (int, []byte) {
+		t.Helper()
+		opts := Options{
+			HTTP: libhttp.DefaultCfg(),
+			Template: libhttp.TemplateConfig{
+				Path: testTemplate,
+			},
+			DisableDirList: disableDirList,
+		}
+		opts.HTTP.ListenAddr = []string{testBindAddress}
+		opts.Auth.BasicUser = testUser
+		opts.Auth.BasicPass = testPass
+
+		s, err := newServer(ctx, f, &opts, &vfscommon.Opt, &proxy.Opt)
+		require.NoError(t, err)
+		go func() { require.NoError(t, s.Serve()) }()
+		defer func() { assert.NoError(t, s.server.Shutdown()) }()
+
+		urls := s.server.URLs()
+		require.Len(t, urls, 1)
+		testURL := urls[0]
+
+		pause := time.Millisecond
+		for range 10 {
+			resp, err := http.Head(testURL)
+			if err == nil {
+				_ = resp.Body.Close()
+				break
+			}
+			time.Sleep(pause)
+			pause *= 2
+		}
+
+		req, err := http.NewRequest("GET", testURL+url, nil)
+		require.NoError(t, err)
+		req.SetBasicAuth(testUser, testPass)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		return resp.StatusCode, body
+	}
+
+	t.Run("enabled by default - root dir lists", func(t *testing.T) {
+		status, body := do(t, false, "")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Contains(t, string(body), "Directory listing of /")
+	})
+
+	t.Run("enabled by default - subdir lists", func(t *testing.T) {
+		status, body := do(t, false, "three/")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Contains(t, string(body), "Directory listing of /three")
+	})
+
+	t.Run("disabled - root dir returns not found", func(t *testing.T) {
+		status, _ := do(t, true, "")
+		assert.Equal(t, http.StatusNotFound, status)
+	})
+
+	t.Run("disabled - subdir returns not found", func(t *testing.T) {
+		status, _ := do(t, true, "three/")
+		assert.Equal(t, http.StatusNotFound, status)
+	})
+
+	t.Run("disabled - existing and non-existent dirs return identical response", func(t *testing.T) {
+		// All must return the same status and body to prevent
+		// directory enumeration, with or without a trailing slash
+		for _, dir := range []string{"three/", "doesnotexist/", "three", "doesnotexist"} {
+			status, body := do(t, true, dir)
+			assert.Equal(t, http.StatusNotFound, status, dir)
+			assert.Equal(t, "404 page not found\n", string(body), dir)
+		}
+	})
+
+	t.Run("disabled - files still served", func(t *testing.T) {
+		status, body := do(t, true, "two.txt")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "0123456789\n", string(body))
+	})
+
+	t.Run("disabled - subdir file still served", func(t *testing.T) {
+		status, _ := do(t, true, "three/a.txt")
+		assert.Equal(t, http.StatusOK, status)
+	})
+}
+
+func TestRc(t *testing.T) {
+	servetest.TestRc(t, rc.Params{
+		"type":           "http",
+		"vfs_cache_mode": "off",
+	})
+}
+
+// TestNewServerError checks that a server initialisation failure is
+// returned as an error rather than panicking in the cleanup.
+func TestNewServerError(t *testing.T) {
+	ctx := context.Background()
+	f, err := fs.NewFs(ctx, "testdata/files")
+	require.NoError(t, err)
+
+	opts := Options{
+		HTTP: libhttp.DefaultCfg(),
+	}
+	opts.HTTP.ListenAddr = []string{"localhost:-1"}
+
+	s, err := newServer(ctx, f, &opts, &vfscommon.Opt, &proxy.Opt)
+	require.Error(t, err)
+	assert.Nil(t, s)
+}
+
+// TestAuthProxyDownloadOutlivesCache checks a download in progress
+// carries on working when the auth proxy drops its VFS from its cache,
+// as it does when a download takes longer than the cache expiry time.
+func TestAuthProxyDownloadOutlivesCache(t *testing.T) {
+	root := t.TempDir()
+	contents := random.String(32 * 1024 * 1024)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "download.bin"), []byte(contents), 0666))
+
+	prog, err := filepath.Abs("../servetest/proxy_code.go")
+	require.NoError(t, err)
+	// FIXME this is untidy setting a global variable!
+	proxy.Opt.AuthProxy = "go run " + prog + " " + root
+	defer func() {
+		proxy.Opt.AuthProxy = ""
+	}()
+	s, testURL := start(context.Background(), t, nil)
+	defer func() { assert.NoError(t, s.Shutdown()) }()
+
+	req, err := http.NewRequest("GET", testURL+"download.bin", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth(testUser, testPass)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	start := make([]byte, 1024)
+	_, err = io.ReadFull(resp.Body, start)
+	require.NoError(t, err)
+
+	// Drop everything from the proxy's cache as if it had expired
+	s.provider.Proxy().Shutdown()
+
+	rest, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.True(t, contents == string(start)+string(rest), "download corrupted")
 }

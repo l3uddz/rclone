@@ -1,5 +1,4 @@
-// +build !windows,!plan9,!js
-// +build !noselfupdate
+//go:build !windows && !plan9 && !js && !noselfupdate
 
 package selfupdate
 

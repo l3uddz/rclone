@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fshttp"
 	"golang.org/x/net/publicsuffix"
@@ -75,7 +74,7 @@ xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-util
 <a:ReplyTo>
 <a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address>
 </a:ReplyTo>
-<a:To s:mustUnderstand="1">https://login.microsoftonline.com/extSTS.srf</a:To>
+<a:To s:mustUnderstand="1">{{ .SPTokenURL }}</a:To>
 <o:Security s:mustUnderstand="1"
  xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
 <o:UsernameToken>
@@ -122,12 +121,12 @@ func (ca *CookieAuth) Cookies(ctx context.Context) (*CookieResponse, error) {
 func (ca *CookieAuth) getSPCookie(conf *SharepointSuccessResponse) (*CookieResponse, error) {
 	spRoot, err := url.Parse(ca.endpoint)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error while constructing endpoint URL")
+		return nil, fmt.Errorf("error while constructing endpoint URL: %w", err)
 	}
 
 	u, err := url.Parse(spRoot.Scheme + "://" + spRoot.Host + "/_forms/default.aspx?wa=wsignin1.0")
 	if err != nil {
-		return nil, errors.Wrap(err, "Error while constructing login URL")
+		return nil, fmt.Errorf("error while constructing login URL: %w", err)
 	}
 
 	// To authenticate with davfs or anything else we need two cookies (rtFa and FedAuth)
@@ -143,7 +142,7 @@ func (ca *CookieAuth) getSPCookie(conf *SharepointSuccessResponse) (*CookieRespo
 
 	// Send the previously acquired Token as a Post parameter
 	if _, err = client.Post(u.String(), "text/xml", strings.NewReader(conf.Body.Token)); err != nil {
-		return nil, errors.Wrap(err, "Error while grabbing cookies from endpoint: %v")
+		return nil, fmt.Errorf("error while grabbing cookies from endpoint: %w", err)
 	}
 
 	cookieResponse := CookieResponse{}
@@ -160,23 +159,49 @@ func (ca *CookieAuth) getSPCookie(conf *SharepointSuccessResponse) (*CookieRespo
 	return &cookieResponse, nil
 }
 
+var spTokenURLMap = map[string]string{
+	"com": "https://login.microsoftonline.com",
+	"cn":  "https://login.chinacloudapi.cn",
+	"us":  "https://login.microsoftonline.us",
+	"de":  "https://login.microsoftonline.de",
+}
+
+func getSPTokenURL(endpoint string) (string, error) {
+	spRoot, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("error while parse endpoint: %w", err)
+	}
+	domains := strings.Split(spRoot.Host, ".")
+	tld := domains[len(domains)-1]
+	spTokenURL, ok := spTokenURLMap[tld]
+	if !ok {
+		return "", fmt.Errorf("error while get SPToken url, unsupported tld: %s", tld)
+	}
+	return spTokenURL + "/extSTS.srf", nil
+}
+
 func (ca *CookieAuth) getSPToken(ctx context.Context) (conf *SharepointSuccessResponse, err error) {
-	reqData := map[string]interface{}{
-		"Username": ca.user,
-		"Password": ca.pass,
-		"Address":  ca.endpoint,
+	spTokenURL, err := getSPTokenURL(ca.endpoint)
+	if err != nil {
+		return nil, err
+	}
+	reqData := map[string]any{
+		"Username":   ca.user,
+		"Password":   ca.pass,
+		"Address":    ca.endpoint,
+		"SPTokenURL": spTokenURL,
 	}
 
 	t := template.Must(template.New("authXML").Parse(reqString))
 
 	buf := &bytes.Buffer{}
 	if err := t.Execute(buf, reqData); err != nil {
-		return nil, errors.Wrap(err, "Error while filling auth token template")
+		return nil, fmt.Errorf("error while filling auth token template: %w", err)
 	}
 
 	// Create and execute the first request which returns an auth token for the sharepoint service
 	// With this token we can authenticate on the login page and save the returned cookies
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://login.microsoftonline.com/extSTS.srf", buf)
+	req, err := http.NewRequestWithContext(ctx, "POST", spTokenURL, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +209,7 @@ func (ca *CookieAuth) getSPToken(ctx context.Context) (conf *SharepointSuccessRe
 	client := fshttp.NewClient(ctx)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error while logging in to endpoint")
+		return nil, fmt.Errorf("error while logging in to endpoint: %w", err)
 	}
 	defer fs.CheckClose(resp.Body, &err)
 
@@ -209,7 +234,7 @@ func (ca *CookieAuth) getSPToken(ctx context.Context) (conf *SharepointSuccessRe
 	}
 
 	if err != nil {
-		return nil, errors.Wrap(err, "Error while reading endpoint response")
+		return nil, fmt.Errorf("error while reading endpoint response: %w", err)
 	}
 	return
 }

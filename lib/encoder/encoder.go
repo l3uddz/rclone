@@ -1,15 +1,13 @@
-/*
-Translate file names for usage on restrictive storage systems
-
-The restricted set of characters are mapped to a unicode equivalent version
-(most to their FULLWIDTH variant) to increase compatibility with other
-storage systems.
-See: http://unicode-search.net/unicode-namesearch.pl?term=FULLWIDTH
-
-Encoders will also quote reserved characters to differentiate between
-the raw and encoded forms.
-*/
-
+// Package encoder provides functionality to translate file names
+// for usage on restrictive storage systems.
+//
+// The restricted set of characters are mapped to a unicode equivalent version
+// (most to their FULLWIDTH variant) to increase compatibility with other
+// storage systems.
+// See: http://unicode-search.net/unicode-namesearch.pl?term=FULLWIDTH
+//
+// Encoders will also quote reserved characters to differentiate between
+// the raw and encoded forms.
 package encoder
 
 import (
@@ -37,32 +35,36 @@ const (
 
 // Possible flags for the MultiEncoder
 const (
-	EncodeZero          MultiEncoder = 0         // NUL(0x00)
-	EncodeSlash         MultiEncoder = 1 << iota // /
-	EncodeLtGt                                   // <>
-	EncodeDoubleQuote                            // "
-	EncodeSingleQuote                            // '
-	EncodeBackQuote                              // `
-	EncodeDollar                                 // $
-	EncodeColon                                  // :
-	EncodeQuestion                               // ?
-	EncodeAsterisk                               // *
-	EncodePipe                                   // |
-	EncodeHash                                   // #
-	EncodePercent                                // %
-	EncodeBackSlash                              // \
-	EncodeCrLf                                   // CR(0x0D), LF(0x0A)
-	EncodeDel                                    // DEL(0x7F)
-	EncodeCtl                                    // CTRL(0x01-0x1F)
-	EncodeLeftSpace                              // Leading SPACE
-	EncodeLeftPeriod                             // Leading .
-	EncodeLeftTilde                              // Leading ~
-	EncodeLeftCrLfHtVt                           // Leading CR LF HT VT
-	EncodeRightSpace                             // Trailing SPACE
-	EncodeRightPeriod                            // Trailing .
-	EncodeRightCrLfHtVt                          // Trailing CR LF HT VT
-	EncodeInvalidUtf8                            // Invalid UTF-8 bytes
-	EncodeDot                                    // . and .. names
+	EncodeZero          MultiEncoder = 0 // NUL(0x00)
+	EncodeRaw           MultiEncoder = 1 << (iota - 1)
+	EncodeSlash                      // /
+	EncodeLtGt                       // <>
+	EncodeDoubleQuote                // "
+	EncodeSingleQuote                // '
+	EncodeBackQuote                  // `
+	EncodeDollar                     // $
+	EncodeColon                      // :
+	EncodeQuestion                   // ?
+	EncodeAsterisk                   // *
+	EncodePipe                       // |
+	EncodeHash                       // #
+	EncodePercent                    // %
+	EncodeBackSlash                  // \
+	EncodeCrLf                       // CR(0x0D), LF(0x0A)
+	EncodeDel                        // DEL(0x7F)
+	EncodeCtl                        // CTRL(0x01-0x1F)
+	EncodeLeftSpace                  // Leading SPACE
+	EncodeLeftPeriod                 // Leading .
+	EncodeLeftTilde                  // Leading ~
+	EncodeLeftCrLfHtVt               // Leading CR LF HT VT
+	EncodeRightSpace                 // Trailing SPACE
+	EncodeRightPeriod                // Trailing .
+	EncodeRightCrLfHtVt              // Trailing CR LF HT VT
+	EncodeInvalidUtf8                // Invalid UTF-8 bytes
+	EncodeDot                        // . and .. names
+	EncodeSquareBracket              // []
+	EncodeSemicolon                  // ;
+	EncodeExclamation                // !
 
 	// Synthetic
 	EncodeWin         = EncodeColon | EncodeQuestion | EncodeDoubleQuote | EncodeAsterisk | EncodeLtGt | EncodePipe // :?"*<>|
@@ -117,9 +119,13 @@ func alias(name string, mask MultiEncoder) {
 }
 
 func init() {
+	alias("Raw", EncodeRaw)
 	alias("None", EncodeZero)
 	alias("Slash", EncodeSlash)
 	alias("LtGt", EncodeLtGt)
+	alias("SquareBracket", EncodeSquareBracket)
+	alias("Semicolon", EncodeSemicolon)
+	alias("Exclamation", EncodeExclamation)
 	alias("DoubleQuote", EncodeDoubleQuote)
 	alias("SingleQuote", EncodeSingleQuote)
 	alias("BackQuote", EncodeBackQuote)
@@ -145,8 +151,8 @@ func init() {
 	alias("Dot", EncodeDot)
 }
 
-// validStrings returns all the valid MultiEncoder strings
-func validStrings() string {
+// ValidStrings returns all the valid MultiEncoder strings
+func ValidStrings() string {
 	var out []string
 	for k := range nameToEncoding {
 		out = append(out, k)
@@ -178,15 +184,15 @@ func (mask MultiEncoder) String() string {
 // Set converts a string into a MultiEncoder
 func (mask *MultiEncoder) Set(in string) error {
 	var out MultiEncoder
-	parts := strings.Split(in, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(in, ",")
+	for part := range parts {
 		part = strings.TrimSpace(part)
 		if bits, ok := nameToEncoding[part]; ok {
 			out |= bits
 		} else {
-			i, err := strconv.ParseInt(part, 0, 64)
+			i, err := strconv.ParseUint(part, 0, 0)
 			if err != nil {
-				return fmt.Errorf("bad encoding %q: possible values are: %s", part, validStrings())
+				return fmt.Errorf("bad encoding %q: possible values are: %s", part, ValidStrings())
 			}
 			out |= MultiEncoder(i)
 		}
@@ -212,6 +218,10 @@ func (mask *MultiEncoder) Scan(s fmt.ScanState, ch rune) error {
 // Encode takes a raw name and substitutes any reserved characters and
 // patterns in it
 func (mask MultiEncoder) Encode(in string) string {
+	if mask == EncodeRaw {
+		return in
+	}
+
 	if in == "" {
 		return ""
 	}
@@ -303,8 +313,7 @@ func (mask MultiEncoder) Encode(in string) string {
 			}
 			if mask.Has(EncodeAsterisk) { // *
 				switch r {
-				case '*',
-					'＊':
+				case '*', '＊':
 					return true
 				}
 			}
@@ -315,66 +324,76 @@ func (mask MultiEncoder) Encode(in string) string {
 					return true
 				}
 			}
+			if mask.Has(EncodeSquareBracket) { // []
+				switch r {
+				case '[', ']',
+					'［', '］':
+					return true
+				}
+			}
+			if mask.Has(EncodeSemicolon) { // ;
+				switch r {
+				case ';', '；':
+					return true
+				}
+			}
+			if mask.Has(EncodeExclamation) { // !
+				switch r {
+				case '!', '！':
+					return true
+				}
+			}
 			if mask.Has(EncodeQuestion) { // ?
 				switch r {
-				case '?',
-					'？':
+				case '?', '？':
 					return true
 				}
 			}
 			if mask.Has(EncodeColon) { // :
 				switch r {
-				case ':',
-					'：':
+				case ':', '：':
 					return true
 				}
 			}
 			if mask.Has(EncodePipe) { // |
 				switch r {
-				case '|',
-					'｜':
+				case '|', '｜':
 					return true
 				}
 			}
 			if mask.Has(EncodeDoubleQuote) { // "
 				switch r {
-				case '"',
-					'＂':
+				case '"', '＂':
 					return true
 				}
 			}
 			if mask.Has(EncodeSingleQuote) { // '
 				switch r {
-				case '\'',
-					'＇':
+				case '\'', '＇':
 					return true
 				}
 			}
 			if mask.Has(EncodeBackQuote) { // `
 				switch r {
-				case '`',
-					'｀':
+				case '`', '｀':
 					return true
 				}
 			}
 			if mask.Has(EncodeDollar) { // $
 				switch r {
-				case '$',
-					'＄':
+				case '$', '＄':
 					return true
 				}
 			}
 			if mask.Has(EncodeSlash) { // /
 				switch r {
-				case '/',
-					'／':
+				case '/', '／':
 					return true
 				}
 			}
 			if mask.Has(EncodeBackSlash) { // \
 				switch r {
-				case '\\',
-					'＼':
+				case '\\', '＼':
 					return true
 				}
 			}
@@ -387,15 +406,13 @@ func (mask MultiEncoder) Encode(in string) string {
 			}
 			if mask.Has(EncodeHash) { // #
 				switch r {
-				case '#',
-					'＃':
+				case '#', '＃':
 					return true
 				}
 			}
 			if mask.Has(EncodePercent) { // %
 				switch r {
-				case '%',
-					'％':
+				case '%', '％':
 					return true
 				}
 			}
@@ -468,6 +485,39 @@ func (mask MultiEncoder) Encode(in string) string {
 				out.WriteRune(r + fullOffset)
 				continue
 			case '＜', '＞':
+				out.WriteRune(QuoteRune)
+				out.WriteRune(r)
+				continue
+			}
+		}
+		if mask.Has(EncodeSquareBracket) { // []
+			switch r {
+			case '[', ']':
+				out.WriteRune(r + fullOffset)
+				continue
+			case '［', '］':
+				out.WriteRune(QuoteRune)
+				out.WriteRune(r)
+				continue
+			}
+		}
+		if mask.Has(EncodeSemicolon) { // ;
+			switch r {
+			case ';':
+				out.WriteRune(r + fullOffset)
+				continue
+			case '；':
+				out.WriteRune(QuoteRune)
+				out.WriteRune(r)
+				continue
+			}
+		}
+		if mask.Has(EncodeExclamation) { // !
+			switch r {
+			case '!':
+				out.WriteRune(r + fullOffset)
+				continue
+			case '！':
 				out.WriteRune(QuoteRune)
 				out.WriteRune(r)
 				continue
@@ -632,8 +682,27 @@ func (mask MultiEncoder) Encode(in string) string {
 	return out.String()
 }
 
+// quoteLen is the length in bytes of QuoteRune
+var quoteLen = utf8.RuneLen(QuoteRune)
+
+// endsWithQuote returns true if in ends with a QuoteRune which quotes
+// the following character, rather than one which is part of an
+// escaped QuoteRune (QuoteRune QuoteRune).
+func endsWithQuote(in string) bool {
+	n := 0
+	for strings.HasSuffix(in, string(QuoteRune)) {
+		in = in[:len(in)-quoteLen]
+		n++
+	}
+	return n%2 == 1
+}
+
 // Decode takes a name and undoes any substitutions made by Encode
 func (mask MultiEncoder) Decode(in string) string {
+	if mask == EncodeRaw {
+		return in
+	}
+
 	if mask.Has(EncodeDot) {
 		switch in {
 		case "．":
@@ -673,22 +742,22 @@ func (mask MultiEncoder) Decode(in string) string {
 	suffix := ""
 	if r, l := utf8.DecodeLastRuneInString(in); mask.Has(EncodeRightSpace) && r == '␠' { // SYMBOL FOR SPACE
 		in = in[:len(in)-l]
-		if q, l2 := utf8.DecodeLastRuneInString(in); q == QuoteRune {
-			suffix, in = "␠", in[:len(in)-l2]
+		if endsWithQuote(in) {
+			suffix, in = "␠", in[:len(in)-quoteLen]
 		} else {
 			suffix = " "
 		}
 	} else if mask.Has(EncodeRightPeriod) && r == '．' { // FULLWIDTH FULL STOP
 		in = in[:len(in)-l]
-		if q, l2 := utf8.DecodeLastRuneInString(in); q == QuoteRune {
-			suffix, in = "．", in[:len(in)-l2]
+		if endsWithQuote(in) {
+			suffix, in = "．", in[:len(in)-quoteLen]
 		} else {
 			suffix = "."
 		}
 	} else if mask.Has(EncodeRightCrLfHtVt) && (r == '␀'+'\t' || r == '␀'+'\n' || r == '␀'+'\v' || r == '␀'+'\r') {
 		in = in[:len(in)-l]
-		if q, l2 := utf8.DecodeLastRuneInString(in); q == QuoteRune {
-			suffix, in = string(r), in[:len(in)-l2]
+		if endsWithQuote(in) {
+			suffix, in = string(r), in[:len(in)-quoteLen]
 		} else {
 			suffix = string(r - '␀')
 		}
@@ -710,6 +779,24 @@ func (mask MultiEncoder) Decode(in string) string {
 			if mask.Has(EncodeLtGt) { // <>
 				switch r {
 				case '＜', '＞':
+					return true
+				}
+			}
+			if mask.Has(EncodeSquareBracket) { // []
+				switch r {
+				case '［', '］':
+					return true
+				}
+			}
+			if mask.Has(EncodeSemicolon) { // ;
+				switch r {
+				case '；':
+					return true
+				}
+			}
+			if mask.Has(EncodeExclamation) { // !
+				switch r {
+				case '！':
 					return true
 				}
 			}
@@ -849,6 +936,39 @@ func (mask MultiEncoder) Decode(in string) string {
 		if mask.Has(EncodeLtGt) { // <>
 			switch r {
 			case '＜', '＞':
+				if unquote {
+					out.WriteRune(r)
+				} else {
+					out.WriteRune(r - fullOffset)
+				}
+				continue
+			}
+		}
+		if mask.Has(EncodeSquareBracket) { // []
+			switch r {
+			case '［', '］':
+				if unquote {
+					out.WriteRune(r)
+				} else {
+					out.WriteRune(r - fullOffset)
+				}
+				continue
+			}
+		}
+		if mask.Has(EncodeSemicolon) { // ;
+			switch r {
+			case '；':
+				if unquote {
+					out.WriteRune(r)
+				} else {
+					out.WriteRune(r - fullOffset)
+				}
+				continue
+			}
+		}
+		if mask.Has(EncodeExclamation) { // !
+			switch r {
+			case '！':
 				if unquote {
 					out.WriteRune(r)
 				} else {
@@ -1065,6 +1185,7 @@ func appendQuotedBytes(w io.Writer, s string) {
 		_, _ = fmt.Fprintf(w, string(QuoteRune)+"%02X", b)
 	}
 }
+
 func appendUnquotedByte(w io.Writer, s string) bool {
 	if len(s) < 2 {
 		return false
@@ -1085,12 +1206,15 @@ func (identity) Decode(in string) string { return in }
 func (i identity) FromStandardPath(s string) string {
 	return FromStandardPath(i, s)
 }
+
 func (i identity) FromStandardName(s string) string {
 	return FromStandardName(i, s)
 }
+
 func (i identity) ToStandardPath(s string) string {
 	return ToStandardPath(i, s)
 }
+
 func (i identity) ToStandardName(s string) string {
 	return ToStandardName(i, s)
 }

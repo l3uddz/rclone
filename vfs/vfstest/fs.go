@@ -3,12 +3,11 @@
 package vfstest
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"os"
 	"os/exec"
 	"path"
@@ -16,6 +15,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,42 +24,58 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/fstest"
-	"github.com/rclone/rclone/lib/file"
-	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
-	"github.com/rclone/rclone/vfs/vfsflags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-var (
-	mountFn mountlib.MountFn
+const (
+	waitForWritersDelay = 30 * time.Second // time to wait for existing writers
 )
 
 // RunTests runs all the tests against all the VFS cache modes
 //
-// If useVFS is set then it runs the tests against a VFS rather than amount
-func RunTests(t *testing.T, useVFS bool, fn mountlib.MountFn) {
-	mountFn = fn
+// If useVFS is set then it runs the tests against a VFS rather than a
+// mount
+//
+// If useVFS is not set then it runs the mount in a subprocess in
+// order to avoid kernel deadlocks.
+func RunTests(t *testing.T, useVFS bool, minimumRequiredCacheMode vfscommon.CacheMode, enableCacheTests bool, mountFn mountlib.MountFn) {
 	flag.Parse()
+	if isSubProcess() {
+		startMount(mountFn, useVFS, *runMount)
+		return
+	}
 	tests := []struct {
 		cacheMode vfscommon.CacheMode
-		writeBack time.Duration
+		writeBack fs.Duration
+		links     bool
 	}{
 		{cacheMode: vfscommon.CacheModeOff},
+		{cacheMode: vfscommon.CacheModeOff, links: true},
 		{cacheMode: vfscommon.CacheModeMinimal},
 		{cacheMode: vfscommon.CacheModeWrites},
 		{cacheMode: vfscommon.CacheModeFull},
-		{cacheMode: vfscommon.CacheModeFull, writeBack: 100 * time.Millisecond},
+		{cacheMode: vfscommon.CacheModeFull, writeBack: fs.Duration(100 * time.Millisecond)},
+		{cacheMode: vfscommon.CacheModeFull, writeBack: fs.Duration(100 * time.Millisecond), links: true},
 	}
-	run = newRun(useVFS)
 	for _, test := range tests {
-		run.cacheMode(test.cacheMode, test.writeBack)
+		if test.cacheMode < minimumRequiredCacheMode {
+			continue
+		}
+		vfsOpt := vfscommon.Opt
+		vfsOpt.CacheMode = test.cacheMode
+		vfsOpt.WriteBack = test.writeBack
+		vfsOpt.Links = test.links
+		run = newRun(useVFS, &vfsOpt, mountFn)
 		what := fmt.Sprintf("CacheMode=%v", test.cacheMode)
 		if test.writeBack > 0 {
 			what += fmt.Sprintf(",WriteBack=%v", test.writeBack)
 		}
-		log.Printf("Starting test run with %s", what)
+		if test.links {
+			what += fmt.Sprintf(",Links=%v", test.links)
+		}
+		fs.Logf(nil, "Starting test run with %s", what)
 		ok := t.Run(what, func(t *testing.T) {
 			t.Run("TestTouchAndDelete", TestTouchAndDelete)
 			t.Run("TestRenameOpenHandle", TestRenameOpenHandle)
@@ -70,7 +86,10 @@ func RunTests(t *testing.T, useVFS bool, fn mountlib.MountFn) {
 			t.Run("TestDirRenameEmptyDir", TestDirRenameEmptyDir)
 			t.Run("TestDirRenameFullDir", TestDirRenameFullDir)
 			t.Run("TestDirModTime", TestDirModTime)
-			t.Run("TestDirCacheFlush", TestDirCacheFlush)
+			t.Run("TestDirRewind", TestDirRewind)
+			if enableCacheTests {
+				t.Run("TestDirCacheFlush", TestDirCacheFlush)
+			}
 			t.Run("TestDirCacheFlushOnDirRename", TestDirCacheFlushOnDirRename)
 			t.Run("TestFileModTime", TestFileModTime)
 			t.Run("TestFileModTimeWithOpenWriters", TestFileModTimeWithOpenWriters)
@@ -87,27 +106,33 @@ func RunTests(t *testing.T, useVFS bool, fn mountlib.MountFn) {
 			t.Run("TestWriteFileFsync", TestWriteFileFsync)
 			t.Run("TestWriteFileDup", TestWriteFileDup)
 			t.Run("TestWriteFileAppend", TestWriteFileAppend)
+			t.Run("TestSymlinks", TestSymlinks)
+			t.Run("TestMknod", TestMknod)
 		})
-		log.Printf("Finished test run with %s (ok=%v)", what, ok)
+		fs.Logf(nil, "Finished test run with %s (ok=%v)", what, ok)
+		run.Finalise()
 		if !ok {
 			break
 		}
 	}
-	run.Finalise()
 }
 
 // Run holds the remotes for a test run
 type Run struct {
-	os           Oser
-	vfs          *vfs.VFS
-	useVFS       bool // set if we are testing a VFS not a mount
-	mountPath    string
-	fremote      fs.Fs
-	fremoteName  string
-	cleanRemote  func()
-	umountResult <-chan error
-	umountFn     mountlib.UnmountFn
-	skip         bool
+	os          Oser
+	vfsOpt      *vfscommon.Options
+	useVFS      bool // set if we are testing a VFS not a mount
+	mountPath   string
+	fremote     fs.Fs
+	fremoteName string
+	cleanRemote func()
+	skip        bool
+	// For controlling the subprocess running the mount
+	cmdMu   sync.Mutex
+	cmd     *exec.Cmd
+	in      io.ReadCloser
+	out     io.WriteCloser
+	scanner *bufio.Scanner
 }
 
 // run holds the master Run data
@@ -119,132 +144,27 @@ var run *Run
 // r.fremote is an empty remote Fs
 //
 // Finalise() will tidy them away when done.
-func newRun(useVFS bool) *Run {
+func newRun(useVFS bool, vfsOpt *vfscommon.Options, mountFn mountlib.MountFn) *Run {
 	r := &Run{
-		useVFS:       useVFS,
-		umountResult: make(chan error, 1),
+		useVFS: useVFS,
+		vfsOpt: vfsOpt,
 	}
+	r.vfsOpt.Init(context.Background())
 	fstest.Initialise()
 
 	var err error
 	r.fremote, r.fremoteName, r.cleanRemote, err = fstest.RandomRemote()
 	if err != nil {
-		log.Fatalf("Failed to open remote %q: %v", *fstest.RemoteName, err)
+		fs.Fatalf(nil, "Failed to open remote %q: %v", *fstest.RemoteName, err)
 	}
 
 	err = r.fremote.Mkdir(context.Background(), "")
 	if err != nil {
-		log.Fatalf("Failed to open mkdir %q: %v", *fstest.RemoteName, err)
+		fs.Fatalf(nil, "Failed to open mkdir %q: %v", *fstest.RemoteName, err)
 	}
 
-	if !r.useVFS {
-		r.mountPath = findMountPath()
-	}
-	// Mount it up
-	r.mount()
-
+	r.startMountSubProcess()
 	return r
-}
-
-func findMountPath() string {
-	if runtime.GOOS != "windows" {
-		mountPath, err := ioutil.TempDir("", "rclonefs-mount")
-		if err != nil {
-			log.Fatalf("Failed to create mount dir: %v", err)
-		}
-		return mountPath
-	}
-
-	// Find a free drive letter
-	letter := file.FindUnusedDriveLetter()
-	drive := ""
-	if letter == 0 {
-		log.Fatalf("Couldn't find free drive letter for test")
-	} else {
-		drive = string(letter) + ":"
-	}
-	return drive
-}
-
-func (r *Run) mount() {
-	log.Printf("mount %q %q", r.fremote, r.mountPath)
-	var err error
-	r.vfs = vfs.New(r.fremote, &vfsflags.Opt)
-	r.umountResult, r.umountFn, err = mountFn(r.vfs, r.mountPath, &mountlib.Opt)
-	if err != nil {
-		log.Printf("mount FAILED: %v", err)
-		r.skip = true
-	} else {
-		log.Printf("mount OK")
-	}
-	if r.useVFS {
-		r.os = vfsOs{r.vfs}
-	} else {
-		r.os = realOs{}
-	}
-
-}
-
-func (r *Run) umount() {
-	if r.skip {
-		log.Printf("FUSE not found so skipping umount")
-		return
-	}
-	/*
-		log.Printf("Calling fusermount -u %q", r.mountPath)
-		err := exec.Command("fusermount", "-u", r.mountPath).Run()
-		if err != nil {
-			log.Printf("fusermount failed: %v", err)
-		}
-	*/
-	log.Printf("Unmounting %q", r.mountPath)
-	err := r.umountFn()
-	if err != nil {
-		log.Printf("signal to umount failed - retrying: %v", err)
-		time.Sleep(3 * time.Second)
-		err = r.umountFn()
-	}
-	if err != nil {
-		log.Fatalf("signal to umount failed: %v", err)
-	}
-	log.Printf("Waiting for umount")
-	err = <-r.umountResult
-	if err != nil {
-		log.Fatalf("umount failed: %v", err)
-	}
-
-	// Cleanup the VFS cache - umount has called Shutdown
-	err = r.vfs.CleanUp()
-	if err != nil {
-		log.Printf("Failed to cleanup the VFS cache: %v", err)
-	}
-}
-
-// cacheMode flushes the VFS and changes the CacheMode and the writeBack time
-func (r *Run) cacheMode(cacheMode vfscommon.CacheMode, writeBack time.Duration) {
-	if r.skip {
-		log.Printf("FUSE not found so skipping cacheMode")
-		return
-	}
-	// Wait for writers to finish
-	r.vfs.WaitForWriters(30 * time.Second)
-	// Empty and remake the remote
-	r.cleanRemote()
-	err := r.fremote.Mkdir(context.Background(), "")
-	if err != nil {
-		log.Fatalf("Failed to open mkdir %q: %v", *fstest.RemoteName, err)
-	}
-	// Empty the cache
-	err = r.vfs.CleanUp()
-	if err != nil {
-		log.Printf("Failed to cleanup the VFS cache: %v", err)
-	}
-	// Reset the cache mode
-	r.vfs.SetCacheMode(cacheMode)
-	r.vfs.Opt.WriteBack = writeBack
-	// Flush the directory cache
-	r.vfs.FlushDirCache()
-
 }
 
 func (r *Run) skipIfNoFUSE(t *testing.T) {
@@ -261,14 +181,18 @@ func (r *Run) skipIfVFS(t *testing.T) {
 
 // Finalise cleans the remote and unmounts
 func (r *Run) Finalise() {
-	r.umount()
+	if !r.useVFS {
+		r.sendMountCommand("exit")
+		_, err := r.cmd.Process.Wait()
+		if err != nil {
+			fs.Fatalf(nil, "mount sub process failed: %v", err)
+		}
+	}
 	r.cleanRemote()
-	if r.useVFS {
-		// FIXME
-	} else {
+	if !r.useVFS {
 		err := os.RemoveAll(r.mountPath)
 		if err != nil {
-			log.Printf("Failed to clean mountPath %q: %v", r.mountPath, err)
+			fs.Logf(nil, "Failed to clean mountPath %q: %v", r.mountPath, err)
 		}
 	}
 }
@@ -280,9 +204,9 @@ func (r *Run) path(filePath string) string {
 	}
 	// return windows drive letter root as E:\
 	if filePath == "" && runtime.GOOS == "windows" {
-		return run.mountPath + `\`
+		return r.mountPath + `\`
 	}
-	return filepath.Join(run.mountPath, filepath.FromSlash(filePath))
+	return filepath.Join(r.mountPath, filepath.FromSlash(filePath))
 }
 
 type dirMap map[string]struct{}
@@ -290,7 +214,7 @@ type dirMap map[string]struct{}
 // Create a dirMap from a string
 func newDirMap(dirString string) (dm dirMap) {
 	dm = make(dirMap)
-	for _, entry := range strings.Split(dirString, "|") {
+	for entry := range strings.SplitSeq(dirString, "|") {
 		if entry != "" {
 			dm[entry] = struct{}{}
 		}
@@ -299,10 +223,16 @@ func newDirMap(dirString string) (dm dirMap) {
 }
 
 // Returns a dirmap with only the files in
-func (dm dirMap) filesOnly() dirMap {
+func (dm dirMap) filesOnly(stripLinksSuffix bool) dirMap {
 	newDm := make(dirMap)
 	for name := range dm {
 		if !strings.HasSuffix(name, "/") {
+			if stripLinksSuffix {
+				index := strings.LastIndex(name, " ")
+				if index != -1 {
+					name = strings.TrimSuffix(name[0:index], fs.LinkSuffix) + name[index:]
+				}
+			}
 			newDm[name] = struct{}{}
 		}
 	}
@@ -310,7 +240,9 @@ func (dm dirMap) filesOnly() dirMap {
 }
 
 // reads the local tree into dir
-func (r *Run) readLocal(t *testing.T, dir dirMap, filePath string) {
+//
+// If recurse it set it will recurse into subdirectories
+func (r *Run) readLocalEx(t *testing.T, dir dirMap, filePath string, recurse bool) {
 	realPath := r.path(filePath)
 	files, err := r.os.ReadDir(realPath)
 	require.NoError(t, err)
@@ -318,13 +250,24 @@ func (r *Run) readLocal(t *testing.T, dir dirMap, filePath string) {
 		name := path.Join(filePath, fi.Name())
 		if fi.IsDir() {
 			dir[name+"/"] = struct{}{}
-			r.readLocal(t, dir, name)
-			assert.Equal(t, run.vfs.Opt.DirPerms&os.ModePerm, fi.Mode().Perm())
+			if recurse {
+				r.readLocalEx(t, dir, name, recurse)
+			}
+			assert.Equal(t, os.FileMode(r.vfsOpt.DirPerms)&os.ModePerm, fi.Mode().Perm())
 		} else {
 			dir[fmt.Sprintf("%s %d", name, fi.Size())] = struct{}{}
-			assert.Equal(t, run.vfs.Opt.FilePerms&os.ModePerm, fi.Mode().Perm())
+			if fi.Mode()&os.ModeSymlink != 0 {
+				assert.Equal(t, os.FileMode(r.vfsOpt.LinkPerms)&os.ModePerm, fi.Mode().Perm())
+			} else {
+				assert.Equal(t, os.FileMode(r.vfsOpt.FilePerms)&os.ModePerm, fi.Mode().Perm())
+			}
 		}
 	}
+}
+
+// reads the local tree into dir
+func (r *Run) readLocal(t *testing.T, dir dirMap, filePath string) {
+	r.readLocalEx(t, dir, filePath, true)
 }
 
 // reads the remote tree into dir
@@ -357,7 +300,7 @@ func (r *Run) checkDir(t *testing.T, dirString string) {
 		remoteDm = make(dirMap)
 		r.readRemote(t, remoteDm, "")
 		// Ignore directories for remote compare
-		remoteOK = reflect.DeepEqual(dm.filesOnly(), remoteDm.filesOnly())
+		remoteOK = reflect.DeepEqual(dm.filesOnly(run.vfsOpt.Links), remoteDm.filesOnly(run.vfsOpt.Links))
 		fuseOK = reflect.DeepEqual(dm, localDm)
 		if remoteOK && fuseOK {
 			return
@@ -366,13 +309,8 @@ func (r *Run) checkDir(t *testing.T, dirString string) {
 		t.Logf("Sleeping for %v for list eventual consistency: %d/%d", sleep, i, retries)
 		time.Sleep(sleep)
 	}
-	assert.Equal(t, dm.filesOnly(), remoteDm.filesOnly(), "expected vs remote")
+	assert.Equal(t, dm.filesOnly(run.vfsOpt.Links), remoteDm.filesOnly(run.vfsOpt.Links), "expected vs remote")
 	assert.Equal(t, dm, localDm, "expected vs fuse mount")
-}
-
-// wait for any files being written to be released by fuse
-func (r *Run) waitForWriters() {
-	run.vfs.WaitForWriters(10 * time.Second)
 }
 
 // writeFile writes data to a file named by filename.
@@ -404,32 +342,32 @@ func writeFile(filename string, data []byte, perm os.FileMode) error {
 
 func (r *Run) createFile(t *testing.T, filepath string, contents string) {
 	filepath = r.path(filepath)
-	err := writeFile(filepath, []byte(contents), 0600)
+	err := writeFile(filepath, []byte(contents), 0644)
 	require.NoError(t, err)
 	r.waitForWriters()
 }
 
 func (r *Run) readFile(t *testing.T, filepath string) string {
 	filepath = r.path(filepath)
-	result, err := run.os.ReadFile(filepath)
+	result, err := r.os.ReadFile(filepath)
 	require.NoError(t, err)
 	return string(result)
 }
 
 func (r *Run) mkdir(t *testing.T, filepath string) {
 	filepath = r.path(filepath)
-	err := run.os.Mkdir(filepath, 0700)
+	err := r.os.Mkdir(filepath, 0755)
 	require.NoError(t, err)
 }
 
 func (r *Run) rm(t *testing.T, filepath string) {
 	filepath = r.path(filepath)
-	err := run.os.Remove(filepath)
+	err := r.os.Remove(filepath)
 	require.NoError(t, err)
 
 	// Wait for file to disappear from listing
-	for i := 0; i < 100; i++ {
-		_, err := run.os.Stat(filepath)
+	for range 100 {
+		_, err := r.os.Stat(filepath)
 		if os.IsNotExist(err) {
 			return
 		}
@@ -440,8 +378,39 @@ func (r *Run) rm(t *testing.T, filepath string) {
 
 func (r *Run) rmdir(t *testing.T, filepath string) {
 	filepath = r.path(filepath)
-	err := run.os.Remove(filepath)
+	err := r.os.Remove(filepath)
 	require.NoError(t, err)
+}
+
+func (r *Run) symlink(t *testing.T, oldname, newname string) {
+	newname = r.path(newname)
+	err := r.os.Symlink(oldname, newname)
+	require.NoError(t, err)
+}
+
+func (r *Run) checkMode(t *testing.T, name string, lexpected os.FileMode, expected os.FileMode) {
+	if r.useVFS {
+		info, err := run.os.Stat(run.path(name))
+		require.NoError(t, err)
+		assert.Equal(t, lexpected, info.Mode())
+		assert.Equal(t, name, info.Name())
+	} else {
+		info, err := os.Lstat(run.path(name))
+		require.NoError(t, err)
+		assert.Equal(t, lexpected, info.Mode())
+		assert.Equal(t, name, info.Name())
+
+		info, err = run.os.Stat(run.path(name))
+		require.NoError(t, err)
+		assert.Equal(t, expected, info.Mode())
+		assert.Equal(t, name, info.Name())
+	}
+}
+
+func (r *Run) readlink(t *testing.T, name string) string {
+	result, err := r.os.Readlink(r.path(name))
+	require.NoError(t, err)
+	return result
 }
 
 // TestMount checks that the Fs is mounted by seeing if the mountpoint
@@ -466,5 +435,5 @@ func TestRoot(t *testing.T) {
 	fi, err := os.Lstat(run.mountPath)
 	require.NoError(t, err)
 	assert.True(t, fi.IsDir())
-	assert.Equal(t, run.vfs.Opt.DirPerms&os.ModePerm, fi.Mode().Perm())
+	assert.Equal(t, os.FileMode(run.vfsOpt.DirPerms)&os.ModePerm, fi.Mode().Perm())
 }

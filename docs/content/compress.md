@@ -1,22 +1,28 @@
 ---
 title: "Compress"
 description: "Compression Remote"
+versionIntroduced: "v1.54"
 ---
 
-{{< icon "fas fa-compress" >}}Compress (Experimental)
------------------------------------------
+# Compress
 
-### Warning
-This remote is currently **experimental**. Things may break and data may be lost. Anything you do with this remote is
-at your own risk. Please understand the risks associated with using experimental code and don't use this remote in
-critical applications.
+## Warning
 
-The `Compress` remote adds compression to another remote. It is best used with remotes containing
-many large compressible files.
+This remote is currently **experimental**. Things may break and data may be lost.
+Anything you do with this remote is at your own risk. Please understand the risks
+associated with using experimental code and don't use this remote in critical
+applications.
 
-To use this remote, all you need to do is specify another remote and a compression mode to use:
+The `Compress` remote adds compression to another remote. It is best used with
+remotes containing many large compressible files.
 
-```
+## Configuration
+
+To use this remote, all you need to do is specify another remote and a
+compression mode to use:
+
+```text
+$ rclone config
 Current remotes:
 
 Name                 Type
@@ -24,7 +30,6 @@ Name                 Type
 remote_to_press      sometype
 
 e) Edit existing remote
-$ rclone config
 n) New remote
 d) Delete remote
 r) Rename remote
@@ -33,115 +38,166 @@ s) Set configuration password
 q) Quit config
 e/n/d/r/c/s/q> n
 name> compress
+
+Option Storage.
+Type of storage to configure.
+Choose a number from below, or type in your own value.
 ...
- 8 / Compress a remote
-   \ "compress"
+12 / Compress a remote
+   \ (compress)
 ...
 Storage> compress
-** See help for compress backend at: https://rclone.org/compress/ **
 
+Option remote.
 Remote to compress.
-Enter a string value. Press Enter for the default ("").
+Enter a value.
 remote> remote_to_press:subdir 
+
+Option mode.
 Compression mode.
-Enter a string value. Press Enter for the default ("gzip").
-Choose a number from below, or type in your own value
- 1 / Gzip compression balanced for speed and compression strength.
-   \ "gzip"
-compression_mode> gzip
-Edit advanced config? (y/n)
+Choose a number from below, or type in your own value of type string.
+Press Enter for the default (gzip).
+ 1 / Standard gzip compression with fastest parameters.
+   \ (gzip)
+ 2 / Zstandard compression — fast modern algorithm offering adjustable speed-to-compression tradeoffs.
+   \ (zstd)
+mode> gzip
+
+Edit advanced config?
 y) Yes
 n) No (default)
 y/n> n
-Remote config
---------------------
-[compress]
-type = compress
-remote = remote_to_press:subdir
-compression_mode = gzip
---------------------
+
+Configuration complete.
+Options:
+- type: compress
+- remote: remote_to_press:subdir
+- mode: gzip
+Keep this "compress" remote?
 y) Yes this is OK (default)
 e) Edit this remote
 d) Delete this remote
 y/e/d> y
 ```
 
-### Compression Modes
-Currently only gzip compression is supported, it provides a decent balance between speed and strength and is well
-supported by other application. Compression strength can further be configured via an advanced setting where 0 is no
-compression and 9 is strongest compression.
+### Compression Algorithms
 
-#### Filetype
-If you open a remote wrapped by press, you will see that there are many files with an extension corresponding to
-the compression algorithm you chose. These files are standard files that can be opened by various archive programs, 
+- **GZIP** – a well-established and widely adopted algorithm that strikes a solid balance between compression speed and ratio. It supports compression levels from -2 to 9, with the default -1 (roughly equivalent to level 5) offering an effective middle ground for most scenarios.
+
+- **Zstandard (zstd)** – a modern, high-performance algorithm that offers precise control over the trade-off between speed and compression efficiency. Compression levels range from 0 (no compression) to 4 (maximum compression), with level 2 as the default.
+
+The compression level of both algorithms can be set with the advanced `level`
+option.
+
+### File types
+
+If you open a remote wrapped by compress, you will see that there are many
+files with an extension corresponding to the compression algorithm you chose.
+These files are standard files that can be opened by various archive programs,
 but they have some hidden metadata that allows them to be used by rclone.
-While you may download and decompress these files at will, do **not** manually delete or rename files. Files without
-correct metadata files will not be recognized by rclone.
+While you may download and decompress these files at will, do **not** manually
+delete or rename files. Files without correct metadata files will not be
+recognized by rclone.
 
 ### File names
 
-The compressed files will be named `*.###########.gz` where `*` is the base file and the `#` part is base64 encoded 
-size of the uncompressed file. The file names should not be changed by anything other than the rclone compression backend.
+The compressed files will be named `*.###########.gz` where `*` is the base
+file and the `#` part is base64 encoded size of the uncompressed file. The file
+names should not be changed by anything other than the rclone compression backend.
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/compress/compress.go then run make backenddocs" >}}
-### Standard Options
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/compress/compress.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
+### Standard options
 
-Here are the standard options specific to compress (Compress a remote).
+Here are the Standard options specific to compress (Compress a remote).
 
 #### --compress-remote
 
 Remote to compress.
 
+Properties:
+
 - Config:      remote
 - Env Var:     RCLONE_COMPRESS_REMOTE
 - Type:        string
-- Default:     ""
+- Required:    true
 
 #### --compress-mode
 
 Compression mode.
+
+Properties:
 
 - Config:      mode
 - Env Var:     RCLONE_COMPRESS_MODE
 - Type:        string
 - Default:     "gzip"
 - Examples:
-    - "gzip"
-        - Standard gzip compression with fastest parameters.
-
-### Advanced Options
-
-Here are the advanced options specific to compress (Compress a remote).
+  - "gzip"
+    - Standard gzip compression with fastest parameters.
+  - "zstd"
+    - Zstandard compression — fast modern algorithm offering adjustable speed-to-compression tradeoffs.
 
 #### --compress-level
 
-GZIP compression level (-2 to 9).
+GZIP (levels -2 to 9):
+- -2 — Huffman encoding only. Only use if you know what you're doing.
+- -1 (default) — recommended; equivalent to level 5.
+- 0 — turns off compression.
+- 1–9 — increase compression at the cost of speed. Going past 6 generally offers very little return.
+ 
+ZSTD (levels 0 to 4):
+- 0 — turns off compression entirely.
+- 1 — fastest compression with the lowest ratio.
+- 2 (default) — good balance of speed and compression.
+- 3 — better compression, but uses about 2–3x more CPU than the default.
+- 4 — best possible compression ratio (highest CPU cost).
+ 
+Notes:
+- Choose GZIP for wide compatibility; ZSTD for better speed/ratio tradeoffs.
+- Negative gzip levels: -2 = Huffman-only, -1 = default (≈ level 5).
 
-			Generally -1 (default, equivalent to 5) is recommended.
-			Levels 1 to 9 increase compressiong at the cost of speed.. Going past 6 
-			generally offers very little return.
-			
-			Level -2 uses Huffmann encoding only. Only use if you now what you
-			are doing
-			Level 0 turns off compression.
+Properties:
 
 - Config:      level
 - Env Var:     RCLONE_COMPRESS_LEVEL
-- Type:        int
-- Default:     -1
+- Type:        string
+- Required:    true
+
+### Advanced options
+
+Here are the Advanced options specific to compress (Compress a remote).
 
 #### --compress-ram-cache-limit
 
 Some remotes don't allow the upload of files with unknown size.
-				   In this case the compressed file will need to be cached to determine
-				   it's size.
-				   
-				   Files smaller than this limit will be cached in RAM, file larger than 
-				   this limit will be cached on disk
+In this case the compressed file will need to be cached to determine
+it's size.
+
+Files smaller than this limit will be cached in RAM, files larger than 
+this limit will be cached on disk.
+
+Properties:
 
 - Config:      ram_cache_limit
 - Env Var:     RCLONE_COMPRESS_RAM_CACHE_LIMIT
 - Type:        SizeSuffix
-- Default:     20M
+- Default:     20Mi
 
-{{< rem autogenerated options stop >}}
+#### --compress-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_COMPRESS_DESCRIPTION
+- Type:        string
+- Required:    false
+
+### Metadata
+
+Any metadata supported by the underlying remote is read and written.
+
+See the [metadata](/docs/#metadata) docs for more info.
+
+<!-- autogenerated options stop -->

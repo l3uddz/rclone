@@ -2,14 +2,16 @@ package fichier
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/rest"
@@ -26,25 +28,44 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
+var errorRegex = regexp.MustCompile(`#(\d{1,3})`)
+
+func parseFichierError(err error) int {
+	matches := errorRegex.FindStringSubmatch(err.Error())
+	if len(matches) == 0 {
+		return 0
+	}
+	code, err := strconv.Atoi(matches[1])
+	if err != nil {
+		fs.Debugf(nil, "failed parsing fichier error: %v", err)
+		return 0
+	}
+	return code
+}
+
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
 func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
-	// Detect this error which the integration tests provoke
-	// error HTTP error 403 (403 Forbidden) returned body: "{\"message\":\"Flood detected: IP Locked #374\",\"status\":\"KO\"}"
+	// 1Fichier uses HTTP error code 403 (Forbidden) for all kinds of errors with
+	// responses looking like this: "{\"message\":\"Flood detected: IP Locked #374\",\"status\":\"KO\"}"
 	//
-	// https://1fichier.com/api.html
-	//
-	// file/ls.cgi is limited :
-	//
-	// Warning (can be changed in case of abuses) :
-	// List all files of the account is limited to 1 request per hour.
-	// List folders is limited to 5 000 results and 1 request per folder per 30s.
-	if err != nil && strings.Contains(err.Error(), "Flood detected") {
-		fs.Debugf(nil, "Sleeping for 30 seconds due to: %v", err)
-		time.Sleep(30 * time.Second)
+	// We attempt to parse the actual 1Fichier error code from this body and handle it accordingly
+	// Most importantly #374 (Flood detected: IP locked) which the integration tests provoke
+	// The list below is far from complete and should be expanded if we see any more error codes.
+	if err != nil {
+		switch parseFichierError(err) {
+		case 93:
+			return false, err // No such user
+		case 186:
+			return false, err // IP blocked?
+		case 374, 412: // Flood detected seems to be #412 now
+			fs.Debugf(nil, "Sleeping for 30 seconds due to: %v", err)
+			time.Sleep(30 * time.Second)
+		default:
+		}
 	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
@@ -80,16 +101,25 @@ func (f *Fs) readFileInfo(ctx context.Context, url string) (*File, error) {
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't read file info")
+		return nil, fmt.Errorf("couldn't read file info: %w", err)
 	}
 
 	return &file, err
+}
+
+// maybe do some actual validation later if necessary
+func validToken(token *GetTokenResponse) bool {
+	return token.Status == "OK"
 }
 
 func (f *Fs) getDownloadToken(ctx context.Context, url string) (*GetTokenResponse, error) {
 	request := DownloadRequest{
 		URL:    url,
 		Single: 1,
+		Pass:   f.opt.FilePassword,
+	}
+	if f.opt.CDN {
+		request.CDN = 1
 	}
 	opts := rest.Opts{
 		Method: "POST",
@@ -99,10 +129,11 @@ func (f *Fs) getDownloadToken(ctx context.Context, url string) (*GetTokenRespons
 	var token GetTokenResponse
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.rest.CallJSON(ctx, &opts, &request, &token)
-		return shouldRetry(ctx, resp, err)
+		doretry, err := shouldRetry(ctx, resp, err)
+		return doretry || !validToken(&token), err
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't list files")
+		return nil, fmt.Errorf("couldn't list files: %w", err)
 	}
 
 	return &token, nil
@@ -118,10 +149,16 @@ func fileFromSharedFile(file *SharedFile) File {
 
 func (f *Fs) listSharedFiles(ctx context.Context, id string) (entries fs.DirEntries, err error) {
 	opts := rest.Opts{
-		Method:     "GET",
-		RootURL:    "https://1fichier.com/dir/",
-		Path:       id,
-		Parameters: map[string][]string{"json": {"1"}},
+		Method:      "GET",
+		RootURL:     "https://1fichier.com/dir/",
+		Path:        id,
+		Parameters:  map[string][]string{"json": {"1"}},
+		ContentType: "application/x-www-form-urlencoded",
+	}
+	if f.opt.FolderPassword != "" {
+		opts.Method = "POST"
+		opts.Parameters = nil
+		opts.Body = strings.NewReader("json=1&pass=" + url.QueryEscape(f.opt.FolderPassword))
 	}
 
 	var sharedFiles SharedFolderResponse
@@ -130,7 +167,7 @@ func (f *Fs) listSharedFiles(ctx context.Context, id string) (entries fs.DirEntr
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't list files")
+		return nil, fmt.Errorf("couldn't list files: %w", err)
 	}
 
 	entries = make([]fs.DirEntry, len(sharedFiles))
@@ -159,7 +196,7 @@ func (f *Fs) listFiles(ctx context.Context, directoryID int) (filesList *FilesLi
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't list files")
+		return nil, fmt.Errorf("couldn't list files: %w", err)
 	}
 	for i := range filesList.Items {
 		item := &filesList.Items[i]
@@ -187,7 +224,7 @@ func (f *Fs) listFolders(ctx context.Context, directoryID int) (foldersList *Fol
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't list folders")
+		return nil, fmt.Errorf("couldn't list folders: %w", err)
 	}
 	foldersList.Name = f.opt.Enc.ToStandardName(foldersList.Name)
 	for i := range foldersList.SubFolders {
@@ -281,7 +318,7 @@ func (f *Fs) makeFolder(ctx context.Context, leaf string, folderID int) (respons
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't create folder")
+		return nil, fmt.Errorf("couldn't create folder: %w", err)
 	}
 
 	// fs.Debugf(f, "Created Folder `%s` in id `%s`", name, directoryID)
@@ -308,10 +345,10 @@ func (f *Fs) removeFolder(ctx context.Context, name string, folderID int) (respo
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't remove folder")
+		return nil, fmt.Errorf("couldn't remove folder: %w", err)
 	}
 	if response.Status != "OK" {
-		return nil, errors.New("Can't remove non-empty dir")
+		return nil, fmt.Errorf("can't remove folder: %s", response.Message)
 	}
 
 	// fs.Debugf(f, "Removed Folder with id `%s`", directoryID)
@@ -338,7 +375,7 @@ func (f *Fs) deleteFile(ctx context.Context, url string) (response *GenericOKRes
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't remove file")
+		return nil, fmt.Errorf("couldn't remove file: %w", err)
 	}
 
 	// fs.Debugf(f, "Removed file with url `%s`", url)
@@ -365,7 +402,33 @@ func (f *Fs) moveFile(ctx context.Context, url string, folderID int, rename stri
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't copy file")
+		return nil, fmt.Errorf("couldn't copy file: %w", err)
+	}
+
+	return response, nil
+}
+
+func (f *Fs) moveDir(ctx context.Context, folderID int, newLeaf string, destinationFolderID int) (response *MoveDirResponse, err error) {
+	request := &MoveDirRequest{
+		FolderID:            folderID,
+		DestinationFolderID: destinationFolderID,
+		Rename:              newLeaf,
+		// DestinationUser:     destinationUser,
+	}
+
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/folder/mv.cgi",
+	}
+
+	response = &MoveDirResponse{}
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.rest.CallJSON(ctx, &opts, request, response)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("couldn't move dir: %w", err)
 	}
 
 	return response, nil
@@ -390,7 +453,35 @@ func (f *Fs) copyFile(ctx context.Context, url string, folderID int, rename stri
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't copy file")
+		return nil, fmt.Errorf("couldn't copy file: %w", err)
+	}
+
+	return response, nil
+}
+
+func (f *Fs) renameFile(ctx context.Context, url string, newName string) (response *RenameFileResponse, err error) {
+	request := &RenameFileRequest{
+		URLs: []RenameFileURL{
+			{
+				URL:      url,
+				Filename: newName,
+			},
+		},
+	}
+
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/file/rename.cgi",
+	}
+
+	response = &RenameFileResponse{}
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.rest.CallJSON(ctx, &opts, request, response)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("couldn't rename file: %w", err)
 	}
 
 	return response, nil
@@ -411,7 +502,7 @@ func (f *Fs) getUploadNode(ctx context.Context) (response *GetUploadNodeResponse
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "didnt got an upload node")
+		return nil, fmt.Errorf("didn't get an upload node: %w", err)
 	}
 
 	// fs.Debugf(f, "Got Upload node")
@@ -425,7 +516,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, size int64, fileName,
 	fileName = f.opt.Enc.FromStandardName(fileName)
 
 	if len(uploadID) > 10 || !isAlphaNumeric(uploadID) {
-		return nil, errors.New("Invalid UploadID")
+		return nil, errors.New("invalid UploadID")
 	}
 
 	opts := rest.Opts{
@@ -455,7 +546,7 @@ func (f *Fs) uploadFile(ctx context.Context, in io.Reader, size int64, fileName,
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't upload file")
+		return nil, fmt.Errorf("couldn't upload file: %w", err)
 	}
 
 	// fs.Debugf(f, "Uploaded File `%s`", fileName)
@@ -467,7 +558,7 @@ func (f *Fs) endUpload(ctx context.Context, uploadID string, nodeurl string) (re
 	// fs.Debugf(f, "Ending File Upload `%s`", uploadID)
 
 	if len(uploadID) > 10 || !isAlphaNumeric(uploadID) {
-		return nil, errors.New("Invalid UploadID")
+		return nil, errors.New("invalid UploadID")
 	}
 
 	opts := rest.Opts{
@@ -489,7 +580,7 @@ func (f *Fs) endUpload(ctx context.Context, uploadID string, nodeurl string) (re
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't finish file upload")
+		return nil, fmt.Errorf("couldn't finish file upload: %w", err)
 	}
 
 	return response, err

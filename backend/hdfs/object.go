@@ -1,13 +1,15 @@
-// +build !plan9
+//go:build !plan9
 
 package hdfs
 
 import (
 	"context"
+	"errors"
 	"io"
 	"path"
 	"time"
 
+	"github.com/colinmarc/hdfs/v2"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/readers"
@@ -48,7 +50,10 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	if err != nil {
 		return err
 	}
-	o.modTime = modTime
+	// Chtimes sets the modtime with second precision so truncate
+	// here too to keep the in-memory modtime identical to the one a
+	// fresh listing returns.
+	o.modTime = modTime.Truncate(time.Second)
 	return nil
 }
 
@@ -105,7 +110,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 // Update object
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	realpath := o.fs.realpath(src.Remote())
+	realpath := o.fs.realpath(o.remote)
 	dirname := path.Dir(realpath)
 	fs.Debugf(o.fs, "update [%s]", realpath)
 
@@ -114,7 +119,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	info, err := o.fs.client.Stat(realpath)
+	_, err = o.fs.client.Stat(realpath)
 	if err == nil {
 		err = o.fs.client.Remove(realpath)
 		if err != nil {
@@ -140,13 +145,29 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	err = out.Close()
+	// If the datanodes have acknowledged all writes but not yet
+	// to the namenode, FileWriter.Close can return ErrReplicating
+	// (wrapped in an os.PathError). This indicates that all data
+	// has been written, but the lease is still open for the file.
+	//
+	// It is safe in this case to either ignore the error (and let
+	// the lease expire on its own) or to call Close multiple
+	// times until it completes without an error. The Java client,
+	// for context, always chooses to retry, with exponential
+	// backoff.
+	err = o.fs.pacer.Call(func() (bool, error) {
+		err := out.Close()
+		if err == nil {
+			return false, nil
+		}
+		return errors.Is(err, hdfs.ErrReplicating), err
+	})
 	if err != nil {
 		cleanup()
 		return err
 	}
 
-	info, err = o.fs.client.Stat(realpath)
+	info, err := o.fs.client.Stat(realpath)
 	if err != nil {
 		return err
 	}

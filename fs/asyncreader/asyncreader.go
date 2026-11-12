@@ -4,11 +4,10 @@ package asyncreader
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
-	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/pool"
 	"github.com/rclone/rclone/lib/readers"
@@ -16,10 +15,8 @@ import (
 
 const (
 	// BufferSize is the default size of the async buffer
-	BufferSize           = 1024 * 1024
-	softStartInitial     = 4 * 1024
-	bufferCacheSize      = 64              // max number of buffers to keep in cache
-	bufferCacheFlushTime = 5 * time.Second // flush the cached buffers after this long
+	BufferSize       = pool.BufferSize
+	softStartInitial = 4 * 1024
 )
 
 // ErrorStreamAbandoned is returned when the input is closed before the end of the stream
@@ -42,6 +39,7 @@ type AsyncReader struct {
 	closed  bool           // whether we have closed the underlying stream
 	mu      sync.Mutex     // lock for Read/WriteTo/Abandon/Close
 	ci      *fs.ConfigInfo // for reading config
+	pool    *pool.Pool     // pool to get memory from
 }
 
 // New returns a reader that will asynchronously read from
@@ -58,7 +56,8 @@ func New(ctx context.Context, rd io.ReadCloser, buffers int) (*AsyncReader, erro
 		return nil, errors.New("nil reader supplied")
 	}
 	a := &AsyncReader{
-		ci: fs.GetConfig(ctx),
+		ci:   fs.GetConfig(ctx),
+		pool: pool.Global(),
 	}
 	a.init(rd, buffers)
 	return a, nil
@@ -68,14 +67,14 @@ func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
 	a.in = rd
 	a.ready = make(chan *buffer, buffers)
 	a.token = make(chan struct{}, buffers)
-	a.exit = make(chan struct{}, 0)
-	a.exited = make(chan struct{}, 0)
+	a.exit = make(chan struct{})
+	a.exited = make(chan struct{})
 	a.buffers = buffers
 	a.cur = nil
 	a.size = softStartInitial
 
 	// Create tokens
-	for i := 0; i < buffers; i++ {
+	for range buffers {
 		a.token <- struct{}{}
 	}
 
@@ -104,24 +103,16 @@ func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
 	}()
 }
 
-// bufferPool is a global pool of buffers
-var bufferPool *pool.Pool
-var bufferPoolOnce sync.Once
-
 // return the buffer to the pool (clearing it)
 func (a *AsyncReader) putBuffer(b *buffer) {
-	bufferPool.Put(b.buf)
+	a.pool.Put(b.buf)
 	b.buf = nil
 }
 
 // get a buffer from the pool
 func (a *AsyncReader) getBuffer() *buffer {
-	bufferPoolOnce.Do(func() {
-		// Initialise the buffer pool when used
-		bufferPool = pool.New(bufferCacheFlushTime, BufferSize, bufferCacheSize, a.ci.UseMmap)
-	})
 	return &buffer{
-		buf: bufferPool.Get(),
+		buf: a.pool.Get(),
 	}
 }
 
@@ -249,10 +240,7 @@ func (a *AsyncReader) SkipBytes(skip int) (ok bool) {
 			}
 		}
 
-		n := len(a.cur.buffer())
-		if n > skip {
-			n = skip
-		}
+		n := min(len(a.cur.buffer()), skip)
 		a.cur.increment(n)
 		skip -= n
 		if skip == 0 {

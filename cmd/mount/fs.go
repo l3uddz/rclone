@@ -1,6 +1,6 @@
 // FUSE main Fs
 
-// +build linux freebsd
+//go:build linux
 
 package mount
 
@@ -10,9 +10,9 @@ import (
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/vfs"
 )
@@ -76,15 +76,16 @@ func translateError(err error) error {
 	if err == nil {
 		return nil
 	}
-	switch errors.Cause(err) {
+	_, uErr := fserrors.Cause(err)
+	switch uErr {
 	case vfs.OK:
 		return nil
 	case vfs.ENOENT, fs.ErrorDirNotFound, fs.ErrorObjectNotFound:
-		return fuse.ENOENT
+		return fuse.Errno(syscall.ENOENT)
 	case vfs.EEXIST, fs.ErrorDirExists:
-		return fuse.EEXIST
+		return fuse.Errno(syscall.EEXIST)
 	case vfs.EPERM, fs.ErrorPermissionDenied:
-		return fuse.EPERM
+		return fuse.Errno(syscall.EPERM)
 	case vfs.ECLOSED:
 		return fuse.Errno(syscall.EBADF)
 	case vfs.ENOTEMPTY:
@@ -96,9 +97,12 @@ func translateError(err error) error {
 	case vfs.EROFS:
 		return fuse.Errno(syscall.EROFS)
 	case vfs.ENOSYS, fs.ErrorNotImplemented:
-		return fuse.ENOSYS
+		return syscall.ENOSYS
 	case vfs.EINVAL:
 		return fuse.Errno(syscall.EINVAL)
+	case vfs.ELOOP:
+		return fuse.Errno(syscall.ELOOP)
 	}
+	fs.Errorf(nil, "IO error: %v", err)
 	return err
 }

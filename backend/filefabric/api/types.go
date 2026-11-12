@@ -5,6 +5,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -18,7 +19,7 @@ const (
 	timeFormatJSON = `"` + timeFormatParameters + `"`
 )
 
-// Time represents represents date and time information for the
+// Time represents date and time information for the
 // filefabric API
 type Time time.Time
 
@@ -51,15 +52,50 @@ func (t Time) String() string {
 	return time.Time(t).UTC().Format(timeFormatParameters)
 }
 
+// Int represents an integer which can be represented in JSON as a
+// quoted integer or an integer.
+type Int int
+
+// MarshalJSON turns a Int into JSON
+func (i *Int) MarshalJSON() (out []byte, err error) {
+	return json.Marshal((*int)(i))
+}
+
+// UnmarshalJSON turns JSON into a Int
+func (i *Int) UnmarshalJSON(data []byte) error {
+	if len(data) >= 2 && data[0] == '"' && data[len(data)-1] == '"' {
+		data = data[1 : len(data)-1]
+	}
+	return json.Unmarshal(data, (*int)(i))
+}
+
+// String represents an string which can be represented in JSON as a
+// quoted string or an integer.
+type String string
+
+// MarshalJSON turns a String into JSON
+func (s *String) MarshalJSON() (out []byte, err error) {
+	return json.Marshal((*string)(s))
+}
+
+// UnmarshalJSON turns JSON into a String
+func (s *String) UnmarshalJSON(data []byte) error {
+	err := json.Unmarshal(data, (*string)(s))
+	if err != nil {
+		*s = String(data)
+	}
+	return nil
+}
+
 // Status return returned in all status responses
 type Status struct {
 	Code    string `json:"status"`
 	Message string `json:"statusmessage"`
-	TaskID  string `json:"taskid"`
+	TaskID  String `json:"taskid"`
 	// Warning string `json:"warning"` // obsolete
 }
 
-// Status statisfies the error interface
+// Status satisfies the error interface
 func (e *Status) Error() string {
 	return fmt.Sprintf("%s (%s)", e.Message, e.Code)
 }
@@ -115,7 +151,7 @@ type GetFolderContentsResponse struct {
 	Total  int    `json:"total,string"`
 	Items  []Item `json:"filelist"`
 	Folder Item   `json:"folder"`
-	From   int    `json:"from,string"`
+	From   Int    `json:"from"`
 	//Count         int    `json:"count"`
 	Pid           string `json:"pid"`
 	RefreshResult Status `json:"refreshresult"`
@@ -180,11 +216,11 @@ var ItemFields = mustFields(Item{})
 
 // fields returns the JSON fields in use by opt as a | separated
 // string.
-func fields(opt interface{}) (pipeTags string, err error) {
+func fields(opt any) (pipeTags string, err error) {
 	var tags []string
 	def := reflect.ValueOf(opt)
 	defType := def.Type()
-	for i := 0; i < def.NumField(); i++ {
+	for i := range def.NumField() {
 		field := defType.Field(i)
 		tag, ok := field.Tag.Lookup("json")
 		if !ok {
@@ -203,7 +239,7 @@ func fields(opt interface{}) (pipeTags string, err error) {
 
 // mustFields returns the JSON fields in use by opt as a | separated
 // string. It panics on failure.
-func mustFields(opt interface{}) string {
+func mustFields(opt any) string {
 	tags, err := fields(opt)
 	if err != nil {
 		panic(err)
@@ -315,12 +351,12 @@ type SpaceInfo struct {
 // DeleteResponse is returned from doDeleteFile
 type DeleteResponse struct {
 	Status
-	Deleted        []string      `json:"deleted"`
-	Errors         []interface{} `json:"errors"`
-	ID             string        `json:"fi_id"`
-	BackgroundTask int           `json:"backgroundtask"`
-	UsSize         string        `json:"us_size"`
-	PaSize         string        `json:"pa_size"`
+	Deleted        []string `json:"deleted"`
+	Errors         []any    `json:"errors"`
+	ID             string   `json:"fi_id"`
+	BackgroundTask int      `json:"backgroundtask"`
+	UsSize         string   `json:"us_size"`
+	PaSize         string   `json:"pa_size"`
 	//SpaceInfo      SpaceInfo     `json:"spaceinfo"`
 }
 

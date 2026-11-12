@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Test all the remotes against restic integration test
 # Run with: screen -S restic-test -L ./restic-test.sh
@@ -15,7 +15,7 @@ TestDropbox:
 TestFichier:
 TestFTP:
 TestGoogleCloudStorage:
-TestHubic:
+TestNetStorage:
 TestOneDrive:
 TestPcloud:
 TestQingStor:

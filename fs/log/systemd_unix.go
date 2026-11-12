@@ -1,50 +1,48 @@
 // Systemd interface for Unix variants only
 
-// +build !windows,!nacl,!plan9
+//go:build unix
 
 package log
 
 import (
-	"fmt"
-	"log"
-	"strings"
+	"log/slog"
 
-	sysdjournald "github.com/iguanesolutions/go-systemd/v5/journald"
+	"github.com/coreos/go-systemd/v22/journal"
 	"github.com/rclone/rclone/fs"
 )
 
-// Enables systemd logs if configured or if auto detected
-func startSystemdLog() bool {
-	flagsStr := "," + Opt.Format + ","
-	var flags int
-	if strings.Contains(flagsStr, ",longfile,") {
-		flags |= log.Llongfile
-	}
-	if strings.Contains(flagsStr, ",shortfile,") {
-		flags |= log.Lshortfile
-	}
-	log.SetFlags(flags)
-	fs.LogPrint = func(level fs.LogLevel, text string) {
-		text = fmt.Sprintf("%s%-6s: %s", systemdLogPrefix(level), level, text)
-		_ = log.Output(4, text)
-	}
+// Enables systemd logs if configured or if auto-detected
+func startSystemdLog(handler *OutputHandler) bool {
+	handler.clearFormatFlags(logFormatDate | logFormatTime | logFormatMicroseconds | logFormatUTC | logFormatLongFile | logFormatShortFile | logFormatPid)
+	handler.setFormatFlags(logFormatNoLevel)
+	handler.SetOutput(func(level slog.Level, text string) {
+		_ = journal.Print(slogLevelToSystemdPriority(level), "%-6s: %s", level, text)
+	})
 	return true
 }
 
-var logLevelToSystemdPrefix = []string{
-	fs.LogLevelEmergency: sysdjournald.EmergPrefix,
-	fs.LogLevelAlert:     sysdjournald.AlertPrefix,
-	fs.LogLevelCritical:  sysdjournald.CritPrefix,
-	fs.LogLevelError:     sysdjournald.ErrPrefix,
-	fs.LogLevelWarning:   sysdjournald.WarningPrefix,
-	fs.LogLevelNotice:    sysdjournald.NoticePrefix,
-	fs.LogLevelInfo:      sysdjournald.InfoPrefix,
-	fs.LogLevelDebug:     sysdjournald.DebugPrefix,
+var slogLevelToSystemdPrefix = map[slog.Level]journal.Priority{
+	fs.SlogLevelEmergency: journal.PriEmerg,
+	fs.SlogLevelAlert:     journal.PriAlert,
+	fs.SlogLevelCritical:  journal.PriCrit,
+	slog.LevelError:       journal.PriErr,
+	slog.LevelWarn:        journal.PriWarning,
+	fs.SlogLevelNotice:    journal.PriNotice,
+	slog.LevelInfo:        journal.PriInfo,
+	slog.LevelDebug:       journal.PriDebug,
 }
 
-func systemdLogPrefix(l fs.LogLevel) string {
-	if l >= fs.LogLevel(len(logLevelToSystemdPrefix)) {
-		return ""
+func slogLevelToSystemdPriority(l slog.Level) journal.Priority {
+	prio, ok := slogLevelToSystemdPrefix[l]
+	if !ok {
+		return journal.PriInfo
 	}
-	return logLevelToSystemdPrefix[l]
+	return prio
+}
+
+func isJournalStream() bool {
+	if usingJournald, _ := journal.StderrIsJournalStream(); usingJournald {
+		return true
+	}
+	return false
 }

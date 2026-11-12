@@ -1,10 +1,10 @@
 ---
 title: "Google Photos"
 description: "Rclone docs for Google Photos"
+versionIntroduced: "v1.49"
 ---
 
-{{< icon "fa fa-images" >}} Google Photos
--------------------------------------------------
+# Google Photos
 
 The rclone backend for [Google Photos](https://www.google.com/photos/about/) is
 a specialized backend for transferring photos and videos to and from
@@ -14,7 +14,12 @@ Google Photos.
 limitations, so please read the [limitations section](#limitations)
 carefully to make sure it is suitable for your use.
 
-## Configuring Google Photos
+**NB** From March 31, 2025 rclone can only download photos it
+uploaded. This limitation is due to policy changes at Google. You may
+need to run `rclone config reconnect remote:` to make rclone work
+again after upgrading to rclone v1.70.
+
+## Configuration
 
 The initial setup for google cloud storage involves getting a token from Google Photos
 which you need to do in your browser.  `rclone config` walks you
@@ -22,12 +27,14 @@ through it.
 
 Here is an example of how to make a remote called `remote`.  First run:
 
-     rclone config
+```console
+rclone config
+```
 
 This will guide you through an interactive setup process:
 
-```
-No remotes found - make a new one
+```text
+No remotes found, make a new one?
 n) New remote
 s) Set configuration password
 q) Quit config
@@ -43,12 +50,15 @@ XX / Google Photos
 Storage> google photos
 ** See help for google photos backend at: https://rclone.org/googlephotos/ **
 
-Google Application Client Id
-Leave blank normally.
+OAuth Client Id.
+Creating your own is now strongly recommended.
+If you leave this blank rclone uses a shared client_id which is being retired and will stop working during 2026.
+See https://rclone.org/googlephotos/#making-your-own-client-id for how to create your own.
 Enter a string value. Press Enter for the default ("").
 client_id> 
-Google Application Client Secret
-Leave blank normally.
+OAuth Client Secret.
+Leave blank to use rclone's shared client_id.
+If you created your own client_id then enter its client secret here.
 Enter a string value. Press Enter for the default ("").
 client_secret> 
 Set to make the Google Photos backend read only.
@@ -62,9 +72,21 @@ y) Yes
 n) No
 y/n> n
 Remote config
-Use auto config?
- * Say Y if not sure
- * Say N if you are working on a remote or headless machine
+rclone's shared Google Photos client_id is being retired and will stop working during 2026.
+Create your own to avoid interruption: https://rclone.org/googlephotos/#making-your-own-client-id
+
+Continue using the shared client_id anyway?
+y) Yes
+n) No (default)
+y/n> n
+OAuth Client Id.
+client_id> 1234567890-abcdefghijklmnop.apps.googleusercontent.com
+OAuth Client Secret.
+client_secret> GOCSPX-your-client-secret
+Use web browser to automatically authenticate rclone with remote?
+ * Say Y if the machine running rclone has a web browser you can use
+ * Say N if running rclone on a (remote) machine without web browser access
+If not sure try Y. If Y failed, try N.
 y) Yes
 n) No
 y/n> y
@@ -77,19 +99,23 @@ Got code
 *** are stored in full resolution at original quality.  These uploads
 *** will count towards storage in your Google Account.
 
---------------------
-[remote]
-type = google photos
-token = {"access_token":"XXX","token_type":"Bearer","refresh_token":"XXX","expiry":"2019-06-28T17:38:04.644930156+01:00"}
---------------------
+Configuration complete.
+Options:
+- type: google photos
+- token: {"access_token":"XXX","token_type":"Bearer","refresh_token":"XXX","expiry":"2019-06-28T17:38:04.644930156+01:00"}
+Keep this "remote" remote?
 y) Yes this is OK
 e) Edit this remote
 d) Delete this remote
 y/e/d> y
 ```
 
+See the [remote setup docs](/remote_setup/) for how to set it up on a
+machine without an internet-connected web browser available.
+
 Note that rclone runs a webserver on your local machine to collect the
-token as returned from Google if you use auto config mode. This only
+token as returned from Google if using web browser to automatically
+authenticate. This only
 runs from the moment it opens your browser to the moment you get back
 the verification code.  This is on `http://127.0.0.1:53682/` and this
 may require you to unblock it temporarily if you are running a host
@@ -99,24 +125,32 @@ This remote is called `remote` and can now be used like this
 
 See all the albums in your photos
 
-    rclone lsd remote:album
+```console
+rclone lsd remote:album
+```
 
 Make a new album
 
-    rclone mkdir remote:album/newAlbum
+```console
+rclone mkdir remote:album/newAlbum
+```
 
 List the contents of an album
 
-    rclone ls remote:album/newAlbum
+```console
+rclone ls remote:album/newAlbum
+```
 
 Sync `/home/local/images` to the Google Photos, removing any excess
 files in the album.
 
-    rclone sync -i /home/local/image remote:album/newAlbum
+```console
+rclone sync --interactive /home/local/image remote:album/newAlbum
+```
 
-## Layout
+### Layout
 
-As Google Photos is not a general purpose cloud storage system the
+As Google Photos is not a general purpose cloud storage system, the
 backend is laid out to help you navigate it.
 
 The directories under `media` show different ways of categorizing the
@@ -129,7 +163,7 @@ Note that all your photos and videos will appear somewhere under
 `media`, but they may not appear under `album` unless you've put them
 into albums.
 
-```
+```text
 /
 - upload
     - file1.jpg
@@ -193,11 +227,13 @@ may create new directories (albums) under `album`.  If you copy files
 with a directory hierarchy in there then rclone will create albums
 with the `/` character in them.  For example if you do
 
-    rclone copy /path/to/images remote:album/images
+```console
+rclone copy /path/to/images remote:album/images
+```
 
 and the images directory contains
 
-```
+```text
 images
     - file1.jpg
     dir
@@ -210,11 +246,11 @@ images
 Then rclone will create the following albums with the following files in
 
 - images
-    - file1.jpg
+  - file1.jpg
 - images/dir
-    - file2.jpg
+  - file2.jpg
 - images/dir2/dir3
-    - file3.jpg
+  - file3.jpg
 
 This means that you can use the `album` path pretty much like a normal
 filesystem and it is a good target for repeated syncing.
@@ -222,12 +258,305 @@ filesystem and it is a good target for repeated syncing.
 The `shared-album` directory shows albums shared with you or by you.
 This is similar to the Sharing tab in the Google Photos web interface.
 
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/googlephotos/googlephotos.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
+### Standard options
+
+Here are the Standard options specific to google photos (Google Photos).
+
+#### --gphotos-client-id
+
+OAuth Client Id.
+
+Creating your own is now strongly recommended.
+If you leave this blank rclone uses a shared client_id which is being retired and will stop working during 2026.
+See https://rclone.org/googlephotos/#making-your-own-client-id for how to create your own.
+
+Properties:
+
+- Config:      client_id
+- Env Var:     RCLONE_GPHOTOS_CLIENT_ID
+- Type:        string
+- Required:    false
+
+#### --gphotos-client-secret
+
+OAuth Client Secret.
+
+Leave blank to use rclone's shared client_id.
+If you created your own client_id then enter its client secret here.
+
+Properties:
+
+- Config:      client_secret
+- Env Var:     RCLONE_GPHOTOS_CLIENT_SECRET
+- Type:        string
+- Required:    false
+
+#### --gphotos-read-only
+
+Set to make the Google Photos backend read only.
+
+If you choose read only then rclone will only request read only access
+to your photos, otherwise rclone will request full access.
+
+Properties:
+
+- Config:      read_only
+- Env Var:     RCLONE_GPHOTOS_READ_ONLY
+- Type:        bool
+- Default:     false
+
+### Advanced options
+
+Here are the Advanced options specific to google photos (Google Photos).
+
+#### --gphotos-token
+
+OAuth Access Token as a JSON blob.
+
+Properties:
+
+- Config:      token
+- Env Var:     RCLONE_GPHOTOS_TOKEN
+- Type:        string
+- Required:    false
+
+#### --gphotos-auth-url
+
+Auth server URL.
+
+Leave blank to use the provider defaults.
+
+Properties:
+
+- Config:      auth_url
+- Env Var:     RCLONE_GPHOTOS_AUTH_URL
+- Type:        string
+- Required:    false
+
+#### --gphotos-token-url
+
+Token server url.
+
+Leave blank to use the provider defaults.
+
+Properties:
+
+- Config:      token_url
+- Env Var:     RCLONE_GPHOTOS_TOKEN_URL
+- Type:        string
+- Required:    false
+
+#### --gphotos-client-credentials
+
+Use client credentials OAuth flow.
+
+This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Note that this option is NOT supported by all backends.
+
+Properties:
+
+- Config:      client_credentials
+- Env Var:     RCLONE_GPHOTOS_CLIENT_CREDENTIALS
+- Type:        bool
+- Default:     false
+
+#### --gphotos-read-size
+
+Set to read the size of media items.
+
+Normally rclone does not read the size of media items since this takes
+another transaction.  This isn't necessary for syncing.  However
+rclone mount needs to know the size of files in advance of reading
+them, so setting this flag when using rclone mount is recommended if
+you want to read the media.
+
+Properties:
+
+- Config:      read_size
+- Env Var:     RCLONE_GPHOTOS_READ_SIZE
+- Type:        bool
+- Default:     false
+
+#### --gphotos-start-year
+
+Year limits the photos to be downloaded to those which are uploaded after the given year.
+
+Properties:
+
+- Config:      start_year
+- Env Var:     RCLONE_GPHOTOS_START_YEAR
+- Type:        int
+- Default:     2000
+
+#### --gphotos-include-archived
+
+Also view and download archived media.
+
+By default, rclone does not request archived media. Thus, when syncing,
+archived media is not visible in directory listings or transferred.
+
+Note that media in albums is always visible and synced, no matter
+their archive status.
+
+With this flag, archived media are always visible in directory
+listings and transferred.
+
+Without this flag, archived media will not be visible in directory
+listings and won't be transferred.
+
+Properties:
+
+- Config:      include_archived
+- Env Var:     RCLONE_GPHOTOS_INCLUDE_ARCHIVED
+- Type:        bool
+- Default:     false
+
+#### --gphotos-proxy
+
+Use the gphotosdl proxy for downloading the full resolution images
+
+The Google API will deliver images and video which aren't full
+resolution, and/or have EXIF data missing.
+
+However if you use the gphotosdl proxy then you can download original,
+unchanged images.
+
+This runs a headless browser in the background.
+
+Download the software from [gphotosdl](https://github.com/rclone/gphotosdl)
+
+First run with
+
+    gphotosdl -login
+
+Then once you have logged into google photos close the browser window
+and run
+
+    gphotosdl
+
+Then supply the parameter `--gphotos-proxy "http://localhost:8282"` to make
+rclone use the proxy.
+
+
+Properties:
+
+- Config:      proxy
+- Env Var:     RCLONE_GPHOTOS_PROXY
+- Type:        string
+- Required:    false
+
+#### --gphotos-encoding
+
+The encoding for the backend.
+
+See the [encoding section in the overview](/overview/#encoding) for more info.
+
+Properties:
+
+- Config:      encoding
+- Env Var:     RCLONE_GPHOTOS_ENCODING
+- Type:        Encoding
+- Default:     Slash,CrLf,InvalidUtf8,Dot
+
+#### --gphotos-batch-mode
+
+Upload file batching sync|async|off.
+
+This sets the batch mode used by rclone.
+
+This has 3 possible values
+
+- off - no batching
+- sync - batch uploads and check completion (default)
+- async - batch upload and don't check completion
+
+Rclone will close any outstanding batches when it exits which may make
+a delay on quit.
+
+
+Properties:
+
+- Config:      batch_mode
+- Env Var:     RCLONE_GPHOTOS_BATCH_MODE
+- Type:        string
+- Default:     "sync"
+
+#### --gphotos-batch-size
+
+Max number of files in upload batch.
+
+This sets the batch size of files to upload. It has to be less than 50.
+
+By default this is 0 which means rclone will calculate the batch size
+depending on the setting of batch_mode.
+
+- batch_mode: async - default batch_size is 50
+- batch_mode: sync - default batch_size is the same as --transfers
+- batch_mode: off - not in use
+
+Rclone will close any outstanding batches when it exits which may make
+a delay on quit.
+
+Setting this is a great idea if you are uploading lots of small files
+as it will make them a lot quicker. You can use --transfers 32 to
+maximise throughput.
+
+
+Properties:
+
+- Config:      batch_size
+- Env Var:     RCLONE_GPHOTOS_BATCH_SIZE
+- Type:        int
+- Default:     0
+
+#### --gphotos-batch-timeout
+
+Max time to allow an idle upload batch before uploading.
+
+If an upload batch is idle for more than this long then it will be
+uploaded.
+
+The default for this is 0 which means rclone will choose a sensible
+default based on the batch_mode in use.
+
+- batch_mode: async - default batch_timeout is 10s
+- batch_mode: sync - default batch_timeout is 1s
+- batch_mode: off - not in use
+
+
+Properties:
+
+- Config:      batch_timeout
+- Env Var:     RCLONE_GPHOTOS_BATCH_TIMEOUT
+- Type:        Duration
+- Default:     0s
+
+#### --gphotos-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_GPHOTOS_DESCRIPTION
+- Type:        string
+- Required:    false
+
+<!-- autogenerated options stop -->
+
 ## Limitations
 
 Only images and videos can be uploaded.  If you attempt to upload non
 videos or images or formats that Google Photos doesn't understand,
 rclone will upload the file, then Google Photos will give an error
 when it is put turned into a media item.
+
+**NB** From March 31, 2025 rclone can only download photos it
+uploaded. This limitation is due to policy changes at Google. You may
+need to run `rclone config reconnect remote:` to make rclone work
+again after upgrading to rclone v1.70.
 
 Note that all media items uploaded to Google Photos through the API
 are stored in full resolution at "original quality" and **will** count
@@ -248,13 +577,23 @@ When Images are downloaded this strips EXIF location (according to the
 docs and my tests).  This is a limitation of the Google Photos API and
 is covered by [bug #112096115](https://issuetracker.google.com/issues/112096115).
 
-**The current google API does not allow photos to be downloaded at original resolution.  This is very important if you are, for example, relying on "Google Photos" as a backup of your photos.  You will not be able to use rclone to redownload original images.  You could use 'google takeout' to recover the original photos as a last resort**
+**The current google API does not allow photos to be downloaded at original
+resolution. This is very important if you are, for example, relying on
+"Google Photos" as a backup of your photos. You will not be able to use
+rclone to redownload original images.  You could use 'google takeout'
+to recover the original photos as a last resort**
+
+**NB** you **can** use the [--gphotos-proxy](#gphotos-proxy) flag to use a
+headless browser to download images in full resolution.
 
 ### Downloading Videos
 
 When videos are downloaded they are downloaded in a really compressed
 version of the video compared to downloading it via the Google Photos
 web interface. This is covered by [bug #113672044](https://issuetracker.google.com/issues/113672044).
+
+**NB** you **can** use the [--gphotos-proxy](#gphotos-proxy) flag to use a
+headless browser to download images in full resolution.
 
 ### Duplicates
 
@@ -271,7 +610,7 @@ if you uploaded an image to `upload` then uploaded the same image to
 what it was uploaded with initially, not what you uploaded it with to
 `album`.  In practise this shouldn't cause too many problems.
 
-### Modified time
+### Modification times
 
 The date shown of media in Google Photos is the creation date as
 determined by the EXIF information, or the upload date if that is not
@@ -316,119 +655,29 @@ Rclone cannot delete files anywhere except under `album`.
 
 The Google Photos API does not support deleting albums - see [bug #135714733](https://issuetracker.google.com/issues/135714733).
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/googlephotos/googlephotos.go then run make backenddocs" >}}
-### Standard Options
+## Making your own client_id
 
-Here are the standard options specific to google photos (Google Photos).
+When you use rclone with Google photos in its default configuration you
+are using rclone's client_id.  This is shared between all the rclone
+users.
 
-#### --gphotos-client-id
+**This shared client_id is being retired and will stop working during
+2026.**  To avoid interruption you must create and use your own
+client_id, so creating one is now required rather than optional.  New
+remotes created with `rclone config` will warn you if you leave the
+client_id blank.
 
-OAuth Client Id
-Leave blank normally.
+Please follow the steps in [the google drive docs](https://rclone.org/drive/#making-your-own-client-id)
+with the following differences:
 
-- Config:      client_id
-- Env Var:     RCLONE_GPHOTOS_CLIENT_ID
-- Type:        string
-- Default:     ""
+- At step 3, instead of enabling the "Google Drive API", search for and
+  enable the "Photos Library API".
 
-#### --gphotos-client-secret
+- At step 5, you will need to add different scopes. Use these scopes
+  instead of the drive ones:
 
-OAuth Client Secret
-Leave blank normally.
-
-- Config:      client_secret
-- Env Var:     RCLONE_GPHOTOS_CLIENT_SECRET
-- Type:        string
-- Default:     ""
-
-#### --gphotos-read-only
-
-Set to make the Google Photos backend read only.
-
-If you choose read only then rclone will only request read only access
-to your photos, otherwise rclone will request full access.
-
-- Config:      read_only
-- Env Var:     RCLONE_GPHOTOS_READ_ONLY
-- Type:        bool
-- Default:     false
-
-### Advanced Options
-
-Here are the advanced options specific to google photos (Google Photos).
-
-#### --gphotos-token
-
-OAuth Access Token as a JSON blob.
-
-- Config:      token
-- Env Var:     RCLONE_GPHOTOS_TOKEN
-- Type:        string
-- Default:     ""
-
-#### --gphotos-auth-url
-
-Auth server URL.
-Leave blank to use the provider defaults.
-
-- Config:      auth_url
-- Env Var:     RCLONE_GPHOTOS_AUTH_URL
-- Type:        string
-- Default:     ""
-
-#### --gphotos-token-url
-
-Token server url.
-Leave blank to use the provider defaults.
-
-- Config:      token_url
-- Env Var:     RCLONE_GPHOTOS_TOKEN_URL
-- Type:        string
-- Default:     ""
-
-#### --gphotos-read-size
-
-Set to read the size of media items.
-
-Normally rclone does not read the size of media items since this takes
-another transaction.  This isn't necessary for syncing.  However
-rclone mount needs to know the size of files in advance of reading
-them, so setting this flag when using rclone mount is recommended if
-you want to read the media.
-
-- Config:      read_size
-- Env Var:     RCLONE_GPHOTOS_READ_SIZE
-- Type:        bool
-- Default:     false
-
-#### --gphotos-start-year
-
-Year limits the photos to be downloaded to those which are uploaded after the given year
-
-- Config:      start_year
-- Env Var:     RCLONE_GPHOTOS_START_YEAR
-- Type:        int
-- Default:     2000
-
-#### --gphotos-include-archived
-
-Also view and download archived media.
-
-By default rclone does not request archived media. Thus, when syncing,
-archived media is not visible in directory listings or transferred.
-
-Note that media in albums is always visible and synced, no matter
-their archive status.
-
-With this flag, archived media are always visible in directory
-listings and transferred.
-
-Without this flag, archived media will not be visible in directory
-listings and won't be transferred.
-
-- Config:      include_archived
-- Env Var:     RCLONE_GPHOTOS_INCLUDE_ARCHIVED
-- Type:        bool
-- Default:     false
-
-{{< rem autogenerated options stop >}}
+```text
+https://www.googleapis.com/auth/photoslibrary.appendonly
+https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata
+https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata
+```

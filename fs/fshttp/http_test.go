@@ -1,9 +1,28 @@
 package fshttp
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/rest"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"moul.io/http2curl/v2"
 )
 
 func TestCleanAuth(t *testing.T) {
@@ -44,4 +63,363 @@ func TestCleanAuths(t *testing.T) {
 		got := string(cleanAuths([]byte(test.in)))
 		assert.Equal(t, test.want, got, test.in)
 	}
+}
+
+func TestCleanCurl(t *testing.T) {
+	for _, test := range []struct {
+		in   []string
+		want []string
+	}{{
+		[]string{""},
+		[]string{""},
+	}, {
+		[]string{"floo"},
+		[]string{"floo"},
+	}, {
+		[]string{"'Authorization: AAAAAAAAA'", "'Potato: Help'", ""},
+		[]string{"'Authorization: XXXX'", "'Potato: Help'", ""},
+	}, {
+		[]string{"'X-Auth-Token: AAAAAAAAA'", "'Potato: Help'", ""},
+		[]string{"'X-Auth-Token: XXXX'", "'Potato: Help'", ""},
+	}, {
+		[]string{"'X-Auth-Token: AAAAAAAAA'", "'Authorization: AAAAAAAAA'", "'Potato: Help'", ""},
+		[]string{"'X-Auth-Token: XXXX'", "'Authorization: XXXX'", "'Potato: Help'", ""},
+	}} {
+		in := http2curl.CurlCommand(test.in)
+		cleanCurl(&in)
+		assert.Equal(t, test.want, test.in, test.in)
+	}
+}
+
+var certSerial = int64(0)
+
+// Create a test certificate and key pair that is valid for a specific
+// duration
+func createTestCert(validity time.Duration) (keyPEM []byte, certPEM []byte, err error) {
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		return
+	}
+	keyBytes := x509.MarshalPKCS1PrivateKey(key)
+	// PEM encoding of private key
+	keyPEM = pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: keyBytes,
+		},
+	)
+
+	// Now create the certificate
+	notBefore := time.Now()
+	notAfter := notBefore.Add(validity).Add(expireWindow)
+
+	certSerial += 1
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(certSerial),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		SignatureAlgorithm:    x509.SHA256WithRSA,
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyAgreement | x509.KeyUsageKeyEncipherment | x509.KeyUsageDataEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		return
+	}
+
+	certPEM = pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: derBytes,
+		},
+	)
+	return
+}
+
+func writeTestCert(t *testing.T, ci *fs.ConfigInfo, validity time.Duration) {
+	keyPEM, certPEM, err := createTestCert(1 * time.Second)
+	assert.NoError(t, err, "Cannot create test cert")
+	err = os.WriteFile(ci.ClientCert, certPEM, 0666)
+	assert.NoError(t, err, "Failed to write cert")
+	err = os.WriteFile(ci.ClientKey, keyPEM, 0666)
+	assert.NoError(t, err, "Failed to write key")
+}
+
+func TestCertificates(t *testing.T) {
+	startTime := time.Now()
+	// Starting a TLS server
+	expectedSerial := int64(0)
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cert := r.TLS.PeerCertificates
+		require.Greater(t, len(cert), 0, "No certificates received")
+		expectedSerial += 1
+		assert.Equal(t, expectedSerial, cert[0].SerialNumber.Int64(), "Did not get the correct serial number in certificate")
+		// Check that the certificate hasn't expired. We cannot use cert validation
+		// functions because those check for signature as well and our certificates
+		// are not properly signed
+		if time.Now().After(cert[0].NotAfter) {
+			assert.Fail(t, "Certificate expired", "Certificate expires at %s, current time is %s", cert[0].NotAfter.Sub(startTime), time.Since(startTime))
+		}
+
+		// Write some test data to fulfill the request
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = fmt.Fprintln(w, "test data")
+	}))
+	defer ts.Close()
+	// Modify servers config to request a client certificate
+	// we cannot validate the certificate since we are not properly signing it
+	ts.TLS.ClientAuth = tls.RequestClientCert
+
+	// Set --client-cert and --client-key in config to
+	// a pair of temp files
+	// create a test cert/key pair and write it to the files
+	// Use a private config so the cert paths don't leak into other tests
+	ctx, ci := fs.AddConfig(context.TODO())
+	// Create a test certificate and write it to a temp file
+	ci.ClientCert = t.TempDir() + "client.cert"
+	ci.ClientKey = t.TempDir() + "client.key"
+	validity := 1 * time.Second
+	writeTestCert(t, ci, validity)
+
+	// Now create the client with the above settings
+	// we need to disable TLS verification since we don't
+	// care about server certificate
+	client := NewClient(ctx)
+	tt := client.Transport.(*Transport)
+	tt.TLSClientConfig.InsecureSkipVerify = true
+
+	// Now make requests, the first request should be within
+	// the valid window
+	_, err := client.Get(ts.URL)
+	assert.NoError(t, err)
+
+	// Wait for the 2* valid duration of the certificate so that has definitely expired
+	time.Sleep(2 * validity)
+
+	// Create a new cert and write it to files
+	writeTestCert(t, ci, validity)
+
+	// The new cert should be auto-loaded before we make this request
+	_, err = client.Get(ts.URL)
+	assert.NoError(t, err)
+}
+
+// TestRedirectStripsGlobalHeaders checks the headers set with --header
+// are sent to the requested host and any redirect on it but not to
+// another host the request is redirected to
+func TestRedirectStripsGlobalHeaders(t *testing.T) {
+	var got http.Header
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}))
+	defer target.Close()
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/same":
+			http.Redirect(w, r, ts.URL+"/moved", http.StatusFound)
+		case "/other":
+			http.Redirect(w, r, target.URL+"/moved", http.StatusFound)
+		case "/back":
+			// Chain via the other host and back again
+			http.Redirect(w, r, target.URL+"/bounce", http.StatusFound)
+		default:
+			got = r.Header.Clone()
+		}
+	}))
+	defer ts.Close()
+	// The other host bounces /bounce back to the original host
+	target.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bounce" {
+			http.Redirect(w, r, ts.URL+"/moved", http.StatusFound)
+			return
+		}
+		got = r.Header.Clone()
+	})
+
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.Headers = []*fs.HTTPOption{{Key: "X-Potato", Value: "sausage"}}
+	client := NewClient(ctx)
+
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{"/direct", "sausage"},
+		{"/same", "sausage"},
+		{"/other", ""},
+		{"/back", ""},
+	} {
+		got = nil
+		resp, err := client.Get(ts.URL + test.path)
+		require.NoError(t, err, test.path)
+		require.NoError(t, resp.Body.Close())
+		require.NotNil(t, got, test.path)
+		assert.Equal(t, test.want, got.Get("X-Potato"), test.path)
+	}
+}
+
+// TestRedirectLeavesHost checks the redirect chain walk against
+// synthetic chains, in particular that an HTTPS to HTTP downgrade
+// which keeps the host and port counts as leaving the host.
+func TestRedirectLeavesHost(t *testing.T) {
+	// chain builds the linked list of requests net/http records
+	// when following redirects, returning the last hop
+	chain := func(urls ...string) *http.Request {
+		var req *http.Request
+		for _, u := range urls {
+			next, err := http.NewRequest(http.MethodGet, u, nil)
+			require.NoError(t, err)
+			if req != nil {
+				next.Response = &http.Response{Request: req}
+			}
+			req = next
+		}
+		return req
+	}
+	for _, test := range []struct {
+		urls []string
+		want bool
+	}{
+		{[]string{"https://a.test/"}, false},
+		{[]string{"https://a.test/", "https://a.test/x"}, false},
+		{[]string{"https://a.test/", "https://A.test:443/x"}, false},
+		{[]string{"https://a.test/", "https://b.test/x"}, true},
+		{[]string{"https://a.test/", "https://b.test/x", "https://a.test/y"}, true},
+		{[]string{"https://a.test/", "http://a.test/x"}, true},
+		{[]string{"https://a.test:8443/", "http://a.test:8443/x"}, true},
+		{[]string{"https://a.test:8443/", "http://a.test:8443/x", "https://a.test:8443/y"}, true},
+		{[]string{"http://a.test:8080/", "https://a.test:8080/x"}, false},
+		{[]string{"http://a.test:8080/", "https://a.test:8080/x", "http://a.test:8080/y"}, false},
+	} {
+		assert.Equal(t, test.want, redirectLeavesHost(chain(test.urls...)), test.urls)
+	}
+}
+
+// TestRedirectStripsGlobalHeadersOnDowngrade checks the headers set
+// with --header are not sent over plaintext HTTP when an HTTPS
+// request is redirected to an http:// URL with the same host and
+// port and --allow-https-downgrade permits the redirect.
+//
+// The https:// request is made to the plain server's host and port
+// with a TLS dialer which ignores the address and connects to the
+// TLS server instead, so both hops share a host and port as they
+// would in the wild.
+func TestRedirectStripsGlobalHeadersOnDowngrade(t *testing.T) {
+	var gotTLS, gotPlain http.Header
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPlain = r.Header.Clone()
+	}))
+	defer plain.Close()
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTLS = r.Header.Clone()
+		http.Redirect(w, r, plain.URL+"/final", http.StatusFound)
+	}))
+	defer secure.Close()
+	tlsConfig := secure.Client().Transport.(*http.Transport).TLSClientConfig
+
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.Headers = []*fs.HTTPOption{{Key: "X-Potato", Value: "sausage"}}
+	ci.AllowHTTPSDowngrade = true
+	client := NewClientCustom(ctx, func(tr *http.Transport) {
+		tr.DialTLSContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&tls.Dialer{Config: tlsConfig}).DialContext(ctx, network, secure.Listener.Addr().String())
+		}
+	})
+
+	resp, err := client.Get("https" + strings.TrimPrefix(plain.URL, "http") + "/start")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.NotNil(t, gotTLS)
+	require.NotNil(t, gotPlain)
+	assert.Equal(t, "sausage", gotTLS.Get("X-Potato"))
+	assert.Equal(t, "", gotPlain.Get("X-Potato"))
+}
+
+// TestRefuseHTTPSDowngrade checks the transport refuses to follow a
+// redirect from HTTPS to HTTP unless --allow-https-downgrade is set,
+// whatever CheckRedirect policy the client uses.
+func TestRefuseHTTPSDowngrade(t *testing.T) {
+	var plainHits int
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		plainHits++
+	}))
+	defer plain.Close()
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/downgrade":
+			http.Redirect(w, r, plain.URL+"/final", http.StatusFound)
+		case "/secure":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		}
+	}))
+	defer secure.Close()
+	tlsConfig := secure.Client().Transport.(*http.Transport).TLSClientConfig
+
+	for _, test := range []struct {
+		name          string
+		allow         bool
+		checkRedirect func(req *http.Request, via []*http.Request) error
+		path          string
+		wantErr       bool
+		wantPlainHits int
+	}{
+		{name: "Default", path: "/downgrade", wantErr: true},
+		{name: "CustomCheckRedirect", checkRedirect: func(*http.Request, []*http.Request) error { return nil }, path: "/downgrade", wantErr: true},
+		{name: "Allowed", allow: true, path: "/downgrade", wantPlainHits: 1},
+		{name: "HTTPSToHTTPS", path: "/secure"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plainHits = 0
+			ctx, ci := fs.AddConfig(context.Background())
+			ci.AllowHTTPSDowngrade = test.allow
+			client := NewClientCustom(ctx, func(tr *http.Transport) {
+				tr.TLSClientConfig = tlsConfig
+			})
+			if test.checkRedirect != nil {
+				client.CheckRedirect = test.checkRedirect
+			}
+			resp, err := client.Get(secure.URL + test.path)
+			if test.wantErr {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, rest.ErrHTTPSDowngrade)
+				assert.Contains(t, err.Error(), "--allow-https-downgrade")
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, resp.Body.Close())
+			}
+			assert.Equal(t, test.wantPlainHits, plainHits)
+		})
+	}
+}
+
+// TestRefuseHTTPSDowngradeClosesBody checks the transport closes the
+// request body when it refuses a redirect, as RoundTrip must.
+func TestRefuseHTTPSDowngradeClosesBody(t *testing.T) {
+	body := &closeRecorder{Reader: strings.NewReader("potato")}
+	req, err := http.NewRequest(http.MethodPost, "http://a.test/x", body)
+	require.NoError(t, err)
+	origin, err := http.NewRequest(http.MethodPost, "https://a.test/", nil)
+	require.NoError(t, err)
+	req.Response = &http.Response{Request: origin}
+
+	ctx, _ := fs.AddConfig(context.Background())
+	_, err = NewTransport(ctx).RoundTrip(req)
+	assert.ErrorIs(t, err, rest.ErrHTTPSDowngrade)
+	assert.True(t, body.closed)
+}
+
+// closeRecorder is an io.ReadCloser which records whether it was closed
+type closeRecorder struct {
+	*strings.Reader
+	closed bool
+}
+
+// Close records the close
+func (c *closeRecorder) Close() error {
+	c.closed = true
+	return nil
 }

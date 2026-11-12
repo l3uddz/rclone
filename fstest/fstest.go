@@ -5,18 +5,17 @@ package fstest
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
-	"math/rand"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -27,7 +26,9 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/fstest/testy"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -48,14 +49,8 @@ var (
 	// ListRetries is the number of times to retry a listing to overcome eventual consistency
 	ListRetries = flag.Int("list-retries", 3, "Number or times to retry listing")
 	// MatchTestRemote matches the remote names used for testing
-	MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{24}$`)
+	MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{12}$`)
 )
-
-// Seed the random number generator
-func init() {
-	rand.Seed(time.Now().UnixNano())
-
-}
 
 // Initialise rclone for testing
 func Initialise() {
@@ -71,7 +66,10 @@ func Initialise() {
 	if envConfig := os.Getenv("RCLONE_CONFIG"); envConfig != "" {
 		_ = config.SetConfigPath(envConfig)
 	}
-	configfile.LoadConfig(ctx)
+	if *RemoteName == "local" {
+		*RemoteName = ""
+	}
+	configfile.Install()
 	accounting.Start(ctx)
 	if *Verbose {
 		ci.LogLevel = fs.LogLevelDebug
@@ -84,6 +82,8 @@ func Initialise() {
 	}
 	ci.LowLevelRetries = *LowLevelRetries
 	ci.UseListR = *UseListR
+	log.InitLogging()
+	_ = fs.LogReload(ci)
 }
 
 // Item represents an item for checking
@@ -105,7 +105,7 @@ func NewItem(Path, Content string, modTime time.Time) Item {
 	buf := bytes.NewBufferString(Content)
 	_, err := io.Copy(hash, buf)
 	if err != nil {
-		log.Fatalf("Failed to create item: %v", err)
+		fs.Fatalf(nil, "Failed to create item: %v", err)
 	}
 	i.Hashes = hash.Sums()
 	return i
@@ -272,7 +272,7 @@ func CheckListingWithRoot(t *testing.T, f fs.Fs, dir string, items []Item, expec
 	var objs []fs.Object
 	var dirs []fs.Directory
 	var err error
-	var retries = *ListRetries
+	retries := *ListRetries
 	sleep := time.Second / 2
 	wantListing := makeListingFromItems(items)
 	gotListing := "<unset>"
@@ -282,12 +282,12 @@ func CheckListingWithRoot(t *testing.T, f fs.Fs, dir string, items []Item, expec
 		if err != nil && err != fs.ErrorDirNotFound {
 			t.Fatalf("Error listing: %v", err)
 		}
-
 		gotListing = makeListingFromObjects(objs)
+
 		listingOK = wantListing == gotListing
 		if listingOK && (expectedDirs == nil || len(dirs) == len(expectedDirs)) {
 			// Put an extra sleep in if we did any retries just to make sure it really
-			// is consistent (here is looking at you Amazon Drive!)
+			// is consistent
 			if i != 1 {
 				extraSleep := 5*time.Second + sleep
 				t.Logf("Sleeping for %v just to make sure", extraSleep)
@@ -345,6 +345,12 @@ func CheckListing(t *testing.T, f fs.Fs, items []Item) {
 	CheckListingWithPrecision(t, f, items, nil, precision)
 }
 
+// CheckItemsWithPrecision checks the fs with the specified precision
+// to see if it has the expected items.
+func CheckItemsWithPrecision(t *testing.T, f fs.Fs, precision time.Duration, items ...Item) {
+	CheckListingWithPrecision(t, f, items, nil, precision)
+}
+
 // CheckItems checks the fs to see if it has only the items passed in
 // using a precision of fs.Config.ModifyWindow
 func CheckItems(t *testing.T, f fs.Fs, items ...Item) {
@@ -398,14 +404,14 @@ func CompareItems(t *testing.T, entries fs.DirEntries, items []Item, expectedDir
 func Time(timeString string) time.Time {
 	t, err := time.Parse(time.RFC3339Nano, timeString)
 	if err != nil {
-		log.Fatalf("Failed to parse time %q: %v", timeString, err)
+		fs.Fatalf(nil, "Failed to parse time %q: %v", timeString, err)
 	}
 	return t
 }
 
 // LocalRemote creates a temporary directory name for local remotes
 func LocalRemote() (path string, err error) {
-	path, err = ioutil.TempDir("", "rclone")
+	path, err = os.MkdirTemp("", "rclone")
 	if err == nil {
 		// Now remove the directory
 		err = os.Remove(path)
@@ -431,9 +437,9 @@ func RandomRemoteName(remoteName string) (string, string, error) {
 		if !strings.HasSuffix(remoteName, ":") {
 			remoteName += "/"
 		}
-		leafName = "rclone-test-" + random.String(24)
+		leafName = "rclone-test-" + random.String(12)
 		if !MatchTestRemote.MatchString(leafName) {
-			log.Fatalf("%q didn't match the test remote name regexp", leafName)
+			fs.Fatalf(nil, "%q didn't match the test remote name regexp", leafName)
 		}
 		remoteName += leafName
 	}
@@ -467,7 +473,15 @@ func RandomRemote() (fs.Fs, string, func(), error) {
 		if parentRemote != nil {
 			Purge(parentRemote)
 			if err != nil {
-				log.Printf("Failed to purge %v: %v", parentRemote, err)
+				fs.Logf(nil, "Failed to purge %v: %v", parentRemote, err)
+			}
+		}
+		// The remote isn't in the fs cache so release its resources
+		// (e.g. pooled connections) here rather than letting them
+		// pile up until they time out.
+		if do := remote.Features().Shutdown; do != nil {
+			if err := do(context.Background()); err != nil {
+				fs.Logf(nil, "Failed to shutdown %v: %v", remote, err)
 			}
 		}
 	}
@@ -480,7 +494,9 @@ func RandomRemote() (fs.Fs, string, func(), error) {
 //
 // It logs errors rather than returning them
 func Purge(f fs.Fs) {
-	ctx := context.Background()
+	// Create a stats group here so errors in the cleanup don't
+	// interfere with the global stats.
+	ctx := accounting.WithStatsGroup(context.Background(), "test-cleanup")
 	var err error
 	doFallbackPurge := true
 	if doPurge := f.Features().Purge; doPurge != nil {
@@ -499,7 +515,7 @@ func Purge(f fs.Fs) {
 				fs.Debugf(f, "Purge object %q", obj.Remote())
 				err = obj.Remove(ctx)
 				if err != nil {
-					log.Printf("purge failed to remove %q: %v", obj.Remote(), err)
+					fs.Logf(nil, "purge failed to remove %q: %v", obj.Remote(), err)
 				}
 			})
 			entries.ForDir(func(dir fs.Directory) {
@@ -508,16 +524,136 @@ func Purge(f fs.Fs) {
 			return nil
 		})
 		sort.Strings(dirs)
-		for i := len(dirs) - 1; i >= 0; i-- {
-			dir := dirs[i]
+		for _, dir := range slices.Backward(dirs) {
 			fs.Debugf(f, "Purge dir %q", dir)
 			err := f.Rmdir(ctx, dir)
 			if err != nil {
-				log.Printf("purge failed to rmdir %q: %v", dir, err)
+				fs.Logf(nil, "purge failed to rmdir %q: %v", dir, err)
 			}
 		}
 	}
 	if err != nil {
-		log.Printf("purge failed: %v", err)
+		fs.Logf(nil, "purge failed: %v", err)
 	}
+}
+
+// NewObject finds the object on the remote
+func NewObject(ctx context.Context, t *testing.T, f fs.Fs, remote string) fs.Object {
+	var obj fs.Object
+	var err error
+	sleepTime := 1 * time.Second
+	for i := 1; i <= *ListRetries; i++ {
+		obj, err = f.NewObject(ctx, remote)
+		if err == nil {
+			break
+		}
+		t.Logf("Sleeping for %v for findObject eventual consistency: %d/%d (%v)", sleepTime, i, *ListRetries, err)
+		time.Sleep(sleepTime)
+		sleepTime = (sleepTime * 3) / 2
+	}
+	require.NoError(t, err)
+	return obj
+}
+
+// NewDirectoryRetries finds the directory with remote in f
+//
+// If directory can't be found it returns an error wrapping fs.ErrorDirNotFound
+//
+// One day this will be an rclone primitive
+func NewDirectoryRetries(ctx context.Context, t *testing.T, f fs.Fs, remote string, retries int) (fs.Directory, error) {
+	var err error
+	var dir fs.Directory
+	sleepTime := 1 * time.Second
+	root := path.Dir(remote)
+	if root == "." {
+		root = ""
+	}
+	for i := 1; i <= retries; i++ {
+		var entries fs.DirEntries
+		entries, err = f.List(ctx, root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			var ok bool
+			dir, ok = entry.(fs.Directory)
+			if ok && dir.Remote() == remote {
+				return dir, nil
+			}
+		}
+		err = fmt.Errorf("directory %q not found in %q: %w", remote, root, fs.ErrorDirNotFound)
+		if i < retries {
+			t.Logf("Sleeping for %v for NewDirectoryRetries eventual consistency: %d/%d (%v)", sleepTime, i, retries, err)
+			time.Sleep(sleepTime)
+			sleepTime = (sleepTime * 3) / 2
+		}
+	}
+	return dir, err
+}
+
+// NewDirectory finds the directory with remote in f
+//
+// One day this will be an rclone primitive
+func NewDirectory(ctx context.Context, t *testing.T, f fs.Fs, remote string) fs.Directory {
+	dir, err := NewDirectoryRetries(ctx, t, f, remote, *ListRetries)
+	require.NoError(t, err)
+	return dir
+}
+
+// CheckEntryMetadata checks the metadata on the directory
+//
+// This checks a limited set of metadata on the directory
+func CheckEntryMetadata(ctx context.Context, t *testing.T, f fs.Fs, entry fs.DirEntry, wantMeta fs.Metadata) {
+	features := f.Features()
+	do, ok := entry.(fs.Metadataer)
+	require.True(t, ok, "Didn't find expected Metadata() method on %T", entry)
+	gotMeta, err := do.Metadata(ctx)
+	require.NoError(t, err)
+
+	for k, v := range wantMeta {
+		switch k {
+		case "mtime", "atime", "btime", "ctime":
+			// Check the system time Metadata
+			wantT, err := time.Parse(time.RFC3339, v)
+			require.NoError(t, err)
+			gotT, err := time.Parse(time.RFC3339, gotMeta[k])
+			require.NoError(t, err)
+			AssertTimeEqualWithPrecision(t, entry.Remote(), wantT, gotT, f.Precision())
+		default:
+			// Check the User metadata if we can
+			_, isDir := entry.(fs.Directory)
+			if (isDir && features.UserDirMetadata) || (!isDir && features.UserMetadata) {
+				assert.Equal(t, v, gotMeta[k])
+			}
+		}
+	}
+}
+
+// CheckDirModTime checks the modtime on the directory
+func CheckDirModTime(ctx context.Context, t *testing.T, f fs.Fs, dir fs.Directory, wantT time.Time) {
+	if f.Features().DirSetModTime == nil && f.Features().MkdirMetadata == nil {
+		fs.Debugf(f, "Skipping modtime test as remote does not support DirSetModTime or MkdirMetadata")
+		return
+	}
+	gotT := dir.ModTime(ctx)
+	precision := f.Precision()
+	// For unknown reasons the precision of modification times of
+	// directories on the CI is about >15mS. The tests work fine
+	// when run in Virtualbox though so I conjecture this is
+	// something to do with the file system used there.
+	if runtime.GOOS == "windows" && testy.CI() {
+		precision = 100 * time.Millisecond
+	}
+	AssertTimeEqualWithPrecision(t, dir.Remote(), wantT, gotT, precision)
+}
+
+// Gz returns a compressed version of its input string
+func Gz(t *testing.T, s string) string {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, err := zw.Write([]byte(s))
+	require.NoError(t, err)
+	err = zw.Close()
+	require.NoError(t, err)
+	return buf.String()
 }

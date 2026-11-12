@@ -12,7 +12,7 @@ set -e
 #when adding a tool to the list make sure to also add its corresponding command further in the script
 unzip_tools_list=('unzip' '7z' 'busybox')
 
-usage() { echo "Usage: curl https://rclone.org/install.sh | sudo bash [-s beta]" 1>&2; exit 1; }
+usage() { echo "Usage: sudo -v ; curl https://rclone.org/install.sh | sudo bash [-s beta]" 1>&2; exit 1; }
 
 #check for beta flag
 if [ -n "$1" ] && [ "$1" != "beta" ]; then
@@ -81,6 +81,8 @@ case $OS in
     ;;  
   Darwin)
     OS='osx'
+    binTgtDir=/usr/local/bin
+    man1TgtDir=/usr/local/share/man/man1
     ;;
   SunOS)
     OS='solaris'
@@ -103,6 +105,12 @@ case "$OS_type" in
     ;;
   aarch64|arm64)
     OS_type='arm64'
+    ;;
+  armv7*)
+    OS_type='arm-v7'
+    ;;
+  armv6*)
+    OS_type='arm-v6'
     ;;
   arm*)
     OS_type='arm'
@@ -171,21 +179,25 @@ case "$OS" in
     ;;
   'osx')
     #binary
-    mkdir -p /usr/local/bin
-    cp rclone /usr/local/bin/rclone.new
-    mv /usr/local/bin/rclone.new /usr/local/bin/rclone
+    mkdir -m 0555 -p ${binTgtDir}
+    cp rclone ${binTgtDir}/rclone.new
+    mv ${binTgtDir}/rclone.new ${binTgtDir}/rclone
+    chmod a=x ${binTgtDir}/rclone
     #manual
-    mkdir -p /usr/local/share/man/man1
-    cp rclone.1 /usr/local/share/man/man1/    
+    mkdir -m 0555 -p ${man1TgtDir}
+    cp rclone.1 ${man1TgtDir}    
+    chmod a=r ${man1TgtDir}/rclone.1
     ;;
   *)
     echo 'OS not supported'
     exit 2
 esac
 
-
 #update version variable post install
 version=$(rclone --version 2>>errors | head -n 1)
+
+#cleanup
+rm -rf "$tmp_dir"
 
 printf "\n${version} has successfully installed."
 printf '\nNow run "rclone config" for setup. Check https://rclone.org/docs/ for more details.\n\n'

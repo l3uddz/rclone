@@ -1,6 +1,4 @@
-// +build cmount
-// +build cgo
-// +build linux darwin freebsd windows
+//go:build cmount && ((linux && cgo) || (darwin && cgo) || (freebsd && cgo) || (openbsd && cgo) || windows)
 
 package cmount
 
@@ -8,16 +6,18 @@ import (
 	"io"
 	"os"
 	"path"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/billziss-gh/cgofuse/fuse"
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/vfs"
+	"github.com/winfsp/cgofuse/fuse"
 )
 
 const fhUnset = ^uint64(0)
@@ -26,17 +26,19 @@ const fhUnset = ^uint64(0)
 type FS struct {
 	VFS       *vfs.VFS
 	f         fs.Fs
+	opt       *mountlib.Options
 	ready     chan (struct{})
 	mu        sync.Mutex // to protect the below
 	handles   []vfs.Handle
-	destroyed int32 // read/write with sync/atomic
+	destroyed atomic.Int32
 }
 
 // NewFS makes a new FS
-func NewFS(VFS *vfs.VFS) *FS {
+func NewFS(VFS *vfs.VFS, opt *mountlib.Options) *FS {
 	fsys := &FS{
 		VFS:   VFS,
 		f:     VFS.Fs(),
+		opt:   opt,
 		ready: make(chan (struct{})),
 	}
 	return fsys
@@ -120,19 +122,6 @@ func (fsys *FS) lookupParentDir(filePath string) (leaf string, dir *vfs.Dir, err
 	return leaf, dir, errc
 }
 
-// lookup a File given a path
-func (fsys *FS) lookupFile(path string) (file *vfs.File, errc int) {
-	node, errc := fsys.lookupNode(path)
-	if errc != 0 {
-		return nil, errc
-	}
-	file, ok := node.(*vfs.File)
-	if !ok {
-		return nil, -fuse.EISDIR
-	}
-	return file, 0
-}
-
 // get a node and handle from the path or from the fh if not fhUnset
 //
 // handle may be nil
@@ -153,15 +142,9 @@ func (fsys *FS) stat(node vfs.Node, stat *fuse.Stat_t) (errc int) {
 	Size := uint64(node.Size())
 	Blocks := (Size + 511) / 512
 	modTime := node.ModTime()
-	Mode := node.Mode().Perm()
-	if node.IsDir() {
-		Mode |= fuse.S_IFDIR
-	} else {
-		Mode |= fuse.S_IFREG
-	}
 	//stat.Dev = 1
 	stat.Ino = node.Inode() // FIXME do we need to set the inode number?
-	stat.Mode = uint32(Mode)
+	stat.Mode = getMode(node)
 	stat.Nlink = 1
 	stat.Uid = fsys.VFS.Opt.UID
 	stat.Gid = fsys.VFS.Opt.GID
@@ -189,7 +172,7 @@ func (fsys *FS) Init() {
 // Destroy call).
 func (fsys *FS) Destroy() {
 	defer log.Trace(fsys.f, "")("")
-	atomic.StoreInt32(&fsys.destroyed, 1)
+	fsys.destroyed.Store(1)
 }
 
 // Getattr reads the attributes for path
@@ -228,6 +211,12 @@ func (fsys *FS) Readdir(dirPath string,
 	// We can't seek in directories and FUSE should know that so
 	// return an error if ofst is ever set.
 	if ofst > 0 {
+		// However openbsd doesn't seem to know this - perhaps a bug in its
+		// FUSE implementation or a bug in cgofuse?
+		// See: https://github.com/billziss-gh/cgofuse/issues/49
+		if runtime.GOOS == "openbsd" {
+			return 0
+		}
 		return -fuse.ESPIPE
 	}
 
@@ -306,6 +295,9 @@ func (fsys *FS) OpenEx(path string, fi *fuse.FileInfo_t) (errc int) {
 
 	// If size unknown then use direct io to read
 	if entry := handle.Node().DirEntry(); entry != nil && entry.Size() < 0 {
+		fi.DirectIo = true
+	}
+	if fsys.opt.DirectIO {
 		fi.DirectIo = true
 	}
 
@@ -505,14 +497,15 @@ func (fsys *FS) Link(oldpath string, newpath string) (errc int) {
 
 // Symlink creates a symbolic link.
 func (fsys *FS) Symlink(target string, newpath string) (errc int) {
-	defer log.Trace(target, "newpath=%q", newpath)("errc=%d", &errc)
-	return -fuse.ENOSYS
+	defer log.Trace(target, "newpath=%q, target=%q", newpath, target)("errc=%d", &errc)
+	return translateError(fsys.VFS.Symlink(target, newpath))
 }
 
 // Readlink reads the target of a symbolic link.
 func (fsys *FS) Readlink(path string) (errc int, linkPath string) {
-	defer log.Trace(path, "")("linkPath=%q, errc=%d", &linkPath, &errc)
-	return -fuse.ENOSYS, ""
+	defer log.Trace(path, "")("errc=%v, linkPath=%q", &errc, linkPath)
+	linkPath, err := fsys.VFS.Readlink(path)
+	return translateError(err), linkPath
 }
 
 // Chmod changes the permission bits of a file.
@@ -543,24 +536,72 @@ func (fsys *FS) Fsyncdir(path string, datasync bool, fh uint64) (errc int) {
 	return 0
 }
 
+// #9908: simulate macFUSE behaviour (discard setxattr calls) - otherwise Finder cannot copy files onto the mount
+func shouldIgnoreAppleXattr(opt *mountlib.Options) bool {
+	if !opt.NoAppleXattr {
+		return false
+	}
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	// only flip the behaviour on FSKit
+	for _, o := range opt.ExtraOptions {
+		if strings.TrimSpace(o) == "backend=fskit" {
+			return true
+		}
+	}
+	return false
+}
+
 // Setxattr sets extended attributes.
 func (fsys *FS) Setxattr(path string, name string, value []byte, flags int) (errc int) {
+	defer log.Trace(path, "name=%q, value=%q, flags=%d", name, value, flags)("errc=%d", &errc)
+	if shouldIgnoreAppleXattr(fsys.opt) && strings.HasPrefix(name, "com.apple.") {
+		return 0
+	}
 	return -fuse.ENOSYS
 }
 
 // Getxattr gets extended attributes.
 func (fsys *FS) Getxattr(path string, name string) (errc int, value []byte) {
+	defer log.Trace(path, "name=%q", name)("errc=%d, value=%q", &errc, &value)
+	if shouldIgnoreAppleXattr(fsys.opt) && strings.HasPrefix(name, "com.apple.") {
+		return -fuse.ENOATTR, nil
+	}
 	return -fuse.ENOSYS, nil
 }
 
 // Removexattr removes extended attributes.
 func (fsys *FS) Removexattr(path string, name string) (errc int) {
+	defer log.Trace(path, "name=%q", name)("errc=%d", &errc)
+	if shouldIgnoreAppleXattr(fsys.opt) && strings.HasPrefix(name, "com.apple.") {
+		return 0
+	}
 	return -fuse.ENOSYS
 }
 
 // Listxattr lists extended attributes.
 func (fsys *FS) Listxattr(path string, fill func(name string) bool) (errc int) {
+	defer log.Trace(path, "fill=%p", fill)("errc=%d", &errc)
+	if shouldIgnoreAppleXattr(fsys.opt) {
+		return 0
+	}
 	return -fuse.ENOSYS
+}
+
+// Getpath allows a case-insensitive file system to report the correct case of
+// a file path.
+func (fsys *FS) Getpath(path string, fh uint64) (errc int, normalisedPath string) {
+	defer log.Trace(path, "Getpath fh=%d", fh)("errc=%d, normalisedPath=%q", &errc, &normalisedPath)
+	node, _, errc := fsys.getNode(path, fh)
+	if errc != 0 {
+		return errc, ""
+	}
+	normalisedPath = node.Path()
+	if !strings.HasPrefix(normalisedPath, "/") {
+		normalisedPath = "/" + normalisedPath
+	}
+	return 0, normalisedPath
 }
 
 // Translate errors from mountlib
@@ -568,7 +609,8 @@ func translateError(err error) (errc int) {
 	if err == nil {
 		return 0
 	}
-	switch errors.Cause(err) {
+	_, uErr := fserrors.Cause(err)
+	switch uErr {
 	case vfs.OK:
 		return 0
 	case vfs.ENOENT, fs.ErrorDirNotFound, fs.ErrorObjectNotFound:
@@ -591,6 +633,8 @@ func translateError(err error) (errc int) {
 		return -fuse.ENOSYS
 	case vfs.EINVAL:
 		return -fuse.EINVAL
+	case vfs.ELOOP:
+		return -fuse.ELOOP
 	}
 	fs.Errorf(nil, "IO error: %v", err)
 	return -fuse.EIO
@@ -622,10 +666,27 @@ func translateOpenFlags(inFlags int) (outFlags int) {
 	return outFlags
 }
 
+// get the Mode from a vfs Node
+func getMode(node os.FileInfo) uint32 {
+	vfsMode := node.Mode()
+	Mode := vfsMode.Perm()
+	if vfsMode&os.ModeDir != 0 {
+		Mode |= fuse.S_IFDIR
+	} else if vfsMode&os.ModeSymlink != 0 {
+		Mode |= fuse.S_IFLNK
+	} else if vfsMode&os.ModeNamedPipe != 0 {
+		Mode |= fuse.S_IFIFO
+	} else {
+		Mode |= fuse.S_IFREG
+	}
+	return uint32(Mode)
+}
+
 // Make sure interfaces are satisfied
 var (
 	_ fuse.FileSystemInterface = (*FS)(nil)
 	_ fuse.FileSystemOpenEx    = (*FS)(nil)
+	_ fuse.FileSystemGetpath   = (*FS)(nil)
 	//_ fuse.FileSystemChflags    = (*FS)(nil)
 	//_ fuse.FileSystemSetcrtime  = (*FS)(nil)
 	//_ fuse.FileSystemSetchgtime = (*FS)(nil)

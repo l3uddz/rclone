@@ -3,32 +3,33 @@ package rcserver
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/go-chi/chi/v5"
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
-	testBindAddress = "localhost:0"
-	testTemplate    = "testdata/golden/testindex.html"
-	testFs          = "testdata/files"
-	remoteURL       = "[" + testFs + "]/" // initial URL path to fetch from that remote
+	testBindAddress     = "localhost:0"
+	defaultTestTemplate = "testdata/golden/testindex.html"
+	testFs              = "testdata/files"
+	remoteURL           = "[" + testFs + "]/" // initial URL path to fetch from that remote
 )
 
 func TestMain(m *testing.M) {
@@ -49,26 +50,26 @@ func TestMain(m *testing.M) {
 // Test the RC server runs and we can do HTTP fetches from it.
 // We'll do the majority of the testing with the httptest framework
 func TestRcServer(t *testing.T) {
-	opt := rc.DefaultOpt
-	opt.HTTPOptions.ListenAddr = testBindAddress
-	opt.HTTPOptions.Template = testTemplate
+	opt := rc.Opt
+	opt.HTTP.ListenAddr = []string{testBindAddress}
+	opt.Template.Path = defaultTestTemplate
 	opt.Enabled = true
 	opt.Serve = true
 	opt.Files = testFs
 	mux := http.NewServeMux()
-	rcServer := newServer(context.Background(), &opt, mux)
+	rcServer, err := newServer(context.Background(), &opt, mux)
+	require.NoError(t, err)
 	assert.NoError(t, rcServer.Serve())
 	defer func() {
-		rcServer.Close()
+		assert.NoError(t, rcServer.Shutdown())
 		rcServer.Wait()
 	}()
-	testURL := rcServer.Server.URL()
+	testURL := rcServer.server.URLs()[0]
 
 	// Do the simplest possible test to check the server is alive
 	// Do it a few times to wait for the server to start
 	var resp *http.Response
-	var err error
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		resp, err = http.Get(testURL + "file.txt")
 		if err == nil {
 			break
@@ -77,7 +78,7 @@ func TestRcServer(t *testing.T) {
 	}
 
 	require.NoError(t, err)
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
 	require.NoError(t, err)
@@ -88,27 +89,42 @@ func TestRcServer(t *testing.T) {
 }
 
 type testRun struct {
-	Name        string
-	URL         string
-	Status      int
-	Method      string
-	Range       string
-	Body        string
-	ContentType string
-	Expected    string
-	Contains    *regexp.Regexp
-	Headers     map[string]string
+	Name           string
+	URL            string
+	User           string
+	Pass           string
+	Status         int
+	Method         string
+	Range          string
+	Body           string
+	ContentType    string
+	Expected       string
+	Contains       *regexp.Regexp
+	Headers        map[string]string
+	RequestHeaders map[string]string
 }
 
 // Run a suite of tests
 func testServer(t *testing.T, tests []testRun, opt *rc.Options) {
+	t.Helper()
+
 	ctx := context.Background()
-	configfile.LoadConfig(ctx)
-	mux := http.NewServeMux()
-	opt.HTTPOptions.Template = testTemplate
-	rcServer := newServer(ctx, opt, mux)
+	configfile.Install()
+	if opt.Template.Path == "" {
+		opt.Template.Path = defaultTestTemplate
+	}
+	rcServer, err := newServer(ctx, opt, http.DefaultServeMux)
+	require.NoError(t, err)
+	testURL := rcServer.server.URLs()[0]
+	mux := rcServer.server.Router()
+	emulateCalls(t, tests, mux, testURL)
+}
+
+func emulateCalls(t *testing.T, tests []testRun, mux chi.Router, testURL string) {
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
+			t.Helper()
+
 			method := test.Method
 			if method == "" {
 				method = "GET"
@@ -126,22 +142,37 @@ func testServer(t *testing.T, tests []testRun, opt *rc.Options) {
 			if test.ContentType != "" {
 				req.Header.Add("Content-Type", test.ContentType)
 			}
+			if test.User != "" && test.Pass != "" {
+				req.SetBasicAuth(test.User, test.Pass)
+			}
+			for k, v := range test.RequestHeaders {
+				req.Header.Set(k, v)
+			}
 
 			w := httptest.NewRecorder()
-			rcServer.handler(w, req)
+			mux.ServeHTTP(w, req)
 			resp := w.Result()
 
 			assert.Equal(t, test.Status, resp.StatusCode)
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
-			if test.Contains == nil {
-				assert.Equal(t, test.Expected, string(body))
+			if test.ContentType == "application/json" && test.Expected != "" {
+				expectedNormalized := normalizeJSON(t, test.Expected)
+				actualNormalized := normalizeJSON(t, string(body))
+				assert.Equal(t, expectedNormalized, actualNormalized, "Normalized JSON does not match")
+			} else if test.Contains == nil {
+				// go1.23 started putting an html wrapper
+				bodyNormalized := strings.TrimPrefix(string(body), "<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n")
+				assert.Equal(t, test.Expected, bodyNormalized)
 			} else {
 				assert.True(t, test.Contains.Match(body), fmt.Sprintf("body didn't match: %v: %v", test.Contains, string(body)))
 			}
 
 			for k, v := range test.Headers {
+				if v == "testURL" {
+					v = testURL
+				}
 				assert.Equal(t, v, resp.Header.Get(k), k)
 			}
 		})
@@ -150,8 +181,9 @@ func testServer(t *testing.T, tests []testRun, opt *rc.Options) {
 
 // return an enabled rc
 func newTestOpt() rc.Options {
-	opt := rc.DefaultOpt
+	opt := rc.Opt
 	opt.Enabled = true
+	opt.HTTP.ListenAddr = []string{testBindAddress}
 	return opt
 }
 
@@ -163,6 +195,7 @@ func TestFileServing(t *testing.T) {
 		Expected: `<pre>
 <a href="dir/">dir/</a>
 <a href="file.txt">file.txt</a>
+<a href="modtime/">modtime/</a>
 </pre>
 `,
 	}, {
@@ -233,8 +266,9 @@ func TestRemoteServing(t *testing.T) {
 </head>
 <body>
 <h1>Directory listing of /</h1>
-<a href="dir/">dir/</a><br />
-<a href="file.txt">file.txt</a><br />
+<a href="./dir/">dir/</a><br />
+<a href="./modtime/">modtime/</a><br />
+<a href="./file.txt">file.txt</a><br />
 </body>
 </html>
 `,
@@ -283,7 +317,7 @@ func TestRemoteServing(t *testing.T) {
 </head>
 <body>
 <h1>Directory listing of /dir</h1>
-<a href="file2.txt">file2.txt</a><br />
+<a href="./file2.txt">file2.txt</a><br />
 </body>
 </html>
 `,
@@ -328,7 +362,7 @@ func TestRemoteServing(t *testing.T) {
 			URL:    "[notfoundremote:]/",
 			Status: http.StatusInternalServerError,
 			Expected: `{
-	"error": "failed to make Fs: didn't find section in config file",
+	"error": "failed to make Fs: didn't find section in config file (\"notfoundremote\")",
 	"input": null,
 	"path": "/",
 	"status": 500
@@ -338,7 +372,136 @@ func TestRemoteServing(t *testing.T) {
 	opt := newTestOpt()
 	opt.Serve = true
 	opt.Files = testFs
+	opt.NoAuth = true
 	testServer(t, tests, &opt)
+}
+
+// TestCheckServeRemote must reject request-derived backend instantiation on the
+// unauthenticated file-serving path, and global.* config mutation.
+func TestCheckServeRemote(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		fsName        string
+		authenticated bool
+		wantErr       string // substring of expected error, "" means no error
+	}{
+		// Plain named remotes are always allowed
+		{name: "named remote unauth", fsName: "remote:path", wantErr: ""},
+		{name: "named remote auth", fsName: "remote:path", authenticated: true, wantErr: ""},
+		// Inline backend definitions can run commands (webdav bearer_token_command, sftp ssh)
+		{name: "inline webdav unauth", fsName: ":webdav,url=http://localhost,bearer_token_command=id:", wantErr: "inline remotes"},
+		{name: "inline sftp unauth", fsName: ":sftp,ssh=id:", wantErr: "inline remotes"},
+		{name: "inline local unauth", fsName: ":local:/etc", wantErr: "inline remotes"},
+		{name: "inline allowed when authed", fsName: ":local:/etc", authenticated: true, wantErr: ""},
+		// Bare local paths allow arbitrary local file access
+		{name: "bare path unauth", fsName: "/etc/passwd", wantErr: "local paths"},
+		{name: "bare path allowed when authed", fsName: "/etc/passwd", authenticated: true, wantErr: ""},
+		// Connection string overrides can set command-executing options
+		{name: "connection string unauth", fsName: "remote,vendor=other:path", wantErr: "connection string"},
+		{name: "connection string allowed when authed", fsName: "remote,vendor=other:path", authenticated: true, wantErr: ""},
+		// global.* mutates process-wide config and is never allowed
+		{name: "global config unauth", fsName: "remote,global.http_proxy=x:path", wantErr: "global.http_proxy"},
+		{name: "global config blocked even when authed", fsName: "remote,global.http_proxy=x:path", authenticated: true, wantErr: "global.http_proxy"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := checkServeRemote(test.fsName, test.authenticated)
+			if test.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), test.wantErr)
+			}
+		})
+	}
+}
+
+// On an unauthenticated server the serve path must not instantiate
+// attacker-supplied inline remotes or local paths, but must still allow
+// configured named remotes.
+func TestServeRemoteUnauthenticated(t *testing.T) {
+	forbidden := regexp.MustCompile(`"status": 403`)
+	tests := []testRun{{
+		// An inline remote could run a command during initialisation
+		Name:     "inline-remote-rejected",
+		URL:      "[:local:" + testFs + "]/file.txt",
+		Status:   http.StatusForbidden,
+		Contains: forbidden,
+	}, {
+		Name:     "bare-local-path-rejected",
+		URL:      remoteURL + "file.txt",
+		Status:   http.StatusForbidden,
+		Contains: forbidden,
+	}, {
+		// A configured (here non-existent) named remote is allowed through to
+		// the backend, which then reports it isn't in the config file
+		Name:     "named-remote-allowed-through",
+		URL:      "[notfoundremote:]/",
+		Status:   http.StatusInternalServerError,
+		Contains: regexp.MustCompile(`didn't find section in config file`),
+	}}
+	opt := newTestOpt()
+	opt.Serve = true
+	testServer(t, tests, &opt)
+}
+
+// With authentication configured the serve path may instantiate inline remotes
+// (the request is authenticated) but must still refuse to mutate process-wide
+// config via global.* options.
+func TestServeRemoteWithAuth(t *testing.T) {
+	const user, pass = "user", "pass"
+	tests := []testRun{{
+		// Authenticated requests can serve bare local paths again
+		Name:     "bare-local-path-served-when-authenticated",
+		URL:      remoteURL + "file.txt",
+		User:     user,
+		Pass:     pass,
+		Status:   http.StatusOK,
+		Expected: "this is file1.txt\n",
+	}, {
+		// global.* is blocked even for an authenticated request
+		Name:     "global-config-blocked-when-authenticated",
+		URL:      "[notfoundremote,global.http_proxy=x:]/",
+		User:     user,
+		Pass:     pass,
+		Status:   http.StatusForbidden,
+		Contains: regexp.MustCompile(`global\.http_proxy`),
+	}, {
+		// A request without credentials is rejected before reaching the handler
+		Name:     "unauthenticated-request-rejected",
+		URL:      remoteURL + "file.txt",
+		Status:   http.StatusUnauthorized,
+		Contains: regexp.MustCompile(``),
+	}}
+	opt := newTestOpt()
+	opt.Serve = true
+	opt.Files = testFs
+	opt.Auth.BasicUser = user
+	opt.Auth.BasicPass = pass
+	testServer(t, tests, &opt)
+}
+
+// The serve path must mark backend creation as a remote control (rc) request
+// so a request-supplied remote can't change process-wide config via global.*
+// options.
+func TestServeRemoteMarksRCRequest(t *testing.T) {
+	configfile.Install()
+	opt := newTestOpt()
+	opt.Serve = true
+	opt.NoAuth = true // allow inline remotes so we reach backend creation
+	opt.Template.Path = defaultTestTemplate
+	rcServer, err := newServer(context.Background(), &opt, http.NewServeMux())
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	original := fs.GetConfig(ctx).UserAgent
+	defer func() { fs.GetConfig(ctx).UserAgent = original }()
+
+	// serveRemote uses s.ctx, marked as an rc request, so global.* must not
+	// change the process-wide config.
+	rcServer.serveRemote(httptest.NewRecorder(), httptest.NewRequest("GET", "/file.txt", nil),
+		"file.txt", ":local,global.user_agent=rcservertest:"+testFs)
+	assert.Equal(t, original, fs.GetConfig(ctx).UserAgent,
+		"the serve path must not let global.* change the process-wide config")
 }
 
 func TestRC(t *testing.T) {
@@ -373,11 +536,17 @@ func TestRC(t *testing.T) {
 }
 `,
 	}, {
-		Name:     "core-gc",
-		URL:      "core/gc", // returns nil, nil so check it is made into {}
-		Method:   "POST",
-		Status:   http.StatusOK,
-		Expected: "{}\n",
+		Name:   "core-gc",
+		URL:    "core/gc", // now requires auth
+		Method: "POST",
+		Status: http.StatusForbidden,
+		Expected: `{
+	"error": "authentication must be set up on the rc server to use \"core/gc\" or the --rc-no-auth flag must be in use",
+	"input": {},
+	"path": "core/gc",
+	"status": 403
+}
+`,
 	}, {
 		Name:   "url-params",
 		URL:    "rc/noop?param1=potato&param2=sausage",
@@ -394,6 +563,18 @@ func TestRC(t *testing.T) {
 		Method:      "POST",
 		Body:        `{ "param1":"string", "param2":true }`,
 		ContentType: "application/json",
+		Status:      http.StatusOK,
+		Expected: `{
+	"param1": "string",
+	"param2": true
+}
+`,
+	}, {
+		Name:        "json-mixed-case-content-type",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        `{ "param1":"string", "param2":true }`,
+		ContentType: "ApplicAtion/JsOn",
 		Status:      http.StatusOK,
 		Expected: `{
 	"param1": "string",
@@ -426,6 +607,44 @@ func TestRC(t *testing.T) {
 		"param1": "potato",
 		"param2": "sausage"
 	},
+	"path": "rc/noop",
+	"status": 400
+}
+`,
+	}, {
+		Name:        "json-charset",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        `{ "param1":"string", "param2":true }`,
+		ContentType: "application/json; charset=utf-8",
+		Status:      http.StatusOK,
+		Expected: `{
+	"param1": "string",
+	"param2": true
+}
+`,
+	}, {
+		Name:        "json-mixed-case-charset",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        `{ "param1":"string", "param2":true }`,
+		ContentType: "aPPlication/jSoN; charset=UtF-8",
+		Status:      http.StatusOK,
+		Expected: `{
+	"param1": "string",
+	"param2": true
+}
+`,
+	}, {
+		Name:        "json-bad-charset",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        `{ "param1":"string", "param2":true }`,
+		ContentType: "application/json; charset=latin1",
+		Status:      http.StatusBadRequest,
+		Expected: `{
+	"error": "unsupported charset \"latin1\" for JSON input",
+	"input": {},
 	"path": "rc/noop",
 	"status": 400
 }
@@ -469,6 +688,19 @@ func TestRC(t *testing.T) {
 	"status": 400
 }
 `,
+	}, {
+		Name:        "malformed-content-type",
+		URL:         "rc/noop",
+		Method:      "POST",
+		ContentType: "malformed/",
+		Status:      http.StatusBadRequest,
+		Expected: `{
+	"error": "failed to parse Content-Type: mime: expected token after slash",
+	"input": null,
+	"path": "rc/noop",
+	"status": 400
+}
+`,
 	}}
 	opt := newTestOpt()
 	opt.Serve = true
@@ -497,7 +729,7 @@ func TestRCWithAuth(t *testing.T) {
 		ContentType: "application/x-www-form-urlencoded",
 		Status:      http.StatusInternalServerError,
 		Expected: `{
-	"error": "Unknown returnType \"POTATO\"",
+	"error": "unknown returnType \"POTATO\"",
 	"input": {
 		"command": "version",
 		"returnType": "POTATO"
@@ -543,90 +775,6 @@ Unknown command
 	testServer(t, tests, &opt)
 }
 
-func TestMethods(t *testing.T) {
-	tests := []testRun{{
-		Name:     "options",
-		URL:      "",
-		Method:   "OPTIONS",
-		Status:   http.StatusOK,
-		Expected: "",
-		Headers: map[string]string{
-			"Access-Control-Allow-Origin":   "http://localhost:5572/",
-			"Access-Control-Request-Method": "POST, OPTIONS, GET, HEAD",
-			"Access-Control-Allow-Headers":  "authorization, Content-Type",
-		},
-	}, {
-		Name:   "bad",
-		URL:    "",
-		Method: "POTATO",
-		Status: http.StatusMethodNotAllowed,
-		Expected: `{
-	"error": "method \"POTATO\" not allowed",
-	"input": null,
-	"path": "",
-	"status": 405
-}
-`,
-	}}
-	opt := newTestOpt()
-	opt.Serve = true
-	opt.Files = testFs
-	testServer(t, tests, &opt)
-}
-
-func TestMetrics(t *testing.T) {
-	stats := accounting.GlobalStats()
-	tests := makeMetricsTestCases(stats)
-	opt := newTestOpt()
-	opt.EnableMetrics = true
-	testServer(t, tests, &opt)
-
-	// Test changing a couple options
-	stats.Bytes(500)
-	stats.Deletes(30)
-	stats.Errors(2)
-	stats.Bytes(324)
-
-	tests = makeMetricsTestCases(stats)
-	testServer(t, tests, &opt)
-}
-
-func makeMetricsTestCases(stats *accounting.StatsInfo) (tests []testRun) {
-	tests = []testRun{{
-		Name:     "Bytes Transferred Metric",
-		URL:      "/metrics",
-		Method:   "GET",
-		Status:   http.StatusOK,
-		Contains: regexp.MustCompile(fmt.Sprintf("rclone_bytes_transferred_total %d", stats.GetBytes())),
-	}, {
-		Name:     "Checked Files Metric",
-		URL:      "/metrics",
-		Method:   "GET",
-		Status:   http.StatusOK,
-		Contains: regexp.MustCompile(fmt.Sprintf("rclone_checked_files_total %d", stats.GetChecks())),
-	}, {
-		Name:     "Errors Metric",
-		URL:      "/metrics",
-		Method:   "GET",
-		Status:   http.StatusOK,
-		Contains: regexp.MustCompile(fmt.Sprintf("rclone_errors_total %d", stats.GetErrors())),
-	}, {
-		Name:     "Deleted Files Metric",
-		URL:      "/metrics",
-		Method:   "GET",
-		Status:   http.StatusOK,
-		Contains: regexp.MustCompile(fmt.Sprintf("rclone_files_deleted_total %d", stats.Deletes(0))),
-	}, {
-		Name:     "Files Transferred Metric",
-		URL:      "/metrics",
-		Method:   "GET",
-		Status:   http.StatusOK,
-		Contains: regexp.MustCompile(fmt.Sprintf("rclone_files_transferred_total %d", stats.GetTransfers())),
-	},
-	}
-	return
-}
-
 var matchRemoteDirListing = regexp.MustCompile(`<title>Directory listing of /</title>`)
 
 func TestServingRoot(t *testing.T) {
@@ -639,6 +787,7 @@ func TestServingRoot(t *testing.T) {
 	opt := newTestOpt()
 	opt.Serve = true
 	opt.Files = testFs
+	opt.NoAuth = true
 	testServer(t, tests, &opt)
 }
 
@@ -652,6 +801,53 @@ func TestServingRootNoFiles(t *testing.T) {
 	opt := newTestOpt()
 	opt.Serve = true
 	opt.Files = ""
+	opt.NoAuth = true
+	testServer(t, tests, &opt)
+}
+
+// On a server with no authentication configured and without --rc-no-auth the
+// remote listing must not disclose the configured remote names.
+func TestServingRootFailClosed(t *testing.T) {
+	forbidden := regexp.MustCompile(`"status": 403`)
+	tests := []testRun{{
+		Name:     "rootlist-star",
+		URL:      "*",
+		Status:   http.StatusForbidden,
+		Contains: forbidden,
+	}, {
+		Name:     "rootlist-empty",
+		URL:      "",
+		Status:   http.StatusForbidden,
+		Contains: forbidden,
+	}}
+	opt := newTestOpt()
+	opt.Serve = true
+	opt.Files = ""
+	testServer(t, tests, &opt)
+}
+
+// With authentication configured the remote listing is available to
+// authenticated requests only.
+func TestServingRootWithAuth(t *testing.T) {
+	const user, pass = "user", "pass"
+	tests := []testRun{{
+		Name:     "rootlist-authed",
+		URL:      "",
+		User:     user,
+		Pass:     pass,
+		Status:   http.StatusOK,
+		Contains: matchRemoteDirListing,
+	}, {
+		Name:     "rootlist-unauthed",
+		URL:      "",
+		Status:   http.StatusUnauthorized,
+		Contains: regexp.MustCompile(`Unauthorized`),
+	}}
+	opt := newTestOpt()
+	opt.Serve = true
+	opt.Files = ""
+	opt.Auth.BasicUser = user
+	opt.Auth.BasicPass = pass
 	testServer(t, tests, &opt)
 }
 
@@ -714,6 +910,136 @@ func TestAuthRequired(t *testing.T) {
 	testServer(t, tests, &opt)
 }
 
+func TestBodyLimitWithoutAuth(t *testing.T) {
+	bigBody := `{"payload":"` + strings.Repeat("A", maxUnauthenticatedBodySize) + `"}`
+	tooLarge := regexp.MustCompile(`(?s)"error": "failed to read input JSON: http: request body too large",\s*"input": null,.*"status": 413`)
+	tests := []testRun{{
+		Name:        "noAuthCall",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        bigBody,
+		ContentType: "application/json",
+		Status:      http.StatusRequestEntityTooLarge,
+		Contains:    tooLarge,
+	}, {
+		// Rejected before the body is read so nothing is echoed
+		Name:        "authCall",
+		URL:         "rc/noopauth",
+		Method:      "POST",
+		Body:        bigBody,
+		ContentType: "application/json",
+		Status:      http.StatusForbidden,
+		Expected: `{
+	"error": "authentication must be set up on the rc server to use \"rc/noopauth\" or the --rc-no-auth flag must be in use",
+	"input": {},
+	"path": "rc/noopauth",
+	"status": 403
+}
+`,
+	}, {
+		Name:        "unknownCall",
+		URL:         "rc/potato",
+		Method:      "POST",
+		Body:        `{"potato":1}`,
+		ContentType: "application/json",
+		Status:      http.StatusNotFound,
+		Expected: `{
+	"error": "couldn't find method \"rc/potato\"",
+	"input": {},
+	"path": "rc/potato",
+	"status": 404
+}
+`,
+	}, {
+		Name:        "form",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        "payload=" + strings.Repeat("A", maxUnauthenticatedBodySize),
+		ContentType: "application/x-www-form-urlencoded",
+		Status:      http.StatusRequestEntityTooLarge,
+		Contains:    regexp.MustCompile(`"error": "failed to parse form/URL parameters: http: request body too large"`),
+	}, {
+		Name:        "small",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        `{"potato":1}`,
+		ContentType: "application/json",
+		Status:      http.StatusOK,
+		Expected: `{
+	"potato": 1
+}
+`,
+	}}
+	opt := newTestOpt()
+	opt.Serve = false
+	opt.Files = ""
+	opt.NoAuth = false
+	testServer(t, tests, &opt)
+
+	// --rc-no-auth explicitly allows everything so isn't limited
+	bigOK := testRun{
+		Name:        "noAuthFlag",
+		URL:         "rc/noop",
+		Method:      "POST",
+		Body:        bigBody,
+		ContentType: "application/json",
+		Status:      http.StatusOK,
+		Contains:    regexp.MustCompile(`"payload": "AAAA`),
+	}
+	opt.NoAuth = true
+	testServer(t, []testRun{bigOK}, &opt)
+
+	// Authenticated requests aren't limited either
+	opt.NoAuth = false
+	opt.Auth.BasicUser = "user"
+	opt.Auth.BasicPass = "pass"
+	bigOK.Name = "withAuth"
+	bigOK.URL = "rc/noopauth"
+	bigOK.User = "user"
+	bigOK.Pass = "pass"
+	testServer(t, []testRun{bigOK}, &opt)
+}
+
+// job/status returns the output of any job so it must need
+// authentication, e.g. so an unauthenticated user can't read the
+// output of config/dump started with _async by an authenticated one.
+func TestJobAuthRequired(t *testing.T) {
+	tests := []testRun{{
+		Name:        "status",
+		URL:         "job/status",
+		Method:      "POST",
+		Body:        `{"jobid":1}`,
+		ContentType: "application/json",
+		Status:      http.StatusForbidden,
+		Expected: `{
+	"error": "authentication must be set up on the rc server to use \"job/status\" or the --rc-no-auth flag must be in use",
+	"input": {},
+	"path": "job/status",
+	"status": 403
+}
+`,
+	}, {
+		Name:        "list",
+		URL:         "job/list",
+		Method:      "POST",
+		Body:        `{}`,
+		ContentType: "application/json",
+		Status:      http.StatusForbidden,
+		Expected: `{
+	"error": "authentication must be set up on the rc server to use \"job/list\" or the --rc-no-auth flag must be in use",
+	"input": {},
+	"path": "job/list",
+	"status": 403
+}
+`,
+	}}
+	opt := newTestOpt()
+	opt.Serve = false
+	opt.Files = ""
+	opt.NoAuth = false
+	testServer(t, tests, &opt)
+}
+
 func TestNoAuth(t *testing.T) {
 	tests := []testRun{{
 		Name:        "auth",
@@ -733,20 +1059,40 @@ func TestNoAuth(t *testing.T) {
 
 func TestWithUserPass(t *testing.T) {
 	tests := []testRun{{
-		Name:        "auth",
+		Name:        "authMissing",
+		URL:         "rc/noopauth",
+		Method:      "POST",
+		Body:        `{}`,
+		ContentType: "application/javascript",
+		Status:      http.StatusUnauthorized,
+		Expected:    "401 Unauthorized\n",
+	}, {
+		Name:        "authWrong",
+		URL:         "rc/noopauth",
+		Method:      "POST",
+		Body:        `{}`,
+		ContentType: "application/javascript",
+		Status:      http.StatusUnauthorized,
+		Expected:    "401 Unauthorized\n",
+		User:        "user1",
+		Pass:        "pass2",
+	}, {
+		Name:        "authOK",
 		URL:         "rc/noopauth",
 		Method:      "POST",
 		Body:        `{}`,
 		ContentType: "application/javascript",
 		Status:      http.StatusOK,
 		Expected:    "{}\n",
+		User:        "user",
+		Pass:        "pass",
 	}}
 	opt := newTestOpt()
 	opt.Serve = false
 	opt.Files = ""
 	opt.NoAuth = false
-	opt.HTTPOptions.BasicUser = "user"
-	opt.HTTPOptions.BasicPass = "pass"
+	opt.Auth.BasicUser = "user"
+	opt.Auth.BasicPass = "pass"
 	testServer(t, tests, &opt)
 }
 
@@ -759,6 +1105,33 @@ func TestRCAsync(t *testing.T) {
 		Body:        `{ "_async":true }`,
 		Status:      http.StatusOK,
 		Contains:    regexp.MustCompile(`(?s)\{.*\"jobid\":.*\}`),
+	}, {
+		Name:           "prefer-respond-async",
+		URL:            "rc/noop",
+		Method:         "POST",
+		ContentType:    "application/json",
+		Body:           `{ "_async":true }`,
+		RequestHeaders: map[string]string{"Prefer": "respond-async"},
+		Status:         http.StatusAccepted,
+		Contains:       regexp.MustCompile(`(?s)\{.*\"jobid\":.*\}`),
+	}, {
+		Name:           "prefer-without-async",
+		URL:            "rc/noop",
+		Method:         "POST",
+		ContentType:    "application/json",
+		Body:           `{}`,
+		RequestHeaders: map[string]string{"Prefer": "respond-async"},
+		Status:         http.StatusAccepted,
+		Contains:       regexp.MustCompile(`(?s)\{.*\"jobid\":.*\}`),
+	}, {
+		Name:           "prefer-respond-async-mixed",
+		URL:            "rc/noop",
+		Method:         "POST",
+		ContentType:    "application/json",
+		Body:           `{}`,
+		RequestHeaders: map[string]string{"Prefer": "wait=10, respond-async"},
+		Status:         http.StatusAccepted,
+		Contains:       regexp.MustCompile(`(?s)\{.*\"jobid\":.*\}`),
 	}, {
 		Name:        "bad",
 		URL:         "rc/noop",
@@ -780,4 +1153,143 @@ func TestRCAsync(t *testing.T) {
 	opt.Serve = true
 	opt.Files = ""
 	testServer(t, tests, &opt)
+}
+
+// The debug/pprof handlers expose the process command line, heap and
+// goroutine dumps, so require auth.
+func TestRCDebug(t *testing.T) {
+	index := testRun{
+		Name:        "index",
+		URL:         "debug/pprof/",
+		Method:      "GET",
+		ContentType: "text/html",
+		Status:      http.StatusOK,
+		Contains:    regexp.MustCompile(`Types of profiles available`),
+	}
+	goroutines := testRun{
+		Name:        "goroutines",
+		URL:         "debug/pprof/goroutine?debug=1",
+		Method:      "GET",
+		ContentType: "text/html",
+		Status:      http.StatusOK,
+		Contains:    regexp.MustCompile(`goroutine profile`),
+	}
+
+	// With --rc-no-auth the debug handlers are attached and open
+	t.Run("NoAuth", func(t *testing.T) {
+		opt := newTestOpt()
+		opt.Serve = true
+		opt.Files = ""
+		opt.NoAuth = true
+		testServer(t, []testRun{index, goroutines}, &opt)
+	})
+
+	// With auth configured the debug handlers are attached but require credentials
+	t.Run("WithAuth", func(t *testing.T) {
+		authed := index
+		authed.User, authed.Pass = "user", "pass"
+		unauthed := index
+		unauthed.Name = "index-no-credentials"
+		unauthed.Status = http.StatusUnauthorized
+		unauthed.Contains = regexp.MustCompile(`Unauthorized`)
+		opt := newTestOpt()
+		opt.Serve = true
+		opt.Files = ""
+		opt.Auth.BasicUser = "user"
+		opt.Auth.BasicPass = "pass"
+		testServer(t, []testRun{authed, unauthed}, &opt)
+	})
+
+	// On a default unauthenticated server the debug handlers must not be
+	// mounted, so they bypass nothing - they simply aren't there
+	t.Run("FailClosed", func(t *testing.T) {
+		blocked := index
+		blocked.Status = http.StatusNotFound
+		blocked.Contains = regexp.MustCompile(`Not Found`)
+		opt := newTestOpt()
+		opt.Serve = true
+		opt.Files = ""
+		testServer(t, []testRun{blocked}, &opt)
+	})
+}
+
+func TestServeModTime(t *testing.T) {
+	for file, mtime := range map[string]time.Time{
+		"dir":         time.Date(2023, 4, 12, 21, 15, 17, 0, time.UTC),
+		"modtime.txt": time.Date(2021, 1, 18, 5, 2, 28, 0, time.UTC),
+	} {
+		path := filepath.Join(testFs, "modtime", file)
+		err := os.Chtimes(path, mtime, mtime)
+		require.NoError(t, err)
+	}
+
+	opt := newTestOpt()
+	opt.Serve = true
+	opt.Template.Path = "testdata/golden/testmodtime.html"
+	opt.NoAuth = true
+
+	tests := []testRun{{
+		Name:     "modtime",
+		Method:   "GET",
+		URL:      remoteURL + "modtime/",
+		Status:   http.StatusOK,
+		Expected: "* dir/ - 2023-04-12T21:15:17Z\n* modtime.txt - 2021-01-18T05:02:28Z\n",
+	}}
+	testServer(t, tests, &opt)
+
+	opt.ServeNoModTime = true
+	tests = []testRun{{
+		Name:     "no modtime",
+		Method:   "GET",
+		URL:      remoteURL + "modtime/",
+		Status:   http.StatusOK,
+		Expected: "* dir/ - 0001-01-01T00:00:00Z\n* modtime.txt - 0001-01-01T00:00:00Z\n",
+	}}
+	testServer(t, tests, &opt)
+}
+
+func TestContentTypeJSON(t *testing.T) {
+	tests := []testRun{
+		{
+			Name:        "Check Content-Type for JSON response",
+			URL:         "rc/noop",
+			Method:      "POST",
+			Body:        `{}`,
+			ContentType: "application/json",
+			Status:      http.StatusOK,
+			Expected:    "{}\n",
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+		},
+		{
+			Name:        "Check Content-Type for JSON error response",
+			URL:         "rc/error",
+			Method:      "POST",
+			Body:        `{}`,
+			ContentType: "application/json",
+			Status:      http.StatusInternalServerError,
+			Expected: `{
+				"error": "arbitrary error on input map[]",
+				"input": {},
+				"path": "rc/error",
+				"status": 500
+			}
+			`,
+			Headers: map[string]string{
+				"Content-Type": "application/json",
+			},
+		},
+	}
+	opt := newTestOpt()
+	testServer(t, tests, &opt)
+}
+
+func normalizeJSON(t *testing.T, jsonStr string) string {
+	var jsonObj map[string]any
+	err := json.Unmarshal([]byte(jsonStr), &jsonObj)
+	require.NoError(t, err, "JSON unmarshalling failed")
+	normalizedJSON, err := json.Marshal(jsonObj)
+	require.NoError(t, err, "JSON marshalling failed")
+	return string(normalizedJSON)
 }

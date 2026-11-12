@@ -1,3 +1,4 @@
+// Package api provides types used by the Backblaze B2 API.
 package api
 
 import (
@@ -32,10 +33,27 @@ var _ fserrors.Fataler = (*Error)(nil)
 
 // Bucket describes a B2 bucket
 type Bucket struct {
-	ID        string `json:"bucketId"`
-	AccountID string `json:"accountId"`
-	Name      string `json:"bucketName"`
-	Type      string `json:"bucketType"`
+	ID             string          `json:"bucketId"`
+	AccountID      string          `json:"accountId"`
+	Name           string          `json:"bucketName"`
+	Type           string          `json:"bucketType"`
+	LifecycleRules []LifecycleRule `json:"lifecycleRules,omitempty"`
+}
+
+// LifecycleRule is a single lifecycle rule
+type LifecycleRule struct {
+	DaysFromHidingToDeleting                        *int   `json:"daysFromHidingToDeleting"`
+	DaysFromUploadingToHiding                       *int   `json:"daysFromUploadingToHiding"`
+	DaysFromStartingToCancelingUnfinishedLargeFiles *int   `json:"daysFromStartingToCancelingUnfinishedLargeFiles"`
+	FileNamePrefix                                  string `json:"fileNamePrefix"`
+}
+
+// ServerSideEncryption is a configuration object for B2 Server-Side Encryption
+type ServerSideEncryption struct {
+	Mode           string `json:"mode"`
+	Algorithm      string `json:"algorithm"`      // Encryption algorithm to use
+	CustomerKey    string `json:"customerKey"`    // User provided Base64 encoded key that is used by the server to encrypt files
+	CustomerKeyMd5 string `json:"customerKeyMd5"` // An MD5 hash of the decoded key
 }
 
 // Timestamp is a UTC time when this file was uploaded. It is a base
@@ -115,21 +133,30 @@ type File struct {
 	Info            map[string]string `json:"fileInfo"`        // The custom information that was uploaded with the file. This is a JSON object, holding the name/value pairs that were uploaded with the file.
 }
 
-// AuthorizeAccountResponse is as returned from the b2_authorize_account call
-type AuthorizeAccountResponse struct {
+// StorageAPI is as returned from the b2_authorize_account call
+type StorageAPI struct {
 	AbsoluteMinimumPartSize int      `json:"absoluteMinimumPartSize"` // The smallest possible size of a part of a large file.
-	AccountID               string   `json:"accountId"`               // The identifier for the account.
 	Allowed                 struct { // An object (see below) containing the capabilities of this auth token, and any restrictions on using it.
-		BucketID     string      `json:"bucketId"`     // When present, access is restricted to one bucket.
-		BucketName   string      `json:"bucketName"`   // When present, name of bucket - may be empty
-		Capabilities []string    `json:"capabilities"` // A list of strings, each one naming a capability the key has.
-		NamePrefix   interface{} `json:"namePrefix"`   // When present, access is restricted to files whose names start with the prefix
+		Buckets []struct { // When present, access is restricted to one or more buckets.
+			ID   string `json:"id"`   // ID of bucket
+			Name string `json:"name"` // When present, name of bucket - may be empty
+		} `json:"buckets"`
+		Capabilities []string `json:"capabilities"` // A list of strings, each one naming a capability the key has for every bucket.
+		NamePrefix   any      `json:"namePrefix"`   // When present, access is restricted to files whose names start with the prefix
 	} `json:"allowed"`
 	APIURL              string `json:"apiUrl"`              // The base URL to use for all API calls except for uploading and downloading files.
-	AuthorizationToken  string `json:"authorizationToken"`  // An authorization token to use with all calls, other than b2_authorize_account, that need an Authorization header.
 	DownloadURL         string `json:"downloadUrl"`         // The base URL to use for downloading files.
 	MinimumPartSize     int    `json:"minimumPartSize"`     // DEPRECATED: This field will always have the same value as recommendedPartSize. Use recommendedPartSize instead.
 	RecommendedPartSize int    `json:"recommendedPartSize"` // The recommended size for each part of a large file. We recommend using this part size for optimal upload performance.
+}
+
+// AuthorizeAccountResponse is as returned from the b2_authorize_account call
+type AuthorizeAccountResponse struct {
+	AccountID          string   `json:"accountId"`          // The identifier for the account.
+	AuthorizationToken string   `json:"authorizationToken"` // An authorization token to use with all calls, other than b2_authorize_account, that need an Authorization header.
+	APIs               struct { // Supported APIs for this account / key. These are API-dependent JSON objects.
+		Storage StorageAPI `json:"storageApi"`
+	} `json:"apiInfo"`
 }
 
 // ListBucketsRequest is parameters for b2_list_buckets call
@@ -205,9 +232,10 @@ type FileInfo struct {
 
 // CreateBucketRequest is used to create a bucket
 type CreateBucketRequest struct {
-	AccountID string `json:"accountId"`
-	Name      string `json:"bucketName"`
-	Type      string `json:"bucketType"`
+	AccountID      string          `json:"accountId"`
+	Name           string          `json:"bucketName"`
+	Type           string          `json:"bucketType"`
+	LifecycleRules []LifecycleRule `json:"lifecycleRules,omitempty"`
 }
 
 // DeleteBucketRequest is used to create a bucket
@@ -238,7 +266,7 @@ type GetFileInfoRequest struct {
 // If the original source of the file being uploaded has a last
 // modified time concept, Backblaze recommends using
 // src_last_modified_millis as the name, and a string holding the base
-// 10 number number of milliseconds since midnight, January 1, 1970
+// 10 number of milliseconds since midnight, January 1, 1970
 // UTC. This fits in a 64 bit integer such as the type "long" in the
 // programming language Java. It is intended to be compatible with
 // Java's time long. For example, it can be passed directly into the
@@ -250,10 +278,11 @@ type GetFileInfoRequest struct {
 //
 // Example: { "src_last_modified_millis" : "1452802803026", "large_file_sha1" : "a3195dc1e7b46a2ff5da4b3c179175b75671e80d", "color": "blue" }
 type StartLargeFileRequest struct {
-	BucketID    string            `json:"bucketId"`    //The ID of the bucket that the file will go in.
-	Name        string            `json:"fileName"`    // The name of the file. See Files for requirements on file names.
-	ContentType string            `json:"contentType"` // The MIME type of the content of the file, which will be returned in the Content-Type header when downloading the file. Use the Content-Type b2/x-auto to automatically set the stored Content-Type post upload. In the case where a file extension is absent or the lookup fails, the Content-Type is set to application/octet-stream.
-	Info        map[string]string `json:"fileInfo"`    // A JSON object holding the name/value pairs for the custom file info.
+	BucketID             string                `json:"bucketId"`                       // The ID of the bucket that the file will go in.
+	Name                 string                `json:"fileName"`                       // The name of the file. See Files for requirements on file names.
+	ContentType          string                `json:"contentType"`                    // The MIME type of the content of the file, which will be returned in the Content-Type header when downloading the file. Use the Content-Type b2/x-auto to automatically set the stored Content-Type post upload. In the case where a file extension is absent or the lookup fails, the Content-Type is set to application/octet-stream.
+	Info                 map[string]string     `json:"fileInfo"`                       // A JSON object holding the name/value pairs for the custom file info.
+	ServerSideEncryption *ServerSideEncryption `json:"serverSideEncryption,omitempty"` // A JSON object holding values related to Server-Side Encryption
 }
 
 // StartLargeFileResponse is the response to StartLargeFileRequest
@@ -314,19 +343,31 @@ type CancelLargeFileResponse struct {
 
 // CopyFileRequest is as passed to b2_copy_file
 type CopyFileRequest struct {
-	SourceID          string            `json:"sourceFileId"`                  // The ID of the source file being copied.
-	Name              string            `json:"fileName"`                      // The name of the new file being created.
-	Range             string            `json:"range,omitempty"`               // The range of bytes to copy. If not provided, the whole source file will be copied.
-	MetadataDirective string            `json:"metadataDirective,omitempty"`   // The strategy for how to populate metadata for the new file: COPY or REPLACE
-	ContentType       string            `json:"contentType,omitempty"`         // The MIME type of the content of the file (REPLACE only)
-	Info              map[string]string `json:"fileInfo,omitempty"`            // This field stores the metadata that will be stored with the file. (REPLACE only)
-	DestBucketID      string            `json:"destinationBucketId,omitempty"` // The destination ID of the bucket if set, if not the source bucket will be used
+	SourceID                        string                `json:"sourceFileId"`                              // The ID of the source file being copied.
+	Name                            string                `json:"fileName"`                                  // The name of the new file being created.
+	Range                           string                `json:"range,omitempty"`                           // The range of bytes to copy. If not provided, the whole source file will be copied.
+	MetadataDirective               string                `json:"metadataDirective,omitempty"`               // The strategy for how to populate metadata for the new file: COPY or REPLACE
+	ContentType                     string                `json:"contentType,omitempty"`                     // The MIME type of the content of the file (REPLACE only)
+	Info                            map[string]string     `json:"fileInfo,omitempty"`                        // This field stores the metadata that will be stored with the file. (REPLACE only)
+	DestBucketID                    string                `json:"destinationBucketId,omitempty"`             // The destination ID of the bucket if set, if not the source bucket will be used
+	SourceServerSideEncryption      *ServerSideEncryption `json:"sourceServerSideEncryption,omitempty"`      // A JSON object holding values related to Server-Side Encryption for the source file
+	DestinationServerSideEncryption *ServerSideEncryption `json:"destinationServerSideEncryption,omitempty"` // A JSON object holding values related to Server-Side Encryption for the destination file
 }
 
 // CopyPartRequest is the request for b2_copy_part - the response is UploadPartResponse
 type CopyPartRequest struct {
-	SourceID    string `json:"sourceFileId"`    // The ID of the source file being copied.
-	LargeFileID string `json:"largeFileId"`     // The ID of the large file the part will belong to, as returned by b2_start_large_file.
-	PartNumber  int64  `json:"partNumber"`      // Which part this is (starting from 1)
-	Range       string `json:"range,omitempty"` // The range of bytes to copy. If not provided, the whole source file will be copied.
+	SourceID                        string                `json:"sourceFileId"`                              // The ID of the source file being copied.
+	LargeFileID                     string                `json:"largeFileId"`                               // The ID of the large file the part will belong to, as returned by b2_start_large_file.
+	PartNumber                      int64                 `json:"partNumber"`                                // Which part this is (starting from 1)
+	Range                           string                `json:"range,omitempty"`                           // The range of bytes to copy. If not provided, the whole source file will be copied.
+	SourceServerSideEncryption      *ServerSideEncryption `json:"sourceServerSideEncryption,omitempty"`      // A JSON object holding values related to Server-Side Encryption for the source file
+	DestinationServerSideEncryption *ServerSideEncryption `json:"destinationServerSideEncryption,omitempty"` // A JSON object holding values related to Server-Side Encryption for the destination file
+}
+
+// UpdateBucketRequest describes a request to modify a B2 bucket
+type UpdateBucketRequest struct {
+	ID             string          `json:"bucketId"`
+	AccountID      string          `json:"accountId"`
+	Type           string          `json:"bucketType,omitempty"`
+	LifecycleRules []LifecycleRule `json:"lifecycleRules,omitempty"`
 }

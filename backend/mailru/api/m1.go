@@ -1,3 +1,4 @@
+// Package api provides types used by the Mail.ru API.
 package api
 
 import (
@@ -58,12 +59,12 @@ type UserInfoResponse struct {
 				AutoProlong  bool   `json:"auto_prolong"`
 				Basequota    int64  `json:"basequota"`
 				Enabled      bool   `json:"enabled"`
-				Expires      int    `json:"expires"`
+				Expires      int64  `json:"expires"`
 				Prolong      bool   `json:"prolong"`
 				Promocodes   struct {
 				} `json:"promocodes"`
-				Subscription []interface{} `json:"subscription"`
-				Version      string        `json:"version"`
+				Subscription []any  `json:"subscription"`
+				Version      string `json:"version"`
 			} `json:"billing"`
 			Bonuses struct {
 				CameraUpload bool `json:"camera_upload"`
@@ -80,7 +81,7 @@ type UserInfoResponse struct {
 			FileSizeLimit int64 `json:"file_size_limit"`
 			Space         struct {
 				BytesTotal int64 `json:"bytes_total"`
-				BytesUsed  int   `json:"bytes_used"`
+				BytesUsed  int64 `json:"bytes_used"`
 				Overquota  bool  `json:"overquota"`
 			} `json:"space"`
 		} `json:"cloud"`
@@ -111,7 +112,7 @@ type ListItem struct {
 	Count struct {
 		Folders int `json:"folders"`
 		Files   int `json:"files"`
-	} `json:"count,omitempty"`
+	} `json:"count"`
 	Kind      string `json:"kind"`
 	Type      string `json:"type"`
 	Name      string `json:"name"`
@@ -153,7 +154,7 @@ type FolderInfoResponse struct {
 		Type string     `json:"type"`
 		Home string     `json:"home"`
 		List []ListItem `json:"list"`
-	} `json:"body,omitempty"`
+	} `json:"body"`
 	Time   int64  `json:"time"`
 	Status int    `json:"status"`
 	Email  string `json:"email"`

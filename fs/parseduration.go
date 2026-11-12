@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -60,12 +61,75 @@ func parseDurationSuffixes(age string) (time.Duration, error) {
 			if err != nil {
 				return time.Duration(0), err
 			}
+			if math.IsNaN(period) {
+				return time.Duration(0), fmt.Errorf("duration %q is not a number", age)
+			}
 			period *= float64(ageSuffix.Multiplier)
+			if math.Abs(period) >= math.MaxInt64 {
+				return time.Duration(0), fmt.Errorf("duration %q is too long", age)
+			}
 			break
 		}
 	}
 
 	return time.Duration(period), nil
+}
+
+// parseDurationSequence parses a possibly signed sequence of numbers each
+// with a unit, eg "1d12h", where a unit is one of the ageSuffixes or one
+// accepted by time.ParseDuration.
+func parseDurationSequence(age string) (time.Duration, error) {
+	s := age
+	sign := 1.0
+	if s != "" && (s[0] == '-' || s[0] == '+') {
+		if s[0] == '-' {
+			sign = -1
+		}
+		s = s[1:]
+	}
+	if s == "" {
+		return 0, fmt.Errorf("invalid duration %q", age)
+	}
+	isNumber := func(c byte) bool { return c == '.' || (c >= '0' && c <= '9') }
+	var total float64
+	for s != "" {
+		i := 0
+		for i < len(s) && isNumber(s[i]) {
+			i++
+		}
+		j := i
+		for j < len(s) && !isNumber(s[j]) {
+			j++
+		}
+		number, unit := s[:i], s[i:j]
+		s = s[j:]
+		if number == "" || unit == "" {
+			return 0, fmt.Errorf("invalid duration %q", age)
+		}
+		value, err := strconv.ParseFloat(number, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration %q: %w", age, err)
+		}
+		found := false
+		for _, ageSuffix := range ageSuffixes {
+			if ageSuffix.Suffix != "" && unit == ageSuffix.Suffix {
+				total += value * float64(ageSuffix.Multiplier)
+				found = true
+				break
+			}
+		}
+		if !found {
+			d, err := time.ParseDuration(number + unit)
+			if err != nil {
+				return 0, fmt.Errorf("invalid duration %q: %w", age, err)
+			}
+			total += float64(d)
+		}
+	}
+	if total >= math.MaxInt64 {
+		return 0, fmt.Errorf("duration %q is too long", age)
+	}
+	return time.Duration(sign * total), nil
 }
 
 // time formats to try parsing ages as - in order
@@ -76,16 +140,26 @@ var timeFormats = []string{
 	"2006-01-02",
 }
 
-// parse the age as time before the epoch in various date formats
-func parseDurationDates(age string, epoch time.Time) (t time.Duration, err error) {
+// parse the date as time in various date formats
+func parseTimeDates(date string) (t time.Time, err error) {
 	var instant time.Time
 	for _, timeFormat := range timeFormats {
-		instant, err = time.Parse(timeFormat, age)
+		instant, err = time.ParseInLocation(timeFormat, date, time.Local)
 		if err == nil {
-			return epoch.Sub(instant), nil
+			return instant, nil
 		}
 	}
 	return t, err
+}
+
+// parse the age as time before the epoch in various date formats
+func parseDurationDates(age string, epoch time.Time) (d time.Duration, err error) {
+	instant, err := parseTimeDates(age)
+	if err != nil {
+		return d, err
+	}
+
+	return epoch.Sub(instant), nil
 }
 
 // parseDurationFromNow parses a duration string. Allows ParseDuration to match the time
@@ -106,6 +180,11 @@ func parseDurationFromNow(age string, getNow func() time.Time) (d time.Duration,
 		return d, nil
 	}
 
+	d, err = parseDurationSequence(age)
+	if err == nil {
+		return d, nil
+	}
+
 	d, err = parseDurationDates(age, getNow())
 	if err == nil {
 		return d, nil
@@ -116,12 +195,30 @@ func parseDurationFromNow(age string, getNow func() time.Time) (d time.Duration,
 
 // ParseDuration parses a duration string. Accept ms|s|m|h|d|w|M|y suffixes. Defaults to second if not provided
 func ParseDuration(age string) (time.Duration, error) {
-	return parseDurationFromNow(age, time.Now)
+	return parseDurationFromNow(age, timeNowFunc)
 }
 
-// ReadableString parses d into a human readable duration.
-// Based on https://github.com/hako/durafmt
+// ReadableString parses d into a human-readable duration with units.
+// Examples: "3s", "1d2h23m20s", "292y24w3d23h47m16s".
 func (d Duration) ReadableString() string {
+	return d.readableString(0)
+}
+
+// ShortReadableString parses d into a human-readable duration with units.
+// This method returns it in short format, including the 3 most significant
+// units only, sacrificing precision if necessary. E.g. returns "292y24w3d"
+// instead of "292y24w3d23h47m16s", and "3d23h47m" instead of "3d23h47m16s".
+func (d Duration) ShortReadableString() string {
+	return d.readableString(3)
+}
+
+// readableString parses d into a human-readable duration with units.
+// Parameter maxNumberOfUnits limits number of significant units to include,
+// sacrificing precision. E.g. with argument 3 it returns "292y24w3d" instead
+// of "292y24w3d23h47m16s", and "3d23h47m" instead of "3d23h47m16s". Zero or
+// negative argument means include all.
+// Based on https://github.com/hako/durafmt
+func (d Duration) readableString(maxNumberOfUnits int) string {
 	switch d {
 	case DurationOff:
 		return "off"
@@ -129,11 +226,11 @@ func (d Duration) ReadableString() string {
 		return "0s"
 	}
 
-	readableString := ""
+	var readableString strings.Builder
 
 	// Check for minus durations.
 	if d < 0 {
-		readableString += "-"
+		readableString.WriteString("-")
 	}
 
 	duration := time.Duration(math.Abs(float64(d)))
@@ -169,16 +266,21 @@ func (d Duration) ReadableString() string {
 	}
 
 	// Construct duration string.
+	numberOfUnits := 0
 	for _, u := range [...]string{"y", "w", "d", "h", "m", "s", "ms"} {
 		v := durationMap[u]
 		strval := strconv.FormatInt(v, 10)
 		if v == 0 {
 			continue
 		}
-		readableString += strval + u
+		readableString.WriteString(strval + u)
+		numberOfUnits++
+		if maxNumberOfUnits > 0 && numberOfUnits >= maxNumberOfUnits {
+			break
+		}
 	}
 
-	return readableString
+	return readableString.String()
 }
 
 // Set a Duration
@@ -198,15 +300,31 @@ func (d Duration) Type() string {
 
 // UnmarshalJSON makes sure the value can be parsed as a string or integer in JSON
 func (d *Duration) UnmarshalJSON(in []byte) error {
-	return UnmarshalJSONFlag(in, d, func(i int64) error {
-		*d = Duration(i)
+	// Check if the input is a string value.
+	if len(in) >= 2 && in[0] == '"' && in[len(in)-1] == '"' {
+		strVal := string(in[1 : len(in)-1]) // Remove the quotes
+
+		// Attempt to parse the string as a duration.
+		parsedDuration, err := ParseDuration(strVal)
+		if err != nil {
+			return err
+		}
+		*d = Duration(parsedDuration)
 		return nil
-	})
+	}
+	// Handle numeric values.
+	var i int64
+	err := json.Unmarshal(in, &i)
+	if err != nil {
+		return err
+	}
+	*d = Duration(i)
+	return nil
 }
 
 // Scan implements the fmt.Scanner interface
 func (d *Duration) Scan(s fmt.ScanState, ch rune) error {
-	token, err := s.Token(true, nil)
+	token, err := s.Token(true, func(rune) bool { return true })
 	if err != nil {
 		return err
 	}

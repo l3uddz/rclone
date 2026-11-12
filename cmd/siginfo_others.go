@@ -1,4 +1,4 @@
-//+build !darwin
+//go:build !darwin && !freebsd && !netbsd && !dragonfly && !openbsd
 
 package cmd
 

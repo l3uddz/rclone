@@ -1,11 +1,11 @@
-// +build !openbsd,!windows
+//go:build !windows
 
 package buildinfo
 
 import (
 	"strings"
 
-	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v4/host"
 )
 
 // GetOSVersion returns OS version, kernel and bitness

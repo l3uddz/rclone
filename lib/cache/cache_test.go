@@ -18,7 +18,7 @@ var (
 
 func setup(t *testing.T) (*Cache, CreateFunc) {
 	called = 0
-	create := func(path string) (interface{}, bool, error) {
+	create := func(path string) (any, bool, error) {
 		assert.Equal(t, 0, called)
 		called++
 		switch path {
@@ -79,6 +79,22 @@ func TestGetError(t *testing.T) {
 	require.Equal(t, nil, f)
 
 	assert.Equal(t, 0, len(c.cache))
+}
+
+func TestPutErr(t *testing.T) {
+	c, create := setup(t)
+
+	assert.Equal(t, 0, len(c.cache))
+
+	c.PutErr("/alien", "slime", errSentinel)
+
+	assert.Equal(t, 1, len(c.cache))
+
+	fNew, err := c.Get("/alien", create)
+	require.Equal(t, errSentinel, err)
+	require.Equal(t, "slime", fNew)
+
+	assert.Equal(t, 1, len(c.cache))
 }
 
 func TestPut(t *testing.T) {
@@ -158,7 +174,7 @@ func TestCachePin(t *testing.T) {
 	_, err := c.Get("/", create)
 	require.NoError(t, err)
 
-	// Pin a non existent item to show nothing happens
+	// Pin a nonexistent item to show nothing happens
 	c.Pin("notfound")
 
 	c.mu.Lock()
@@ -273,7 +289,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestDeletePrefix(t *testing.T) {
-	create := func(path string) (interface{}, bool, error) {
+	create := func(path string) (any, bool, error) {
 		return path, true, nil
 	}
 	c := New()
@@ -301,7 +317,7 @@ func TestDeletePrefix(t *testing.T) {
 
 func TestCacheRename(t *testing.T) {
 	c := New()
-	create := func(path string) (interface{}, bool, error) {
+	create := func(path string) (any, bool, error) {
 		return path, true, nil
 	}
 
@@ -312,7 +328,7 @@ func TestCacheRename(t *testing.T) {
 
 	assert.Equal(t, 2, c.Entries())
 
-	// rename to non existent
+	// rename to nonexistent
 	value, found := c.Rename("existing1", "EXISTING1")
 	assert.Equal(t, true, found)
 	assert.Equal(t, existing1, value)
@@ -326,10 +342,105 @@ func TestCacheRename(t *testing.T) {
 
 	assert.Equal(t, 1, c.Entries())
 
-	// rename non existent
+	// rename nonexistent
 	value, found = c.Rename("notfound", "NOTFOUND")
 	assert.Equal(t, false, found)
 	assert.Nil(t, value)
 
 	assert.Equal(t, 1, c.Entries())
+}
+
+func TestCacheFinalize(t *testing.T) {
+	c := New()
+	numCalled := 0
+	c.SetFinalizer(func(v any) {
+		numCalled++
+	})
+	create := func(path string) (any, bool, error) {
+		return path, true, nil
+	}
+	_, _ = c.Get("ok", create)
+	assert.Equal(t, 0, numCalled)
+	c.Clear()
+	assert.Equal(t, 1, numCalled)
+
+	_, _ = c.Get("ok", create)
+	c.Delete("ok")
+	assert.Equal(t, 2, numCalled)
+
+	_, _ = c.Get("ok", create)
+	c.DeletePrefix("ok")
+	assert.Equal(t, 3, numCalled)
+
+	_, _ = c.Get("old", create)
+	_, _ = c.Get("new", create)
+	c.Rename("old", "new")
+	assert.Equal(t, 4, numCalled)
+
+	c.expireDuration = 1 * time.Millisecond
+	_, _ = c.Get("ok", create)
+	time.Sleep(2 * time.Millisecond)
+	c.cacheExpire() // "ok" and "new" fall out of cache
+	assert.Equal(t, 6, numCalled)
+}
+
+func TestCacheCanExpire(t *testing.T) {
+	c := New()
+	finalized := 0
+	c.SetFinalizer(func(v any) {
+		finalized++
+	})
+	busy := true
+	c.SetCanExpire(func(v any) bool {
+		// Must be callable without the lock
+		assert.Equal(t, 2, c.Entries())
+		return v != "busy" || !busy
+	})
+	create := func(path string) (any, bool, error) {
+		return path, true, nil
+	}
+	c.expireDuration = 1 * time.Millisecond
+	_, _ = c.Get("busy", create)
+	_, _ = c.Get("pinned", create)
+	c.Pin("pinned")
+	time.Sleep(2 * time.Millisecond)
+
+	// Neither the busy nor the pinned entry expire
+	c.cacheExpire()
+	assert.Equal(t, 2, c.Entries())
+	assert.Equal(t, 0, finalized)
+	assert.Equal(t, true, c.expireRunning)
+
+	// The busy entry expires as soon as it is no longer busy
+	busy = false
+	c.cacheExpire()
+	assert.Equal(t, 1, c.Entries())
+	assert.Equal(t, 1, finalized)
+	_, found := c.GetMaybe("pinned")
+	assert.True(t, found)
+}
+
+func TestCacheCanExpireUsed(t *testing.T) {
+	c := New()
+	finalized := 0
+	c.SetFinalizer(func(v any) {
+		finalized++
+	})
+	create := func(path string) (any, bool, error) {
+		return path, true, nil
+	}
+	// Use the entry while it is being asked about
+	c.SetCanExpire(func(v any) bool {
+		_, _ = c.Get("/", create)
+		return true
+	})
+	c.expireDuration = 1 * time.Second
+	_, _ = c.Get("/", create)
+	c.mu.Lock()
+	c.cache["/"].lastUsed = time.Now().Add(-time.Minute)
+	c.mu.Unlock()
+
+	c.cacheExpire()
+	assert.Equal(t, 1, c.Entries())
+	assert.Equal(t, 0, finalized)
 }

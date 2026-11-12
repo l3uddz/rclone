@@ -7,12 +7,12 @@ package dircache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
 	"sync"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 )
 
@@ -48,7 +48,7 @@ type DirCacher interface {
 // error. This isn't done at initialization as it isn't known whether
 // the root and intermediate directories need to be created or not.
 //
-// Most of the utility functions wil call FindRoot() on the caller's
+// Most of the utility functions will call FindRoot() on the caller's
 // behalf with the create flag passed in.
 //
 // The cache is safe for concurrent use
@@ -126,7 +126,21 @@ func (dc *DirCache) Flush() {
 	dc.cacheMu.Unlock()
 }
 
-// FlushDir flushes the map of all data starting with with the path
+// SetRootIDAlias sets the rootID to that passed in. This assumes that
+// the new ID is just an alias for the old ID so does not flush
+// anything.
+//
+// This should be called from FindLeaf (and only from FindLeaf) if it
+// is discovered that the root ID is incorrect. For example some
+// backends use "0" as a root ID, but it has a real ID which is needed
+// for some operations.
+func (dc *DirCache) SetRootIDAlias(rootID string) {
+	// No locking as this is called from FindLeaf
+	dc.rootID = rootID
+	dc.Put("", dc.rootID)
+}
+
+// FlushDir flushes the map of all data starting with the path
 // dir.
 //
 // If dir is empty string then this is equivalent to calling ResetRoot
@@ -178,7 +192,7 @@ func SplitPath(path string) (directory, leaf string) {
 //
 // Path shouldn't start or end with a /
 //
-// If create is set it will make the directory if not found
+// If create is set it will make the directory if not found.
 //
 // It will call FindRoot if it hasn't been called already
 func (dc *DirCache) FindDir(ctx context.Context, path string, create bool) (pathID string, err error) {
@@ -227,7 +241,7 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 		if create {
 			pathID, err = dc.fs.CreateDir(ctx, parentPathID, leaf)
 			if err != nil {
-				return "", errors.Wrap(err, "failed to make directory")
+				return "", fmt.Errorf("failed to make directory: %w", err)
 			}
 		} else {
 			return "", fs.ErrorDirNotFound
@@ -268,7 +282,7 @@ func (dc *DirCache) FindPath(ctx context.Context, path string, create bool) (lea
 // If successful this changes the root of the cache from the true root
 // to the root specified by the path passed into New.
 //
-// Resets the root directory
+// Resets the root directory.
 //
 // If create is set it will make the directory if not found
 func (dc *DirCache) FindRoot(ctx context.Context, create bool) error {
@@ -279,9 +293,9 @@ func (dc *DirCache) FindRoot(ctx context.Context, create bool) error {
 
 // _findRoot finds the root directory if not already found
 //
-// Resets the root directory
+// Resets the root directory.
 //
-// If create is set it will make the directory if not found
+// If create is set it will make the directory if not found.
 //
 // Call with mu held
 func (dc *DirCache) _findRoot(ctx context.Context, create bool) error {
@@ -344,13 +358,8 @@ func (dc *DirCache) RootParentID(ctx context.Context, create bool) (ID string, e
 			return "", err
 		}
 		dc.rootParentID = rootParentID
-	} else {
-		if dc.rootID == dc.trueRootID {
-			return "", errors.New("is root directory")
-		}
-	}
-	if dc.rootParentID == "" {
-		return "", errors.New("internal error: didn't find rootParentID")
+	} else if dc.rootID == dc.trueRootID {
+		return "", errors.New("is root directory")
 	}
 	return dc.rootParentID, nil
 }
@@ -376,7 +385,7 @@ func (dc *DirCache) ResetRoot() {
 // It does all the checking, creates intermediate directories and
 // returns leafs and IDs ready for the move.
 //
-// This returns
+// This returns:
 //
 // - srcID - ID of the source directory
 // - srcDirectoryID - ID of the parent of the source directory

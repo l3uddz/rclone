@@ -1,13 +1,16 @@
 ---
 title: "Cache"
 description: "Rclone docs for cache remote"
+versionIntroduced: "v1.39"
 ---
 
-{{< icon "fa fa-archive" >}} Cache (BETA)
------------------------------------------
+# Cache
 
 The `cache` remote wraps another existing remote and stores file structure
 and its data for long running tasks like `rclone mount`.
+
+It is **deprecated** so not recommended for use with new installations
+and may be removed at some point.
 
 ## Status
 
@@ -23,19 +26,21 @@ the use of the cache backend to minimize API hits and by-and-large
 these are out of date and the cache backend isn't needed in those
 scenarios any more.
 
-## Setup
+## Configuration
 
 To get started you just need to have an existing remote which can be configured
 with `cache`.
 
 Here is an example of how to make a remote called `test-cache`.  First run:
 
-     rclone config
+```console
+rclone config
+```
 
 This will guide you through an interactive setup process:
 
-```
-No remotes found - make a new one
+```text
+No remotes found, make a new one?
 n) New remote
 r) Rename remote
 c) Copy remote
@@ -70,11 +75,11 @@ password:
 The size of a chunk. Lower value good for slow connections but can affect seamless reading.
 Default: 5M
 Choose a number from below, or type in your own value
- 1 / 1MB
-   \ "1m"
- 2 / 5 MB
+ 1 / 1 MiB
+   \ "1M"
+ 2 / 5 MiB
    \ "5M"
- 3 / 10 MB
+ 3 / 10 MiB
    \ "10M"
 chunk_size> 2
 How much time should object info (file size, file hashes, etc.) be stored in cache. Use a very high value if you don't plan on changing the source FS from outside the cache.
@@ -91,11 +96,11 @@ info_age> 2
 The maximum size of stored chunks. When the storage grows beyond this size, the oldest chunks will be deleted.
 Default: 10G
 Choose a number from below, or type in your own value
- 1 / 500 MB
+ 1 / 500 MiB
    \ "500M"
- 2 / 1 GB
+ 2 / 1 GiB
    \ "1G"
- 3 / 10 GB
+ 3 / 10 GiB
    \ "10G"
 chunk_total_size> 3
 Remote config
@@ -114,19 +119,25 @@ You can then use it like this,
 
 List directories in top level of your drive
 
-    rclone lsd test-cache:
+```console
+rclone lsd test-cache:
+```
 
 List all the files in your drive
 
-    rclone ls test-cache:
+```console
+rclone ls test-cache:
+```
 
 To start a cached mount
 
-    rclone mount --allow-other test-cache: /var/tmp/test-cache
+```console
+rclone mount --allow-other test-cache: /var/tmp/test-cache
+```
 
-### Write Features ###
+### Write Features
 
-### Offline uploading ###
+### Offline uploading
 
 In an effort to make writing through cache more reliable, the backend 
 now supports this feature which can be activated by specifying a
@@ -151,7 +162,7 @@ Uploads will be stored in a queue and be processed based on the order they were 
 The queue and the temporary storage is persistent across restarts but
 can be cleared on startup with the `--cache-db-purge` flag.
 
-### Write Support ###
+### Write Support
 
 Writes are supported through `cache`.
 One caveat is that a mounted cache remote does not add any retry or fallback
@@ -162,9 +173,9 @@ One special case is covered with `cache-writes` which will cache the file
 data at the same time as the upload when it is enabled making it available
 from the cache store immediately once the upload is finished.
 
-### Read Features ###
+### Read Features
 
-#### Multiple connections ####
+#### Multiple connections
 
 To counter the high latency between a local PC where rclone is running
 and cloud providers, the cache remote can split multiple requests to the
@@ -176,7 +187,7 @@ This is similar to buffering when media files are played online. Rclone
 will stay around the current marker but always try its best to stay ahead
 and prepare the data before.
 
-#### Plex Integration ####
+#### Plex Integration
 
 There is a direct integration with Plex which allows cache to detect during reading
 if the file is in playback or not. This helps cache to adapt how it queries
@@ -195,9 +206,11 @@ How to enable? Run `rclone config` and add all the Plex options (endpoint, usern
 and password) in your remote and it will be automatically enabled.
 
 Affected settings:
-- `cache-workers`: _Configured value_ during confirmed playback or _1_ all the other times
 
-##### Certificate Validation #####
+- `cache-workers`: *Configured value* during confirmed playback or *1* all the
+  other times
+
+##### Certificate Validation
 
 When the Plex server is configured to only accept secure connections, it is
 possible to use `.plex.direct` URLs to ensure certificate validation succeeds.
@@ -212,60 +225,63 @@ have been replaced with dashes, e.g. `127.0.0.1` becomes `127-0-0-1`.
 
 To get the `server-hash` part, the easiest way is to visit
 
-https://plex.tv/api/resources?includeHttps=1&X-Plex-Token=your-plex-token
+<https://plex.tv/api/resources?includeHttps=1&X-Plex-Token=your-plex-token>
 
 This page will list all the available Plex servers for your account
 with at least one `.plex.direct` link for each. Copy one URL and replace
 the IP address with the desired address. This can be used as the
 `plex_url` value.
 
-### Known issues ###
+### Known issues
 
-#### Mount and --dir-cache-time ####
+#### Mount and --dir-cache-time
 
---dir-cache-time controls the first layer of directory caching which works at the mount layer.
-Being an independent caching mechanism from the `cache` backend, it will manage its own entries
-based on the configured time.
+--dir-cache-time controls the first layer of directory caching which works at
+the mount layer. Being an independent caching mechanism from the `cache` backend,
+it will manage its own entries based on the configured time.
 
-To avoid getting in a scenario where dir cache has obsolete data and cache would have the correct
-one, try to set `--dir-cache-time` to a lower time than `--cache-info-age`. Default values are
-already configured in this way. 
+To avoid getting in a scenario where dir cache has obsolete data and cache would
+have the correct one, try to set `--dir-cache-time` to a lower time than
+`--cache-info-age`. Default values are already configured in this way.
 
-#### Windows support - Experimental ####
+#### Windows support - Experimental
 
-There are a couple of issues with Windows `mount` functionality that still require some investigations.
-It should be considered as experimental thus far as fixes come in for this OS.
+There are a couple of issues with Windows `mount` functionality that still
+require some investigations. It should be considered as experimental thus far
+as fixes come in for this OS.
 
 Most of the issues seem to be related to the difference between filesystems
 on Linux flavors and Windows as cache is heavily dependent on them.
 
 Any reports or feedback on how cache behaves on this OS is greatly appreciated.
- 
-- https://github.com/rclone/rclone/issues/1935
-- https://github.com/rclone/rclone/issues/1907
-- https://github.com/rclone/rclone/issues/1834 
 
-#### Risk of throttling ####
+- [Issue #1935](https://github.com/rclone/rclone/issues/1935)
+- [Issue #1907](https://github.com/rclone/rclone/issues/1907)
+- [Issue #1834](https://github.com/rclone/rclone/issues/1834)
+
+#### Risk of throttling
 
 Future iterations of the cache backend will make use of the pooling functionality
 of the cloud provider to synchronize and at the same time make writing through it
-more tolerant to failures. 
+more tolerant to failures.
 
 There are a couple of enhancements in track to add these but in the meantime
 there is a valid concern that the expiring cache listings can lead to cloud provider
 throttles or bans due to repeated queries on it for very large mounts.
 
 Some recommendations:
+
 - don't use a very small interval for entry information (`--cache-info-age`)
-- while writes aren't yet optimised, you can still write through `cache` which gives you the advantage
-of adding the file in the cache at the same time if configured to do so.
+- while writes aren't yet optimised, you can still write through `cache` which
+  gives you the advantage of adding the file in the cache at the same time if
+  configured to do so.
 
 Future enhancements:
 
-- https://github.com/rclone/rclone/issues/1937
-- https://github.com/rclone/rclone/issues/1936 
+- [Issue #1937](https://github.com/rclone/rclone/issues/1937)
+- [Issue #1936](https://github.com/rclone/rclone/issues/1936)
 
-#### cache and crypt ####
+#### cache and crypt
 
 One common scenario is to keep your data encrypted in the cloud provider
 using the `crypt` remote. `crypt` uses a similar technique to wrap around
@@ -280,75 +296,90 @@ which makes it think we're downloading the full file instead of small chunks.
 Organizing the remotes in this order yields better results:
 {{<color green>}}**cloud remote** -> **cache** -> **crypt**{{</color>}}
 
-#### absolute remote paths ####
+#### absolute remote paths
 
-`cache` can not differentiate between relative and absolute paths for the wrapped remote.
-Any path given in the `remote` config setting and on the command line will be passed to
-the wrapped remote as is, but for storing the chunks on disk the path will be made
-relative by removing any leading `/` character.
+`cache` can not differentiate between relative and absolute paths for the wrapped
+remote. Any path given in the `remote` config setting and on the command line will
+be passed to the wrapped remote as is, but for storing the chunks on disk the path
+will be made relative by removing any leading `/` character.
 
-This behavior is irrelevant for most backend types, but there are backends where a leading `/`
-changes the effective directory, e.g. in the `sftp` backend paths starting with a `/` are
-relative to the root of the SSH server and paths without are relative to the user home directory.
-As a result `sftp:bin` and `sftp:/bin` will share the same cache folder, even if they represent
-a different directory on the SSH server.
+This behavior is irrelevant for most backend types, but there are backends where
+a leading `/` changes the effective directory, e.g. in the `sftp` backend paths
+starting with a `/` are relative to the root of the SSH server and paths without
+are relative to the user home directory. As a result `sftp:bin` and `sftp:/bin`
+will share the same cache folder, even if they represent a different directory
+on the SSH server.
 
-### Cache and Remote Control (--rc) ###
-Cache supports the new `--rc` mode in rclone and can be remote controlled through the following end points:
-By default, the listener is disabled if you do not add the flag.
+### Cache and Remote Control (--rc)
+
+Cache supports the new `--rc` mode in rclone and can be remote controlled
+through the following end points: By default, the listener is disabled if
+you do not add the flag.
 
 ### rc cache/expire
+
 Purge a remote from the cache backend. Supports either a directory or a file.
 It supports both encrypted and unencrypted file names if cache is wrapped by crypt.
 
 Params:
-  - **remote** = path to remote **(required)**
-  - **withData** = true/false to delete cached data (chunks) as well _(optional, false by default)_
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/cache/cache.go then run make backenddocs" >}}
-### Standard Options
+- **remote** = path to remote **(required)**
+- **withData** = true/false to delete cached data (chunks) as
+  well *(optional, false by default)*
 
-Here are the standard options specific to cache (Cache a remote).
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/cache/cache.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
+### Standard options
+
+Here are the Standard options specific to cache (Cache a remote).
 
 #### --cache-remote
 
 Remote to cache.
+
 Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 "myremote:bucket" or maybe "myremote:" (not recommended).
+
+Properties:
 
 - Config:      remote
 - Env Var:     RCLONE_CACHE_REMOTE
 - Type:        string
-- Default:     ""
+- Required:    true
 
 #### --cache-plex-url
 
-The URL of the Plex server
+The URL of the Plex server.
+
+Properties:
 
 - Config:      plex_url
 - Env Var:     RCLONE_CACHE_PLEX_URL
 - Type:        string
-- Default:     ""
+- Required:    false
 
 #### --cache-plex-username
 
-The username of the Plex user
+The username of the Plex user.
+
+Properties:
 
 - Config:      plex_username
 - Env Var:     RCLONE_CACHE_PLEX_USERNAME
 - Type:        string
-- Default:     ""
+- Required:    false
 
 #### --cache-plex-password
 
-The password of the Plex user
+The password of the Plex user.
 
 **NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
+
+Properties:
 
 - Config:      plex_password
 - Env Var:     RCLONE_CACHE_PLEX_PASSWORD
 - Type:        string
-- Default:     ""
+- Required:    false
 
 #### --cache-chunk-size
 
@@ -358,17 +389,19 @@ Use lower numbers for slower connections. If the chunk size is
 changed, any downloaded chunks will be invalid and cache-chunk-path
 will need to be cleared or unexpected EOF errors will occur.
 
+Properties:
+
 - Config:      chunk_size
 - Env Var:     RCLONE_CACHE_CHUNK_SIZE
 - Type:        SizeSuffix
-- Default:     5M
+- Default:     5Mi
 - Examples:
-    - "1m"
-        - 1MB
-    - "5M"
-        - 5 MB
-    - "10M"
-        - 10 MB
+  - "1M"
+    - 1 MiB
+  - "5M"
+    - 5 MiB
+  - "10M"
+    - 10 MiB
 
 #### --cache-info-age
 
@@ -376,17 +409,19 @@ How long to cache file structure information (directory listings, file size, tim
 If all write operations are done through the cache then you can safely make
 this value very large as the cache store will also be updated in real time.
 
+Properties:
+
 - Config:      info_age
 - Env Var:     RCLONE_CACHE_INFO_AGE
 - Type:        Duration
 - Default:     6h0m0s
 - Examples:
-    - "1h"
-        - 1 hour
-    - "24h"
-        - 24 hours
-    - "48h"
-        - 48 hours
+  - "1h"
+    - 1 hour
+  - "24h"
+    - 24 hours
+  - "48h"
+    - 48 hours
 
 #### --cache-chunk-total-size
 
@@ -395,44 +430,42 @@ The total size that the chunks can take up on the local disk.
 If the cache exceeds this value then it will start to delete the
 oldest chunks until it goes under this value.
 
+Properties:
+
 - Config:      chunk_total_size
 - Env Var:     RCLONE_CACHE_CHUNK_TOTAL_SIZE
 - Type:        SizeSuffix
-- Default:     10G
+- Default:     10Gi
 - Examples:
-    - "500M"
-        - 500 MB
-    - "1G"
-        - 1 GB
-    - "10G"
-        - 10 GB
+  - "500M"
+    - 500 MiB
+  - "1G"
+    - 1 GiB
+  - "10G"
+    - 10 GiB
 
-### Advanced Options
+### Advanced options
 
-Here are the advanced options specific to cache (Cache a remote).
-
-#### --cache-plex-token
-
-The plex token for authentication - auto set normally
-
-- Config:      plex_token
-- Env Var:     RCLONE_CACHE_PLEX_TOKEN
-- Type:        string
-- Default:     ""
+Here are the Advanced options specific to cache (Cache a remote).
 
 #### --cache-plex-insecure
 
-Skip all certificate verification when connecting to the Plex server
+Skip all certificate verification when connecting to the Plex server.
+
+Properties:
 
 - Config:      plex_insecure
 - Env Var:     RCLONE_CACHE_PLEX_INSECURE
 - Type:        string
-- Default:     ""
+- Required:    false
 
 #### --cache-db-path
 
 Directory to store file structure metadata DB.
+
 The remote name is used as the DB file name.
+
+Properties:
 
 - Config:      db_path
 - Env Var:     RCLONE_CACHE_DB_PATH
@@ -450,6 +483,8 @@ This config follows the "--cache-db-path". If you specify a custom
 location for "--cache-db-path" and don't specify one for "--cache-chunk-path"
 then "--cache-chunk-path" will use the same path as "--cache-db-path".
 
+Properties:
+
 - Config:      chunk_path
 - Env Var:     RCLONE_CACHE_CHUNK_PATH
 - Type:        string
@@ -459,6 +494,8 @@ then "--cache-chunk-path" will use the same path as "--cache-db-path".
 
 Clear all the cached data for this remote on start.
 
+Properties:
+
 - Config:      db_purge
 - Env Var:     RCLONE_CACHE_DB_PURGE
 - Type:        bool
@@ -467,9 +504,12 @@ Clear all the cached data for this remote on start.
 #### --cache-chunk-clean-interval
 
 How often should the cache perform cleanups of the chunk storage.
+
 The default value should be ok for most people. If you find that the
 cache goes over "cache-chunk-total-size" too often then try to lower
 this value to force it to perform cleanups more often.
+
+Properties:
 
 - Config:      chunk_clean_interval
 - Env Var:     RCLONE_CACHE_CHUNK_CLEAN_INTERVAL
@@ -487,6 +527,8 @@ cache isn't able to provide file data anymore.
 
 For really slow connections, increase this to a point where the stream is
 able to provide data but your experience will be very stuttering.
+
+Properties:
 
 - Config:      read_retries
 - Env Var:     RCLONE_CACHE_READ_RETRIES
@@ -506,6 +548,8 @@ more fluid and data will be available much more faster to readers.
 **Note**: If the optional Plex integration is enabled then this
 setting will adapt to the type of reading performed and the value
 specified here will be used as a maximum number of workers to use.
+
+Properties:
 
 - Config:      workers
 - Env Var:     RCLONE_CACHE_WORKERS
@@ -529,6 +573,8 @@ If the hardware permits it, use this feature to provide an overall better
 performance during streaming but it can also be disabled if RAM is not
 available on the local machine.
 
+Properties:
+
 - Config:      chunk_no_memory
 - Env Var:     RCLONE_CACHE_CHUNK_NO_MEMORY
 - Type:        bool
@@ -536,7 +582,7 @@ available on the local machine.
 
 #### --cache-rps
 
-Limits the number of requests per second to the source FS (-1 to disable)
+Limits the number of requests per second to the source FS (-1 to disable).
 
 This setting places a hard limit on the number of requests per second
 that cache will be doing to the cloud provider remote and try to
@@ -554,6 +600,8 @@ useless but it is available to set for more special cases.
 other API calls to the cloud provider like directory listings will
 still pass.
 
+Properties:
+
 - Config:      rps
 - Env Var:     RCLONE_CACHE_RPS
 - Type:        int
@@ -561,11 +609,13 @@ still pass.
 
 #### --cache-writes
 
-Cache file data on writes through the FS
+Cache file data on writes through the FS.
 
 If you need to read files immediately after you upload them through
 cache you can enable this flag to have their data stored in the
 cache store at the same time during upload.
+
+Properties:
 
 - Config:      writes
 - Env Var:     RCLONE_CACHE_WRITES
@@ -583,20 +633,24 @@ Specifying a value will enable this feature. Without it, it is
 completely disabled and files will be uploaded directly to the cloud
 provider
 
+Properties:
+
 - Config:      tmp_upload_path
 - Env Var:     RCLONE_CACHE_TMP_UPLOAD_PATH
 - Type:        string
-- Default:     ""
+- Required:    false
 
 #### --cache-tmp-wait-time
 
-How long should files be stored in local cache before being uploaded
+How long should files be stored in local cache before being uploaded.
 
 This is the duration that a file must wait in the temporary location
 _cache-tmp-upload-path_ before it is selected for upload.
 
 Note that only one file is uploaded at a time and it can take longer
 to start the upload if a queue formed for this purpose.
+
+Properties:
 
 - Config:      tmp_wait_time
 - Env Var:     RCLONE_CACHE_TMP_WAIT_TIME
@@ -605,7 +659,7 @@ to start the upload if a queue formed for this purpose.
 
 #### --cache-db-wait-time
 
-How long to wait for the DB to be available - 0 is unlimited
+How long to wait for the DB to be available - 0 is unlimited.
 
 Only one process can have the DB open at any one time, so rclone waits
 for this duration for the DB to become available before it gives an
@@ -613,31 +667,48 @@ error.
 
 If you set it to 0 then it will wait forever.
 
+Properties:
+
 - Config:      db_wait_time
 - Env Var:     RCLONE_CACHE_DB_WAIT_TIME
 - Type:        Duration
 - Default:     1s
 
-### Backend commands
+#### --cache-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_CACHE_DESCRIPTION
+- Type:        string
+- Required:    false
+
+## Backend commands
 
 Here are the commands specific to the cache backend.
 
-Run them with
+Run them with:
 
-    rclone backend COMMAND remote:
+```console
+rclone backend COMMAND remote:
+```
 
 The help below will explain what arguments each command takes.
 
-See [the "rclone backend" command](/commands/rclone_backend/) for more
+See the [backend](/commands/rclone_backend/) command for more
 info on how to pass options and arguments.
 
 These can be run on a running backend using the rc command
-[backend/command](/rc/#backend/command).
+[backend/command](/rc/#backend-command).
 
-#### stats
+### stats
 
 Print stats on the cache backend in JSON format.
 
-    rclone backend stats remote: [options] [<arguments>+]
+```console
+rclone backend stats remote: [options] [<arguments>+]
+```
 
-{{< rem autogenerated options stop >}}
+<!-- autogenerated options stop -->

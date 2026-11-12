@@ -1,9 +1,11 @@
-// +build linux freebsd
+//go:build linux
 
 package mount
 
 import (
 	"context"
+	"os"
+	"syscall"
 	"time"
 
 	"bazil.org/fuse"
@@ -24,18 +26,17 @@ var _ fusefs.Node = (*File)(nil)
 // Attr fills out the attributes for the file
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 	defer log.Trace(f, "")("a=%+v, err=%v", a, &err)
-	a.Valid = f.fsys.opt.AttrTimeout
+	a.Valid = time.Duration(f.fsys.opt.AttrTimeout)
 	modTime := f.File.ModTime()
 	Size := uint64(f.File.Size())
 	Blocks := (Size + 511) / 512
 	a.Gid = f.VFS().Opt.GID
 	a.Uid = f.VFS().Opt.UID
-	a.Mode = f.VFS().Opt.FilePerms
+	a.Mode = f.File.Mode() &^ os.ModeAppend
 	a.Size = Size
 	a.Atime = modTime
 	a.Mtime = modTime
 	a.Ctime = modTime
-	a.Crtime = modTime
 	a.Blocks = Blocks
 	return nil
 }
@@ -77,6 +78,9 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	if entry := handle.Node().DirEntry(); entry != nil && entry.Size() < 0 {
 		resp.Flags |= fuse.OpenDirectIO
 	}
+	if f.fsys.opt.DirectIO {
+		resp.Flags |= fuse.OpenDirectIO
+	}
 
 	return &FileHandle{handle}, nil
 }
@@ -97,14 +101,14 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 //
 // If there is no xattr by that name, returns fuse.ErrNoXattr.
 func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
-	return fuse.ENOSYS // we never implement this
+	return syscall.ENOSYS // we never implement this
 }
 
 var _ fusefs.NodeGetxattrer = (*File)(nil)
 
 // Listxattr lists the extended attributes recorded for the node.
 func (f *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
-	return fuse.ENOSYS // we never implement this
+	return syscall.ENOSYS // we never implement this
 }
 
 var _ fusefs.NodeListxattrer = (*File)(nil)
@@ -112,7 +116,7 @@ var _ fusefs.NodeListxattrer = (*File)(nil)
 // Setxattr sets an extended attribute with the given name and
 // value for the node.
 func (f *File) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
-	return fuse.ENOSYS // we never implement this
+	return syscall.ENOSYS // we never implement this
 }
 
 var _ fusefs.NodeSetxattrer = (*File)(nil)
@@ -121,7 +125,15 @@ var _ fusefs.NodeSetxattrer = (*File)(nil)
 //
 // If there is no xattr by that name, returns fuse.ErrNoXattr.
 func (f *File) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
-	return fuse.ENOSYS // we never implement this
+	return syscall.ENOSYS // we never implement this
 }
 
 var _ fusefs.NodeRemovexattrer = (*File)(nil)
+
+var _ fusefs.NodeReadlinker = (*File)(nil)
+
+// Readlink read symbolic link target.
+func (f *File) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (ret string, err error) {
+	defer log.Trace(f, "")("ret=%v, err=%v", &ret, &err)
+	return f.VFS().Readlink(f.Path())
+}

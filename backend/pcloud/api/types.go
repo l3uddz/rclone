@@ -13,7 +13,7 @@ const (
 	timeFormat = `"` + time.RFC1123Z + `"`
 )
 
-// Time represents represents date and time information for the
+// Time represents date and time information for the
 // pcloud API, by using RFC1123Z
 type Time time.Time
 
@@ -109,6 +109,37 @@ type Hashes struct {
 	SHA256 string `json:"sha256"`
 }
 
+// FileTruncateResponse is the response from /file_truncate
+type FileTruncateResponse struct {
+	Error
+}
+
+// FileCloseResponse is the response from /file_close
+type FileCloseResponse struct {
+	Error
+}
+
+// FileOpenResponse is the response from /file_open
+type FileOpenResponse struct {
+	Error
+	Fileid         int64 `json:"fileid"`
+	FileDescriptor int64 `json:"fd"`
+}
+
+// FileChecksumResponse is the response from /file_checksum
+type FileChecksumResponse struct {
+	Error
+	MD5    string `json:"md5"`
+	SHA1   string `json:"sha1"`
+	SHA256 string `json:"sha256"`
+}
+
+// FilePWriteResponse is the response from /file_pwrite
+type FilePWriteResponse struct {
+	Error
+	Bytes int64 `json:"bytes"`
+}
+
 // UploadFileResponse is the response from /uploadfile
 type UploadFileResponse struct {
 	Error
@@ -136,7 +167,7 @@ func (g *GetFileLinkResult) IsValid() bool {
 	if len(g.Hosts) == 0 {
 		return false
 	}
-	return time.Time(g.Expires).Sub(time.Now()) > 30*time.Second
+	return time.Until(time.Time(g.Expires)) > 30*time.Second
 }
 
 // URL returns a URL from the Path and Hosts.  Check with IsValid
@@ -190,4 +221,12 @@ type UserInfo struct {
 			DownloadDrive bool `json:"downloaddrive"`
 		} `json:"steps"`
 	} `json:"journey"`
+}
+
+// DiffResult is the response from /diff
+type DiffResult struct {
+	Result  int              `json:"result"`
+	DiffID  int64            `json:"diffid"`
+	Entries []map[string]any `json:"entries"`
+	Error   string           `json:"error"`
 }

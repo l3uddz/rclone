@@ -2,8 +2,9 @@ package configfile
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -30,7 +31,7 @@ fruit = banana
 
 // Fill up a temporary config file with the testdata filename passed in
 func setConfigFile(t *testing.T, data string) func() {
-	out, err := ioutil.TempFile("", "rclone-configfile-test")
+	out, err := os.CreateTemp("", "rclone-configfile-test")
 	require.NoError(t, err)
 	filePath := out.Name()
 
@@ -50,7 +51,7 @@ func setConfigFile(t *testing.T, data string) func() {
 // toUnix converts \r\n to \n in buf
 func toUnix(buf string) string {
 	if runtime.GOOS == "windows" {
-		return strings.Replace(buf, "\r\n", "\n", -1)
+		return strings.ReplaceAll(buf, "\r\n", "\n")
 	}
 	return buf
 }
@@ -160,7 +161,7 @@ type = number3
 `, toUnix(buf))
 					t.Run("Save", func(t *testing.T) {
 						require.NoError(t, data.Save())
-						buf, err := ioutil.ReadFile(config.GetConfigPath())
+						buf, err := os.ReadFile(config.GetConfigPath())
 						require.NoError(t, err)
 						assert.Equal(t, `[one]
 fruit = potato
@@ -190,7 +191,8 @@ func TestConfigFileReload(t *testing.T) {
 	// Now write a new value on the end
 	out, err := os.OpenFile(config.GetConfigPath(), os.O_APPEND|os.O_WRONLY, 0777)
 	require.NoError(t, err)
-	fmt.Fprintln(out, "appended = what magic")
+	_, err = fmt.Fprintln(out, "appended = what magic")
+	require.NoError(t, err)
 	require.NoError(t, out.Close())
 
 	// And check we magically reloaded it
@@ -241,5 +243,159 @@ func TestConfigFileNoConfig(t *testing.T) {
 	})
 	t.Run("NotFound", func(t *testing.T) {
 		testConfigFileNoConfig(t, "/notfound")
+	})
+}
+
+func TestConfigFileSave(t *testing.T) {
+	testDir := t.TempDir()
+	configPath := filepath.Join(testDir, "a", "b", "c", "configfile")
+
+	assert.NoError(t, config.SetConfigPath(configPath))
+	data := &Storage{}
+	require.Error(t, data.Load(), config.ErrorConfigFileNotFound)
+
+	t.Run("CreatesDirsAndFile", func(t *testing.T) {
+		err := data.Save()
+		require.NoError(t, err)
+		info, err := os.Stat(configPath)
+		require.NoError(t, err)
+		assert.False(t, info.IsDir())
+	})
+	t.Run("KeepsFileMode", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("this is a Linux only test")
+		}
+		assert.NoError(t, os.Chmod(configPath, 0400)) // -r--------
+		defer func() {
+			_ = os.Chmod(configPath, 0644) // -rw-r--r--
+		}()
+		err := data.Save()
+		require.NoError(t, err)
+		info, err := os.Stat(configPath)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0400), info.Mode().Perm())
+	})
+	t.Run("SucceedsEvenIfReadOnlyFile", func(t *testing.T) {
+		// Save succeeds even if file is read-only since it does not write directly to the file.
+		assert.NoError(t, os.Chmod(configPath, 0400)) // -r--------
+		defer func() {
+			_ = os.Chmod(configPath, 0644) // -rw-r--r--
+		}()
+		err := data.Save()
+		assert.NoError(t, err)
+	})
+	t.Run("FailsIfNotAccessToDir", func(t *testing.T) {
+		// Save fails if no access to the directory.
+		if runtime.GOOS != "linux" {
+			// On Windows the os.Chmod only affects the read-only attribute of files)
+			t.Skip("this is a Linux only test")
+		}
+		configDir := filepath.Dir(configPath)
+		assert.NoError(t, os.Chmod(configDir, 0400)) // -r--------
+		defer func() {
+			_ = os.Chmod(configDir, 0755) // -rwxr-xr-x
+		}()
+		err := data.Save()
+		require.Error(t, err)
+		assert.True(t, strings.HasPrefix(err.Error(), "failed to resolve config file path"))
+	})
+	t.Run("FailsIfNotAllowedToCreateNewFiles", func(t *testing.T) {
+		// Save fails if read-only access to the directory, since it needs to create temporary files in there.
+		if runtime.GOOS != "linux" {
+			// On Windows the os.Chmod only affects the read-only attribute of files)
+			t.Skip("this is a Linux only test")
+		}
+		configDir := filepath.Dir(configPath)
+		assert.NoError(t, os.Chmod(configDir, 0544)) // -r-xr--r--
+		defer func() {
+			_ = os.Chmod(configDir, 0755) // -rwxr-xr-x
+		}()
+		err := data.Save()
+		require.Error(t, err)
+		assert.True(t, strings.HasPrefix(err.Error(), "failed to create temp file for new config"))
+	})
+}
+
+func TestConfigFileSaveSymlinkAbsolute(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		// Symlinks may require admin privileges on Windows and os.Symlink will then
+		// fail with "A required privilege is not held by the client."
+		t.Skip("this is a Linux only test")
+	}
+	testDir := t.TempDir()
+	linkDir := filepath.Join(testDir, "a")
+	err := os.Mkdir(linkDir, os.ModePerm)
+	require.NoError(t, err)
+
+	testSymlink := func(t *testing.T, link string, target string, resolvedTarget string) {
+		err = os.Symlink(target, link)
+		require.NoError(t, err)
+		defer func() {
+			_ = os.Remove(link)
+		}()
+
+		assert.NoError(t, config.SetConfigPath(link))
+		data := &Storage{}
+		require.Error(t, data.Load(), config.ErrorConfigFileNotFound)
+
+		err = data.Save()
+		require.NoError(t, err)
+
+		info, err := os.Lstat(link)
+		require.NoError(t, err)
+		assert.True(t, info.Mode()&os.ModeSymlink != 0)
+		assert.False(t, info.IsDir())
+
+		info, err = os.Lstat(resolvedTarget)
+		require.NoError(t, err)
+		assert.False(t, info.IsDir())
+	}
+
+	t.Run("Absolute", func(t *testing.T) {
+		link := filepath.Join(linkDir, "configfilelink")
+		target := filepath.Join(testDir, "b", "configfiletarget")
+		testSymlink(t, link, target, target)
+	})
+	t.Run("Relative", func(t *testing.T) {
+		link := filepath.Join(linkDir, "configfilelink")
+		target := filepath.Join("b", "c", "configfiletarget")
+		resolvedTarget := filepath.Join(filepath.Dir(link), target)
+		testSymlink(t, link, target, resolvedTarget)
+	})
+}
+
+type pipedInput struct {
+	io.Reader
+}
+
+func (p *pipedInput) Read(b []byte) (int, error) {
+	return p.Reader.Read(b)
+}
+
+func (*pipedInput) Seek(int64, int) (int64, error) {
+	return 0, fmt.Errorf("Seek not supported")
+}
+
+func TestPipedConfig(t *testing.T) {
+	t.Run("DoesNotSupportSeeking", func(t *testing.T) {
+		r := &pipedInput{strings.NewReader("")}
+		_, err := r.Seek(0, io.SeekStart)
+		require.Error(t, err)
+	})
+
+	t.Run("IsSupported", func(t *testing.T) {
+		r := &pipedInput{strings.NewReader(configData)}
+		_, err := config.Decrypt(r)
+		require.NoError(t, err)
+	})
+
+	t.Run("PlainTextConfigIsNotConsumedByCryptCheck", func(t *testing.T) {
+		in := &pipedInput{strings.NewReader(configData)}
+
+		r, _ := config.Decrypt(in)
+		got, err := io.ReadAll(r)
+		require.NoError(t, err)
+
+		assert.Equal(t, configData, string(got))
 	})
 }

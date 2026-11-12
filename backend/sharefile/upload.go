@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/sharefile/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
@@ -55,13 +54,10 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 	case "threaded":
 		streamed = false
 	default:
-		return nil, errors.Errorf("can't use method %q with newLargeUpload", info.Method)
+		return nil, fmt.Errorf("can't use method %q with newLargeUpload", info.Method)
 	}
 
-	threads := f.ci.Transfers
-	if threads > info.MaxNumberOfThreads {
-		threads = info.MaxNumberOfThreads
-	}
+	threads := min(f.ci.Transfers, info.MaxNumberOfThreads)
 
 	// unwrap the accounting from the input, we use wrap to put it
 	// back on after the buffering
@@ -87,7 +83,7 @@ func (up *largeUpload) parseUploadFinishResponse(respBody []byte) (err error) {
 	err = json.Unmarshal(respBody, &finish)
 	if err != nil {
 		// Sometimes the unmarshal fails in which case return the body
-		return errors.Errorf("upload: bad response: %q", bytes.TrimSpace(respBody))
+		return fmt.Errorf("upload: bad response: %q", bytes.TrimSpace(respBody))
 	}
 	return up.o.checkUploadResponse(up.ctx, &finish)
 }
@@ -240,7 +236,7 @@ outer:
 
 	// check size read is correct
 	if eof && err == nil && up.size >= 0 && up.size != offset {
-		err = errors.Errorf("upload: short read: read %d bytes expected %d", up.size, offset)
+		err = fmt.Errorf("upload: short read: read %d bytes expected %d", up.size, offset)
 	}
 
 	// read any errors

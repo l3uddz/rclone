@@ -1,4 +1,4 @@
-//+build gofuzz
+//go:build gofuzz
 
 /*
    Fuzz test the Parse function

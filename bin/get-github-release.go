@@ -1,4 +1,4 @@
-// +build ignore
+//go:build ignore
 
 // Get the latest release from a github project
 //
@@ -15,7 +15,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -167,7 +166,7 @@ func defaultBinDir() string {
 
 // read the body or an error message
 func readBody(in io.Reader) string {
-	data, err := ioutil.ReadAll(in)
+	data, err := io.ReadAll(in)
 	if err != nil {
 		return fmt.Sprintf("Error reading body: %v", err.Error())
 	}

@@ -16,6 +16,8 @@ type Cache struct {
 	expireRunning  bool
 	expireDuration time.Duration // expire the cache entry when it is older than this
 	expireInterval time.Duration // interval to run the cache expire
+	finalize       func(value any)
+	canExpire      func(value any) bool // if set, asked before expiring a value
 }
 
 // New creates a new cache with the default expire duration and interval
@@ -25,6 +27,7 @@ func New() *Cache {
 		expireRunning:  false,
 		expireDuration: 300 * time.Second,
 		expireInterval: 60 * time.Second,
+		finalize:       func(_ any) {},
 	}
 }
 
@@ -54,17 +57,17 @@ func (c *Cache) SetExpireInterval(d time.Duration) *Cache {
 
 // cacheEntry is stored in the cache
 type cacheEntry struct {
-	value    interface{} // cached item
-	err      error       // creation error
-	key      string      // key
-	lastUsed time.Time   // time used for expiry
-	pinCount int         // non zero if the entry should not be removed
+	value    any       // cached item
+	err      error     // creation error
+	key      string    // key
+	lastUsed time.Time // time used for expiry
+	pinCount int       // non zero if the entry should not be removed
 }
 
 // CreateFunc is called to create new values.  If the create function
 // returns an error it will be cached if ok is true, otherwise the
 // error will just be returned, allowing negative caching if required.
-type CreateFunc func(key string) (value interface{}, ok bool, error error)
+type CreateFunc func(key string) (value any, ok bool, error error)
 
 // used marks an entry as accessed now and kicks the expire timer off
 // should be called with the lock held
@@ -78,7 +81,7 @@ func (c *Cache) used(entry *cacheEntry) {
 
 // Get gets a value named key either from the cache or creates it
 // afresh with the create function.
-func (c *Cache) Get(key string, create CreateFunc) (value interface{}, err error) {
+func (c *Cache) Get(key string, create CreateFunc) (value any, err error) {
 	c.mu.Lock()
 	entry, ok := c.cache[key]
 	if !ok {
@@ -122,8 +125,8 @@ func (c *Cache) Unpin(key string) {
 	c.addPin(key, -1)
 }
 
-// Put puts a value named key into the cache
-func (c *Cache) Put(key string, value interface{}) {
+// PutErr puts a value named key with err into the cache
+func (c *Cache) PutErr(key string, value any, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.noCache() {
@@ -132,13 +135,19 @@ func (c *Cache) Put(key string, value interface{}) {
 	entry := &cacheEntry{
 		value: value,
 		key:   key,
+		err:   err,
 	}
 	c.used(entry)
 	c.cache[key] = entry
 }
 
+// Put puts a value named key into the cache
+func (c *Cache) Put(key string, value any) {
+	c.PutErr(key, value, nil)
+}
+
 // GetMaybe returns the key and true if found, nil and false if not
-func (c *Cache) GetMaybe(key string) (value interface{}, found bool) {
+func (c *Cache) GetMaybe(key string) (value any, found bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, found := c.cache[key]
@@ -154,7 +163,10 @@ func (c *Cache) GetMaybe(key string) (value interface{}, found bool) {
 // Returns true if the entry was found
 func (c *Cache) Delete(key string) bool {
 	c.mu.Lock()
-	_, found := c.cache[key]
+	entry, found := c.cache[key]
+	if found {
+		c.finalize(entry.value)
+	}
 	delete(c.cache, key)
 	c.mu.Unlock()
 	return found
@@ -165,11 +177,13 @@ func (c *Cache) Delete(key string) bool {
 // Returns number of entries deleted
 func (c *Cache) DeletePrefix(prefix string) (deleted int) {
 	c.mu.Lock()
-	for k := range c.cache {
-		if strings.HasPrefix(k, prefix) {
-			delete(c.cache, k)
-			deleted++
+	for key, entry := range c.cache {
+		if !strings.HasPrefix(key, prefix) {
+			continue
 		}
+		c.finalize(entry.value)
+		delete(c.cache, key)
+		deleted++
 	}
 	c.mu.Unlock()
 	return deleted
@@ -179,16 +193,23 @@ func (c *Cache) DeletePrefix(prefix string) (deleted int) {
 //
 // If there was an existing item at newKey then it takes precedence
 // and is returned otherwise the item (if any) at oldKey is returned.
-func (c *Cache) Rename(oldKey, newKey string) (value interface{}, found bool) {
+func (c *Cache) Rename(oldKey, newKey string) (value any, found bool) {
 	c.mu.Lock()
 	if newEntry, newFound := c.cache[newKey]; newFound {
 		// If new entry is found use that
+		if oldEntry, oldFound := c.cache[oldKey]; oldFound {
+			// If there's an old entry that is different we must finalize it
+			if newEntry.value != oldEntry.value {
+				c.finalize(c.cache[oldKey].value)
+			}
+		}
 		delete(c.cache, oldKey)
 		value, found = newEntry.value, newFound
 		c.used(newEntry)
 	} else if oldEntry, oldFound := c.cache[oldKey]; oldFound {
 		// If old entry is found rename it to new and use that
 		c.cache[newKey] = oldEntry
+		// No need to shutdown here, as value lives on under newKey
 		delete(c.cache, oldKey)
 		c.used(oldEntry)
 		value, found = oldEntry.value, oldFound
@@ -202,8 +223,30 @@ func (c *Cache) cacheExpire() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
+	expired := func(entry *cacheEntry) bool {
+		return entry.pinCount <= 0 && now.Sub(entry.lastUsed) > c.expireDuration
+	}
+	candidates := map[string]*cacheEntry{}
 	for key, entry := range c.cache {
-		if entry.pinCount <= 0 && now.Sub(entry.lastUsed) > c.expireDuration {
+		if expired(entry) {
+			candidates[key] = entry
+		}
+	}
+	if c.canExpire != nil && len(candidates) != 0 {
+		// canExpire may block so call it without the lock
+		canExpire := c.canExpire
+		c.mu.Unlock()
+		for key, entry := range candidates {
+			if !canExpire(entry.value) {
+				delete(candidates, key)
+			}
+		}
+		c.mu.Lock()
+	}
+	for key, entry := range candidates {
+		// The entry may have been used or replaced while the lock was released
+		if c.cache[key] == entry && expired(entry) {
+			c.finalize(entry.value)
 			delete(c.cache, key)
 		}
 	}
@@ -218,8 +261,9 @@ func (c *Cache) cacheExpire() {
 // Clear removes everything from the cache
 func (c *Cache) Clear() {
 	c.mu.Lock()
-	for k := range c.cache {
-		delete(c.cache, k)
+	for key, entry := range c.cache {
+		c.finalize(entry.value)
+		delete(c.cache, key)
 	}
 	c.mu.Unlock()
 }
@@ -230,4 +274,40 @@ func (c *Cache) Entries() int {
 	entries := len(c.cache)
 	c.mu.Unlock()
 	return entries
+}
+
+// SetFinalizer sets a function to be called when a value drops out of the cache
+func (c *Cache) SetFinalizer(finalize func(any)) {
+	c.mu.Lock()
+	c.finalize = finalize
+	c.mu.Unlock()
+}
+
+// SetCanExpire sets a function which is asked whether a value which
+// hasn't been used recently can be expired from the cache. If it
+// returns false the value is kept and asked about again the next time
+// the cache expiry runs.
+//
+// It is called without the cache locked so may use the cache. It
+// isn't called for values removed in other ways, e.g. Delete or Clear.
+func (c *Cache) SetCanExpire(canExpire func(value any) bool) {
+	c.mu.Lock()
+	c.canExpire = canExpire
+	c.mu.Unlock()
+}
+
+// EntriesWithPinCount returns the number of pinned and unpinned entries in the cache
+//
+// Each entry is counted only once, regardless of entry.pinCount
+func (c *Cache) EntriesWithPinCount() (pinned, unpinned int) {
+	c.mu.Lock()
+	for _, entry := range c.cache {
+		if entry.pinCount <= 0 {
+			unpinned++
+		} else {
+			pinned++
+		}
+	}
+	c.mu.Unlock()
+	return pinned, unpinned
 }

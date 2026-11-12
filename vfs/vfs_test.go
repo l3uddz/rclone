@@ -4,14 +4,13 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
-	_ "github.com/rclone/rclone/backend/all" // import all the backends
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -28,8 +27,8 @@ var (
 
 // Constants uses in the tests
 const (
-	writeBackDelay      = 100 * time.Millisecond // A short writeback delay for testing
-	waitForWritersDelay = 10 * time.Second       // time to wait for existing writers
+	writeBackDelay      = fs.Duration(100 * time.Millisecond) // A short writeback delay for testing
+	waitForWritersDelay = 30 * time.Second                    // time to wait for existing writers
 )
 
 // TestMain drives the tests
@@ -46,18 +45,17 @@ func cleanupVFS(t *testing.T, vfs *VFS) {
 }
 
 // Create a new VFS
-func newTestVFSOpt(t *testing.T, opt *vfscommon.Options) (r *fstest.Run, vfs *VFS, cleanup func()) {
+func newTestVFSOpt(t *testing.T, opt *vfscommon.Options) (r *fstest.Run, vfs *VFS) {
 	r = fstest.NewRun(t)
-	vfs = New(r.Fremote, opt)
-	cleanup = func() {
+	vfs = New(context.Background(), r.Fremote, opt)
+	t.Cleanup(func() {
 		cleanupVFS(t, vfs)
-		r.Finalise()
-	}
-	return r, vfs, cleanup
+	})
+	return r, vfs
 }
 
 // Create a new VFS with default options
-func newTestVFS(t *testing.T) (r *fstest.Run, vfs *VFS, cleanup func()) {
+func newTestVFS(t *testing.T) (r *fstest.Run, vfs *VFS) {
 	return newTestVFSOpt(t, nil)
 }
 
@@ -126,7 +124,7 @@ func TestVFSbaseHandle(t *testing.T) {
 	assert.Nil(t, node)
 }
 
-// TestNew sees if the New command works properly
+// TestVFSNew sees if the New command works properly
 func TestVFSNew(t *testing.T) {
 	// Check active cache has this many entries
 	checkActiveCacheEntries := func(i int) {
@@ -136,19 +134,17 @@ func TestVFSNew(t *testing.T) {
 
 	checkActiveCacheEntries(0)
 
-	r, vfs, cleanup := newTestVFS(t)
+	r, vfs := newTestVFS(t)
 
 	// Check making a VFS with nil options
-	var defaultOpt = vfscommon.DefaultOpt
-	defaultOpt.DirPerms |= os.ModeDir
-	assert.Equal(t, vfs.Opt, defaultOpt)
-	assert.Equal(t, vfs.f, r.Fremote)
+	var defaultOpt = vfscommon.Opt
+	defaultOpt.Init(context.Background())
 
 	checkActiveCacheEntries(1)
 
 	// Check that we get the same VFS if we ask for it again with
 	// the same options
-	vfs2 := New(r.Fremote, nil)
+	vfs2 := New(context.Background(), r.Fremote, nil)
 	assert.Equal(t, fmt.Sprintf("%p", vfs), fmt.Sprintf("%p", vfs2))
 
 	checkActiveCacheEntries(1)
@@ -158,43 +154,93 @@ func TestVFSNew(t *testing.T) {
 
 	checkActiveCacheEntries(1)
 
-	cleanup()
+	cleanupVFS(t, vfs)
 
 	checkActiveCacheEntries(0)
 }
 
-// TestNew sees if the New command works properly
+// TestVFSHold checks a held VFS isn't shut down until it is released
+// and can't be held once shut down.
+func TestVFSHold(t *testing.T) {
+	r := fstest.NewRun(t)
+	vfs := New(context.Background(), r.Fremote, nil)
+
+	require.True(t, vfs.Hold())
+	vfs.Shutdown()
+	assert.NoError(t, vfs.ctx.Err(), "VFS shut down while held")
+
+	vfs.Shutdown()
+	assert.Error(t, vfs.ctx.Err(), "VFS not shut down when released")
+	assert.False(t, vfs.Hold(), "VFS held after being shut down")
+}
+
+// TestVFSNewShuttingDown checks New doesn't reuse a VFS which is being
+// shut down but hasn't yet removed itself from the active cache.
+func TestVFSNewShuttingDown(t *testing.T) {
+	r := fstest.NewRun(t)
+	vfs := New(context.Background(), r.Fremote, nil)
+
+	// The state Shutdown leaves the VFS in while it waits for activeMu
+	vfs.inUse.Store(0)
+	vfs2 := New(context.Background(), r.Fremote, nil)
+	assert.NotSame(t, vfs, vfs2, "reused a VFS being shut down")
+	assert.Equal(t, int32(0), vfs.inUse.Load())
+
+	vfs.Shutdown()
+	vfs2.Shutdown()
+}
+
+// TestVFSBusy checks Busy reports files open for write and cached
+// files which haven't been uploaded yet.
+func TestVFSBusy(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = 10 * writeBackDelay
+	_, vfs := newTestVFSOpt(t, &opt)
+	assert.False(t, vfs.Busy())
+
+	fh, err := vfs.Create("file.txt")
+	require.NoError(t, err)
+	assert.True(t, vfs.Busy(), "not busy with a file open for write")
+
+	_, err = fh.WriteString("hello")
+	require.NoError(t, err)
+	require.NoError(t, fh.Close())
+	assert.True(t, vfs.Busy(), "not busy with a file waiting to be uploaded")
+
+	vfs.WaitForWriters(waitForWritersDelay)
+	assert.False(t, vfs.Busy(), "busy after the file was uploaded")
+}
+
+// TestVFSNewWithOpts sees if the New command works properly
 func TestVFSNewWithOpts(t *testing.T) {
-	var opt = vfscommon.DefaultOpt
+	var opt = vfscommon.Opt
 	opt.DirPerms = 0777
 	opt.FilePerms = 0666
 	opt.Umask = 0002
-	_, vfs, cleanup := newTestVFSOpt(t, &opt)
-	defer cleanup()
+	_, vfs := newTestVFSOpt(t, &opt)
 
-	assert.Equal(t, os.FileMode(0775)|os.ModeDir, vfs.Opt.DirPerms)
-	assert.Equal(t, os.FileMode(0664), vfs.Opt.FilePerms)
+	assert.Equal(t, vfscommon.FileMode(0775)|vfscommon.FileMode(os.ModeDir), vfs.Opt.DirPerms)
+	assert.Equal(t, vfscommon.FileMode(0664), vfs.Opt.FilePerms)
 }
 
-// TestRoot checks root directory is present and correct
+// TestVFSRoot checks root directory is present and correct
 func TestVFSRoot(t *testing.T) {
-	_, vfs, cleanup := newTestVFS(t)
-	defer cleanup()
+	_, vfs := newTestVFS(t)
 
 	root, err := vfs.Root()
 	require.NoError(t, err)
 	assert.Equal(t, vfs.root, root)
 	assert.True(t, root.IsDir())
-	assert.Equal(t, vfs.Opt.DirPerms.Perm(), root.Mode().Perm())
+	assert.Equal(t, os.FileMode(vfs.Opt.DirPerms).Perm(), root.Mode().Perm())
 }
 
 func TestVFSStat(t *testing.T) {
-	r, vfs, cleanup := newTestVFS(t)
-	defer cleanup()
+	r, vfs := newTestVFS(t)
 
 	file1 := r.WriteObject(context.Background(), "file1", "file1 contents", t1)
 	file2 := r.WriteObject(context.Background(), "dir/file2", "file2 contents", t2)
-	fstest.CheckItems(t, r.Fremote, file1, file2)
+	r.CheckRemoteItems(t, file1, file2)
 
 	node, err := vfs.Stat("file1")
 	require.NoError(t, err)
@@ -225,12 +271,11 @@ func TestVFSStat(t *testing.T) {
 }
 
 func TestVFSStatParent(t *testing.T) {
-	r, vfs, cleanup := newTestVFS(t)
-	defer cleanup()
+	r, vfs := newTestVFS(t)
 
 	file1 := r.WriteObject(context.Background(), "file1", "file1 contents", t1)
 	file2 := r.WriteObject(context.Background(), "dir/file2", "file2 contents", t2)
-	fstest.CheckItems(t, r.Fremote, file1, file2)
+	r.CheckRemoteItems(t, file1, file2)
 
 	node, leaf, err := vfs.StatParent("file1")
 	require.NoError(t, err)
@@ -257,13 +302,33 @@ func TestVFSStatParent(t *testing.T) {
 	assert.Equal(t, os.ErrExist, err)
 }
 
+func TestVFSAddVirtual(t *testing.T) {
+	_, vfs := newTestVFS(t)
+
+	require.NoError(t, vfs.AddVirtual("file", 17, false))
+	node, err := vfs.Stat("file")
+	require.NoError(t, err)
+	assert.True(t, node.IsFile())
+	assert.Equal(t, int64(17), node.Size())
+
+	require.NoError(t, vfs.AddVirtual("dir/", 0, true))
+	node, err = vfs.Stat("dir")
+	require.NoError(t, err)
+	assert.True(t, node.IsDir())
+
+	require.NoError(t, vfs.AddVirtual("dir/file2", 18, false))
+	node, err = vfs.Stat("dir/file2")
+	require.NoError(t, err)
+	assert.True(t, node.IsFile())
+	assert.Equal(t, int64(18), node.Size())
+}
+
 func TestVFSOpenFile(t *testing.T) {
-	r, vfs, cleanup := newTestVFS(t)
-	defer cleanup()
+	r, vfs := newTestVFS(t)
 
 	file1 := r.WriteObject(context.Background(), "file1", "file1 contents", t1)
 	file2 := r.WriteObject(context.Background(), "dir/file2", "file2 contents", t2)
-	fstest.CheckItems(t, r.Fremote, file1, file2)
+	r.CheckRemoteItems(t, file1, file2)
 
 	fd, err := vfs.OpenFile("file1", os.O_RDONLY, 0777)
 	require.NoError(t, err)
@@ -283,7 +348,7 @@ func TestVFSOpenFile(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, fd)
 	err = fd.Close()
-	if errors.Cause(err) != fs.ErrorCantUploadEmptyFiles {
+	if !errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
 		require.NoError(t, err)
 	}
 
@@ -293,8 +358,7 @@ func TestVFSOpenFile(t *testing.T) {
 }
 
 func TestVFSRename(t *testing.T) {
-	r, vfs, cleanup := newTestVFS(t)
-	defer cleanup()
+	r, vfs := newTestVFS(t)
 
 	features := r.Fremote.Features()
 	if features.Move == nil && features.Copy == nil {
@@ -302,17 +366,17 @@ func TestVFSRename(t *testing.T) {
 	}
 
 	file1 := r.WriteObject(context.Background(), "dir/file2", "file2 contents", t2)
-	fstest.CheckItems(t, r.Fremote, file1)
+	r.CheckRemoteItems(t, file1)
 
 	err := vfs.Rename("dir/file2", "dir/file1")
 	require.NoError(t, err)
 	file1.Path = "dir/file1"
-	fstest.CheckItems(t, r.Fremote, file1)
+	r.CheckRemoteItems(t, file1)
 
 	err = vfs.Rename("dir/file1", "file0")
 	require.NoError(t, err)
 	file1.Path = "file0"
-	fstest.CheckItems(t, r.Fremote, file1)
+	r.CheckRemoteItems(t, file1)
 
 	err = vfs.Rename("not found/file0", "file0")
 	assert.Equal(t, os.ErrNotExist, err)
@@ -322,8 +386,7 @@ func TestVFSRename(t *testing.T) {
 }
 
 func TestVFSStatfs(t *testing.T) {
-	r, vfs, cleanup := newTestVFS(t)
-	defer cleanup()
+	r, vfs := newTestVFS(t)
 
 	// pre-conditions
 	assert.Nil(t, vfs.usage)
@@ -372,6 +435,90 @@ func TestVFSStatfs(t *testing.T) {
 	assert.Equal(t, oldTime, vfs.usageTime)
 }
 
+func TestVFSMkdir(t *testing.T) {
+	r, vfs := newTestVFS(t)
+
+	if !r.Fremote.Features().CanHaveEmptyDirectories {
+		return // can't test if can't have empty directories
+	}
+
+	r.CheckRemoteListing(t, nil, []string{})
+
+	// Try making the root
+	err := vfs.Mkdir("", 0777)
+	require.NoError(t, err)
+	r.CheckRemoteListing(t, nil, []string{})
+
+	// Try making a sub directory
+	err = vfs.Mkdir("a", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a"})
+
+	// Try making an existing directory
+	err = vfs.Mkdir("a", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a"})
+
+	// Try making a new directory
+	err = vfs.Mkdir("b/", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a", "b"})
+
+	// Try making a new directory
+	err = vfs.Mkdir("/c", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a", "b", "c"})
+
+	// Try making a new directory
+	err = vfs.Mkdir("/d/", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a", "b", "c", "d"})
+
+	vfs.Opt.ReadOnly = true
+	err = vfs.Mkdir("", 0777)
+	assert.Equal(t, EROFS, err)
+	err = vfs.Mkdir("e", 0777)
+	assert.Equal(t, EROFS, err)
+}
+
+func TestVFSMkdirAll(t *testing.T) {
+	r, vfs := newTestVFS(t)
+
+	if !r.Fremote.Features().CanHaveEmptyDirectories {
+		return // can't test if can't have empty directories
+	}
+
+	r.CheckRemoteListing(t, nil, []string{})
+
+	// Try making the root
+	err := vfs.MkdirAll("", 0777)
+	require.NoError(t, err)
+	r.CheckRemoteListing(t, nil, []string{})
+
+	// Try making a sub directory
+	err = vfs.MkdirAll("a/b/c/d", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a", "a/b", "a/b/c", "a/b/c/d"})
+
+	// Try making an existing directory
+	err = vfs.MkdirAll("a/b/c", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a", "a/b", "a/b/c", "a/b/c/d"})
+
+	// Try making an existing directory
+	err = vfs.MkdirAll("/a/b/c/", 0777)
+	require.NoError(t, err)
+
+	r.CheckRemoteListing(t, nil, []string{"a", "a/b", "a/b/c", "a/b/c/d"})
+}
+
 func TestFillInMissingSizes(t *testing.T) {
 	const unknownFree = 10
 	for _, test := range []struct {
@@ -418,4 +565,18 @@ func TestFillInMissingSizes(t *testing.T) {
 			assert.Equal(t, test.wantFree, gotFree, "free")
 		})
 	}
+}
+
+func TestVFSIsMetadataFile(t *testing.T) {
+	_, vfs := newTestVFS(t)
+
+	rawName, found := vfs.isMetadataFile("leaf.metadata")
+	assert.Equal(t, "leaf.metadata", rawName)
+	assert.Equal(t, false, found)
+
+	vfs.Opt.MetadataExtension = ".metadata"
+
+	rawName, found = vfs.isMetadataFile("leaf.metadata")
+	assert.Equal(t, "leaf", rawName)
+	assert.Equal(t, true, found)
 }

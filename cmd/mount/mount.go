@@ -1,12 +1,11 @@
+//go:build linux
+
 // Package mount implements a FUSE mounting system for rclone remotes.
-
-// +build linux freebsd
-
 package mount
 
 import (
 	"fmt"
-	"runtime"
+	"time"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
@@ -26,7 +25,6 @@ func mountOptions(VFS *vfs.VFS, device string, opt *mountlib.Options) (options [
 		fuse.MaxReadahead(uint32(opt.MaxReadAhead)),
 		fuse.Subtype("rclone"),
 		fuse.FSName(device),
-		fuse.VolumeName(opt.VolumeName),
 
 		// Options from benchmarking in the fuse module
 		//fuse.MaxReadahead(64 * 1024 * 1024),
@@ -34,9 +32,6 @@ func mountOptions(VFS *vfs.VFS, device string, opt *mountlib.Options) (options [
 	}
 	if opt.AsyncRead {
 		options = append(options, fuse.AsyncRead())
-	}
-	if opt.AllowNonEmpty {
-		options = append(options, fuse.AllowNonEmptyMount())
 	}
 	if opt.AllowOther {
 		options = append(options, fuse.AllowOther())
@@ -55,7 +50,7 @@ func mountOptions(VFS *vfs.VFS, device string, opt *mountlib.Options) (options [
 		options = append(options, fuse.WritebackCache())
 	}
 	if opt.DaemonTimeout != 0 {
-		options = append(options, fuse.DaemonTimeout(fmt.Sprint(int(opt.DaemonTimeout.Seconds()))))
+		options = append(options, fuse.DaemonTimeout(fmt.Sprint(int(time.Duration(opt.DaemonTimeout).Seconds()))))
 	}
 	if len(opt.ExtraOptions) > 0 {
 		fs.Errorf(nil, "-o/--option not supported with this FUSE backend")
@@ -72,22 +67,25 @@ func mountOptions(VFS *vfs.VFS, device string, opt *mountlib.Options) (options [
 //
 // returns an error, and an error channel for the serve process to
 // report an error when fusermount is called.
-func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error, func() error, error) {
-	if runtime.GOOS == "darwin" {
-		fs.Logf(nil, "macOS users: please try \"rclone cmount\" as it will be the default in v1.54")
+func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error, func() error, string, error) {
+	f := VFS.Fs()
+	if err := mountlib.CheckOverlap(f, mountpoint); err != nil {
+		return nil, nil, "", err
 	}
+	if err := mountlib.CheckAllowNonEmpty(mountpoint, opt); err != nil {
+		return nil, nil, "", err
+	}
+	fs.Debugf(f, "Mounting on %q", mountpoint)
 
 	if opt.DebugFUSE {
-		fuse.Debug = func(msg interface{}) {
+		fuse.Debug = func(msg any) {
 			fs.Debugf("fuse", "%v", msg)
 		}
 	}
 
-	f := VFS.Fs()
-	fs.Debugf(f, "Mounting on %q", mountpoint)
-	c, err := fuse.Mount(mountpoint, mountOptions(VFS, f.Name()+":"+f.Root(), opt)...)
+	c, err := fuse.Mount(mountpoint, mountOptions(VFS, opt.DeviceName, opt)...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	filesys := NewFS(VFS, opt)
@@ -104,17 +102,9 @@ func mount(VFS *vfs.VFS, mountpoint string, opt *mountlib.Options) (<-chan error
 		errChan <- err
 	}()
 
-	// check if the mount process has an error to report
-	<-c.Ready
-	if err := c.MountError; err != nil {
-		return nil, nil, err
-	}
-
 	unmount := func() error {
-		// Shutdown the VFS
-		filesys.VFS.Shutdown()
 		return fuse.Unmount(mountpoint)
 	}
 
-	return errChan, unmount, nil
+	return errChan, unmount, mountpoint, nil
 }

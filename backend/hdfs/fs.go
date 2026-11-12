@@ -1,4 +1,4 @@
-// +build !plan9
+//go:build !plan9
 
 package hdfs
 
@@ -20,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/pacer"
 )
 
 // Fs represents a HDFS server
@@ -30,7 +31,14 @@ type Fs struct {
 	opt      Options        // options for this backend
 	ci       *fs.ConfigInfo // global config
 	client   *hdfs.Client
+	pacer    *fs.Pacer // pacer for API calls
 }
+
+const (
+	minSleep      = 20 * time.Millisecond
+	maxSleep      = 10 * time.Second
+	decayConstant = 2 // bigger for slower decay, exponential
+)
 
 // copy-paste from https://github.com/colinmarc/hdfs/blob/master/cmd/hdfs/kerberos.go
 func getKerberosClient() (*krb.Client, error) {
@@ -84,14 +92,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	options := hdfs.ClientOptions{
-		Addresses:           []string{opt.Namenode},
+		Addresses:           opt.Namenode,
 		UseDatanodeHostname: false,
 	}
 
 	if opt.ServicePrincipalName != "" {
 		options.KerberosClient, err = getKerberosClient()
 		if err != nil {
-			return nil, fmt.Errorf("Problem with kerberos authentication: %s", err)
+			return nil, fmt.Errorf("problem with kerberos authentication: %w", err)
 		}
 		options.KerberosServicePrincipleName = opt.ServicePrincipalName
 
@@ -113,6 +121,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:    *opt,
 		ci:     fs.GetConfig(ctx),
 		client: client,
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 
 	f.features = (&fs.Features{
@@ -140,7 +149,7 @@ func (f *Fs) Root() string {
 
 // String returns a description of the FS
 func (f *Fs) String() string {
-	return fmt.Sprintf("hdfs://%s", f.opt.Namenode)
+	return fmt.Sprintf("hdfs://%s/%s", f.opt.Namenode, f.root)
 }
 
 // Features returns the optional features of this Fs
@@ -200,7 +209,8 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				fs:      f,
 				remote:  remote,
 				size:    x.Size(),
-				modTime: x.ModTime()})
+				modTime: x.ModTime(),
+			})
 		}
 	}
 	return entries, nil
@@ -262,6 +272,98 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.client.RemoveAll(realpath)
 }
 
+// Move src to this remote using server-side move operations.
+//
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
+	}
+
+	// Get the real paths from the remote specs:
+	sourcePath := srcObj.fs.realpath(srcObj.remote)
+	targetPath := f.realpath(remote)
+	fs.Debugf(f, "rename [%s] to [%s]", sourcePath, targetPath)
+
+	// Make sure the target folder exists:
+	dirname := path.Dir(targetPath)
+	err := f.client.MkdirAll(dirname, 0755)
+	if err != nil {
+		return nil, err
+	}
+
+	// Do the move
+	// Note that the underlying HDFS library hard-codes Overwrite=True, but this is expected rclone behaviour.
+	err = f.client.Rename(sourcePath, targetPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Look up the resulting object
+	info, err := f.client.Stat(targetPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// And return it:
+	return &Object{
+		fs:      f,
+		remote:  remote,
+		size:    info.Size(),
+		modTime: info.ModTime(),
+	}, nil
+}
+
+// DirMove moves src, srcRemote to this remote at dstRemote
+// using server-side move operations.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantDirMove
+//
+// If destination exists then return fs.ErrorDirExists
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) (err error) {
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		return fs.ErrorCantDirMove
+	}
+
+	// Get the real paths from the remote specs:
+	sourcePath := srcFs.realpath(srcRemote)
+	targetPath := f.realpath(dstRemote)
+	fs.Debugf(f, "rename [%s] to [%s]", sourcePath, targetPath)
+
+	// Check if the destination exists:
+	info, err := f.client.Stat(targetPath)
+	if err == nil {
+		fs.Debugf(f, "target directory already exits, IsDir = [%t]", info.IsDir())
+		return fs.ErrorDirExists
+	}
+
+	// Make sure the targets parent folder exists:
+	dirname := path.Dir(targetPath)
+	err = f.client.MkdirAll(dirname, 0755)
+	if err != nil {
+		return err
+	}
+
+	// Do the move
+	err = f.client.Rename(sourcePath, targetPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // About gets quota information from the Fs
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	info, err := f.client.StatFs()
@@ -269,9 +371,9 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		return nil, err
 	}
 	return &fs.Usage{
-		Total: fs.NewUsageValue(int64(info.Capacity)),
-		Used:  fs.NewUsageValue(int64(info.Used)),
-		Free:  fs.NewUsageValue(int64(info.Remaining)),
+		Total: fs.NewUsageValue(info.Capacity),
+		Used:  fs.NewUsageValue(info.Used),
+		Free:  fs.NewUsageValue(info.Remaining),
 	}, nil
 }
 
@@ -317,4 +419,6 @@ var (
 	_ fs.Purger      = (*Fs)(nil)
 	_ fs.PutStreamer = (*Fs)(nil)
 	_ fs.Abouter     = (*Fs)(nil)
+	_ fs.Mover       = (*Fs)(nil)
+	_ fs.DirMover    = (*Fs)(nil)
 )

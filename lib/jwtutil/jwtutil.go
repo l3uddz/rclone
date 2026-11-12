@@ -1,3 +1,4 @@
+// Package jwtutil provides JWT utilities.
 package jwtutil
 
 import (
@@ -6,19 +7,21 @@ import (
 	"crypto/rsa"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/lib/oauthutil"
 
+	"maps"
+
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/jws"
 )
 
 // RandomHex creates a random string of the given length
@@ -31,14 +34,16 @@ func RandomHex(n int) (string, error) {
 }
 
 // Config configures rclone using JWT
-func Config(id, name string, claims *jws.ClaimSet, header *jws.Header, queryParams map[string]string, privateKey *rsa.PrivateKey, m configmap.Mapper, client *http.Client) (err error) {
-	payload, err := jws.Encode(header, claims, privateKey)
+func Config(id, name, url string, claims jwt.Claims, headerParams map[string]any, queryParams map[string]string, privateKey *rsa.PrivateKey, m configmap.Mapper, client *http.Client) (err error) {
+	jwtToken := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	maps.Copy(jwtToken.Header, headerParams)
+	payload, err := jwtToken.SignedString(privateKey)
 	if err != nil {
-		return errors.Wrap(err, "jwtutil: failed to encode payload")
+		return fmt.Errorf("jwtutil: failed to encode payload: %w", err)
 	}
-	req, err := http.NewRequest("POST", claims.Aud, nil)
+	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
-		return errors.Wrap(err, "jwtutil: failed to create new request")
+		return fmt.Errorf("jwtutil: failed to create new request: %w", err)
 	}
 	q := req.URL.Query()
 	q.Add("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
@@ -48,15 +53,15 @@ func Config(id, name string, claims *jws.ClaimSet, header *jws.Header, queryPara
 	}
 	queryString := q.Encode()
 
-	req, err = http.NewRequest("POST", claims.Aud, bytes.NewBuffer([]byte(queryString)))
+	req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(queryString)))
 	if err != nil {
-		return errors.Wrap(err, "jwtutil: failed to create new request")
+		return fmt.Errorf("jwtutil: failed to create new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return errors.Wrap(err, "jwtutil: failed making auth request")
+		return fmt.Errorf("jwtutil: failed making auth request: %w", err)
 	}
 
 	s, err := bodyToString(resp.Body)
@@ -65,22 +70,22 @@ func Config(id, name string, claims *jws.ClaimSet, header *jws.Header, queryPara
 	}
 	if resp.StatusCode != 200 {
 		err = errors.New(resp.Status)
-		return errors.Wrap(err, "jwtutil: failed making auth request")
+		return fmt.Errorf("jwtutil: failed making auth request: %w", err)
 	}
 	defer func() {
-		deferedErr := resp.Body.Close()
-		if deferedErr != nil {
-			err = errors.Wrap(err, "jwtutil: failed to close resp.Body")
+		deferredErr := resp.Body.Close()
+		if deferredErr != nil {
+			err = fmt.Errorf("jwtutil: failed to close resp.Body: %w", err)
 		}
 	}()
 
 	result := &response{}
 	err = json.NewDecoder(strings.NewReader(s)).Decode(result)
 	if result.AccessToken == "" && err == nil {
-		err = errors.New("No AccessToken in Response")
+		err = errors.New("no AccessToken in Response")
 	}
 	if err != nil {
-		return errors.Wrap(err, "jwtutil: failed to get token")
+		return fmt.Errorf("jwtutil: failed to get token: %w", err)
 	}
 	token := &oauth2.Token{
 		AccessToken: result.AccessToken,
@@ -94,12 +99,12 @@ func Config(id, name string, claims *jws.ClaimSet, header *jws.Header, queryPara
 }
 
 func bodyToString(responseBody io.Reader) (bodyString string, err error) {
-	bodyBytes, err := ioutil.ReadAll(responseBody)
+	bodyBytes, err := io.ReadAll(responseBody)
 	if err != nil {
 		return "", err
 	}
 	bodyString = string(bodyBytes)
-	fs.Debugf(nil, "jwtutil: Response Body: "+bodyString)
+	fs.Debugf(nil, "jwtutil: Response Body: %q", bodyString)
 	return bodyString, nil
 }
 

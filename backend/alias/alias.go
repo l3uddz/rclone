@@ -1,3 +1,4 @@
+// Package alias implements a virtual provider to rename existing remotes.
 package alias
 
 import (
@@ -20,7 +21,7 @@ func init() {
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:     "remote",
-			Help:     "Remote or path to alias.\nCan be \"myremote:path/to/dir\", \"myremote:bucket\", \"myremote:\" or \"/local/path\".",
+			Help:     "Remote or path to alias.\n\nCan be \"myremote:path/to/dir\", \"myremote:bucket\", \"myremote:\" or \"/local/path\".",
 			Required: true,
 		}},
 	}

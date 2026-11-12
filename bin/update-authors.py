@@ -17,22 +17,37 @@ def load(filename):
         authors = fd.read()
     return set(re.findall(r"<(.*?)>", authors))
 
-def add_email(name, email):
+def add_email(added, name, email):
     """
-    adds the email passed in to the end of authors.md
+    adds the email passed in to the end of authors.md and records it in added
     """
     print("Adding %s <%s>" % (name, email))
     with open(AUTHORS, "a+") as fd:
-        print("  * %s <%s>" % (name, email), file=fd)
-    subprocess.check_call(["git", "commit", "-m", "Add %s to contributors" % name, AUTHORS])
-    
+        print("- %s <%s>" % (name, email), file=fd)
+    added.append((name, email))
+
+def commit(added):
+    """
+    commits authors.md with a message describing the names in added
+    """
+    if not added:
+        return
+    if len(added) == 1:
+        message = "Add %s to contributors" % added[0][0]
+    else:
+        message = "Add %d new contributors\n\n" % len(added)
+        message += "".join("- %s\n" % name for name, _ in added)
+    subprocess.check_call(["git", "commit", "-m", message, AUTHORS])
+
 def main():
+    # Add emails from authors
     out = subprocess.check_output(["git", "log", '--reverse', '--format=%an|%ae', "master"])
     out = out.decode("utf-8")
 
     ignored = load(IGNORE)
     previous = load(AUTHORS)
     previous.update(ignored)
+    added = []
     for line in out.split("\n"):
         line = line.strip()
         if line == "":
@@ -41,7 +56,27 @@ def main():
         if email in previous:
             continue
         previous.add(email)
-        add_email(name, email)
+        add_email(added, name, email)
+
+    # Add emails from Co-authored-by: lines
+    out = subprocess.check_output(["git", "log", '-i', '--grep', 'Co-authored-by:', "master"])
+    out = out.decode("utf-8")
+    co_authored_by = re.compile(r"(?i)Co-authored-by:\s+(.*?)\s+<([^>]+)>$")
+
+    for line in out.split("\n"):
+        line = line.strip()
+        m = co_authored_by.search(line)
+        if not m:
+            continue
+        name, email = m.group(1), m.group(2)
+        name = name.strip()
+        email = email.strip()
+        if email in previous:
+            continue
+        previous.add(email)
+        add_email(added, name, email)
+
+    commit(added)
 
 if __name__ == "__main__":
     main()

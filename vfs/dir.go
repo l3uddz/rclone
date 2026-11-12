@@ -1,7 +1,7 @@
 package vfs
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -11,21 +11,25 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/dirtree"
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/sanitize"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Dir represents a directory entry
 type Dir struct {
-	vfs   *VFS   // read only
-	inode uint64 // read only: inode number
-	f     fs.Fs  // read only
+	aux                      // values attached by users of the VFS
+	vfs          *VFS        // read only
+	inode        uint64      // read only: inode number
+	f            fs.Fs       // read only
+	cleanupTimer *time.Timer // read only: timer to call cacheCleanup
 
 	mu      sync.RWMutex // protects the following
 	parent  *Dir         // parent, nil for root
@@ -34,10 +38,11 @@ type Dir struct {
 	read    time.Time         // time directory entry last read
 	items   map[string]Node   // directory entries - can be empty but not nil
 	virtual map[string]vState // virtual directory entries - may be nil
-	sys     atomic.Value      // user defined info to be attached here
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
+
+	_virtuals atomic.Int32 // number of virtual directory entries in this directory and children
 }
 
 //go:generate stringer -type=vState
@@ -53,15 +58,37 @@ const (
 )
 
 func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
-	return &Dir{
+	d := &Dir{
 		vfs:     vfs,
 		f:       f,
 		parent:  parent,
 		entry:   fsDir,
 		path:    fsDir.Remote(),
-		modTime: fsDir.ModTime(context.TODO()),
+		modTime: fsDir.ModTime(vfs.ctx),
 		inode:   newInode(),
 		items:   make(map[string]Node),
+	}
+	// Set timer up like this to avoid race of d.cacheCleanup being called
+	// before d.cleanupTimer is assigned to
+	d.cleanupTimer = time.AfterFunc(time.Hour, d.cacheCleanup)
+	d.cleanupTimer.Reset(time.Duration(vfs.Opt.DirCacheTime * 2))
+	return d
+}
+
+func (d *Dir) cacheCleanup() {
+	defer func() {
+		// We should never panic here
+		_ = recover()
+	}()
+
+	when := time.Now()
+
+	d.mu.Lock()
+	_, stale := d._age(when)
+	d.mu.Unlock()
+
+	if stale {
+		d.ForgetAll()
 	}
 }
 
@@ -76,6 +103,9 @@ func (d *Dir) String() string {
 }
 
 // Dumps the directory tree to the string builder with the given indent
+//
+//lint:ignore U1000 false positive when running staticcheck,
+//nolint:unused // Don't include unused when running golangci-lint
 func (d *Dir) dumpIndent(out *strings.Builder, indent string) {
 	if d == nil {
 		fmt.Fprintf(out, "%s<nil *Dir>\n", indent)
@@ -110,6 +140,9 @@ func (d *Dir) dumpIndent(out *strings.Builder, indent string) {
 }
 
 // Dumps a nicely formatted directory tree to a string
+//
+//lint:ignore U1000 false positive when running staticcheck,
+//nolint:unused // Don't include unused when running golangci-lint
 func (d *Dir) dump() string {
 	var out strings.Builder
 	d.dumpIndent(&out, "")
@@ -128,7 +161,7 @@ func (d *Dir) IsDir() bool {
 
 // Mode bits of the directory - satisfies Node interface
 func (d *Dir) Mode() (mode os.FileMode) {
-	return d.vfs.Opt.DirPerms
+	return os.FileMode(d.vfs.Opt.DirPerms)
 }
 
 // Name (base) of the directory - satisfies Node interface
@@ -149,16 +182,6 @@ func (d *Dir) Path() (name string) {
 	return d.path
 }
 
-// Sys returns underlying data source (can be nil) - satisfies Node interface
-func (d *Dir) Sys() interface{} {
-	return d.sys.Load()
-}
-
-// SetSys sets the underlying data source (can be nil) - satisfies Node interface
-func (d *Dir) SetSys(x interface{}) {
-	d.sys.Store(x)
-}
-
 // Inode returns the inode number - satisfies Node interface
 func (d *Dir) Inode() uint64 {
 	return d.inode
@@ -169,37 +192,59 @@ func (d *Dir) Node() Node {
 	return d
 }
 
+// hasVirtual returns whether the directory or children has virtual entries
+func (d *Dir) hasVirtual() bool {
+	return d._virtuals.Load() != 0
+}
+
+// addVirtual adds n virtual items to this directory and all of its parents
+func (d *Dir) addVirtual(n int32) {
+	for d != nil {
+		d._virtuals.Add(n)
+		d = d.parent
+	}
+}
+
 // ForgetAll forgets directory entries for this directory and any children.
 //
 // It does not invalidate or clear the cache of the parent directory.
 //
-// It returns true if the directory or any of its children had virtual entries
-// so could not be forgotten. Children which didn't have virtual entries and
-// children with virtual entries will be forgotten even if true is returned.
+// It returns true if the directory or any of its children had virtual
+// entries so could not be forgotten. Children which didn't have
+// virtual entries will be forgotten even if true is returned.
 func (d *Dir) ForgetAll() (hasVirtual bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// We run this part with RLock only to avoid deadlocks in the recursion
+
+	d.mu.RLock()
+
 	fs.Debugf(d.path, "forgetting directory cache")
 	for _, node := range d.items {
 		if dir, ok := node.(*Dir); ok {
-			if dir.ForgetAll() {
-				hasVirtual = true
-			}
+			dir.ForgetAll()
 		}
 	}
-	// Purge any unecessary virtual entries
+
+	d.mu.RUnlock()
+
+	// We run this part with Lock so we can modify the Dir
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Purge any unnecessary virtual entries
 	d._purgeVirtual()
 
-	d.read = time.Time{}
-	// Check if this dir has virtual entries
-	if len(d.virtual) != 0 {
-		hasVirtual = true
-	}
 	// Don't clear directory entries if there are virtual entries in this
 	// directory or any children
+	hasVirtual = d.hasVirtual()
 	if !hasVirtual {
+		d.read = time.Time{}
 		d.items = make(map[string]Node)
+		d.cleanupTimer.Stop()
+	} else {
+		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 	}
+
 	return hasVirtual
 }
 
@@ -308,7 +353,7 @@ func (d *Dir) _age(when time.Time) (age time.Duration, stale bool) {
 		return age, true
 	}
 	age = when.Sub(d.read)
-	stale = age > d.vfs.Opt.DirCacheTime
+	stale = age > time.Duration(d.vfs.Opt.DirCacheTime)
 	return
 }
 
@@ -322,14 +367,21 @@ func (d *Dir) renameTree(dirPath string) {
 	// Make sure the path is correct for each node
 	if d.path != dirPath {
 		fs.Debugf(d.path, "Renaming to %q", dirPath)
+		delete(d.parent.items, name(d.path))
 		d.path = dirPath
-		d.entry = fs.NewDirCopy(context.TODO(), d.entry).SetRemote(dirPath)
+		d.parent.items[name(d.path)] = d
+		d.entry = fs.NewDirCopy(d.vfs.ctx, d.entry).SetRemote(dirPath)
 	}
 
-	// Do the same to any child directories
+	// Do the same to any child directories and files
 	for leaf, node := range d.items {
-		if dir, ok := node.(*Dir); ok {
-			dir.renameTree(path.Join(dirPath, leaf))
+		switch x := node.(type) {
+		case *Dir:
+			x.renameTree(path.Join(dirPath, leaf))
+		case *File:
+			x.renameDir(dirPath)
+		default:
+			panic("bad dir entry")
 		}
 	}
 }
@@ -338,11 +390,14 @@ func (d *Dir) renameTree(dirPath string) {
 //
 // Reset the directory to new state, discarding all the objects and
 // reading everything again
+//
+// The caller must move the entry between the old and the new parent's
+// directory entries itself, holding each parent's lock as it does so.
 func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	d.ForgetAll()
 
 	d.modTimeMu.Lock()
-	d.modTime = fsDir.ModTime(context.TODO())
+	d.modTime = fsDir.ModTime(d.vfs.ctx)
 	d.modTimeMu.Unlock()
 	d.mu.Lock()
 	oldPath := d.path
@@ -364,6 +419,15 @@ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	}
 }
 
+// convert path to name
+func name(p string) string {
+	p = path.Base(p)
+	if p == "." {
+		p = "/"
+	}
+	return p
+}
+
 // addObject adds a new object or directory to the directory
 //
 // The name passed in is marked as virtual as it hasn't been read from a remote
@@ -381,6 +445,9 @@ func (d *Dir) addObject(node Node) {
 	if node.IsDir() {
 		vAdd = vAddDir
 	}
+	if _, found := d.virtual[leaf]; !found {
+		d.addVirtual(1)
+	}
 	d.virtual[leaf] = vAdd
 	fs.Debugf(d.path, "Added virtual directory entry %v: %q", vAdd, leaf)
 	d.mu.Unlock()
@@ -391,7 +458,8 @@ func (d *Dir) addObject(node Node) {
 // This will be replaced with a real object when it is read back from the
 // remote.
 //
-// This is used to add directory entries while things are uploading
+// This is used by the vfs cache to insert objects that are uploading
+// into the directory tree.
 func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 	var node Node
 	d.mu.RLock()
@@ -407,12 +475,23 @@ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 		entry := fs.NewDir(remote, time.Now())
 		node = newDir(d.vfs, d.f, d, entry)
 	} else {
+		isLink := false
+		if d.vfs.Opt.Links {
+			// since the path came from the cache it may have fs.LinkSuffix,
+			// so remove it and mark the *File accordingly
+			leaf, isLink = strings.CutSuffix(leaf, fs.LinkSuffix)
+			if leaf == "" || leaf == "." || leaf == ".." {
+				return
+			}
+		}
 		f := newFile(d, dPath, nil, leaf)
+		if isLink {
+			f.setSymlink()
+		}
 		f.setSize(size)
 		node = f
 	}
 	d.addObject(node)
-
 }
 
 // delObject removes an object from the directory
@@ -424,6 +503,9 @@ func (d *Dir) delObject(leaf string) {
 	delete(d.items, leaf)
 	if d.virtual == nil {
 		d.virtual = make(map[string]vState)
+	}
+	if _, found := d.virtual[leaf]; !found {
+		d.addVirtual(1)
 	}
 	d.virtual[leaf] = vDel
 	fs.Debugf(d.path, "Added virtual directory entry %v: %q", vDel, leaf)
@@ -451,7 +533,7 @@ func (d *Dir) _readDir() error {
 	} else {
 		return nil
 	}
-	entries, err := list.DirSorted(context.TODO(), d.f, false, d.path)
+	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
 	if err == fs.ErrorDirNotFound {
 		// We treat directory not found as empty because we
 		// create directories on the fly
@@ -459,12 +541,43 @@ func (d *Dir) _readDir() error {
 		return err
 	}
 
+	if d.vfs.Opt.BlockNormDupes { // do this only if requested, as it will have a performance hit
+		ci := fs.GetConfig(d.vfs.ctx)
+
+		// sort entries such that NFD comes before NFC of same name
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i] != entries[j] && fs.DirEntryType(entries[i]) == fs.DirEntryType(entries[j]) && norm.NFC.String(entries[i].Remote()) == norm.NFC.String(entries[j].Remote()) {
+				if norm.NFD.IsNormalString(entries[i].Remote()) && !norm.NFD.IsNormalString(entries[j].Remote()) {
+					return true
+				}
+			}
+			return entries.Less(i, j)
+		})
+
+		// detect dupes, remove them from the list and log an error
+		normalizedNames := make(map[string]struct{}, entries.Len())
+		filteredEntries := make(fs.DirEntries, 0)
+		for _, e := range entries {
+			normName := fmt.Sprintf("%s-%T", operations.ToNormal(e.Remote(), !ci.NoUnicodeNormalization, (ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive)), e) // include type to track objects and dirs separately
+			_, found := normalizedNames[normName]
+			if found {
+				fs.Errorf(e.Remote(), "duplicate normalized names detected - skipping")
+				continue
+			}
+			normalizedNames[normName] = struct{}{}
+			filteredEntries = append(filteredEntries, e)
+		}
+		entries = filteredEntries
+	}
+
 	err = d._readDirFromEntries(entries, nil, time.Time{})
 	if err != nil {
 		return err
 	}
 
-	d.read = when
+	d.read = time.Now()
+	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+
 	return nil
 }
 
@@ -481,6 +594,7 @@ func (d *Dir) _deleteVirtual(name string) {
 		return
 	}
 	delete(d.virtual, name)
+	d.addVirtual(-1)
 	if len(d.virtual) == 0 {
 		d.virtual = nil
 	}
@@ -507,7 +621,7 @@ func (d *Dir) _purgeVirtual() {
 				// if remote can have empty directories then a
 				// new dir will be read in the listing
 				d._deleteVirtual(name)
-			} else {
+				//} else {
 				// leave the empty directory marker
 			}
 		case vAddFile:
@@ -528,7 +642,7 @@ func (d *Dir) _purgeVirtual() {
 				// if writing in progress then leave virtual
 				continue
 			}
-			if d.vfs.Opt.CacheMode >= vfscommon.CacheModeMinimal && d.vfs.cache.InUse(f.Path()) {
+			if d.vfs.Opt.CacheMode >= vfscommon.CacheModeMinimal && d.vfs.cache.InUse(f.CachePath()) {
 				// if object in use or dirty then leave virtual
 				continue
 			}
@@ -556,7 +670,7 @@ func (d *Dir) _newManageVirtuals() manageVirtuals {
 
 // This should be called for every entry added to the directory
 //
-// It returns true if this entry should be skipped
+// It returns true if this entry should be skipped.
 //
 // must be called with the Dir lock held
 func (mv manageVirtuals) add(d *Dir, name string) bool {
@@ -615,7 +729,12 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 	mv := d._newManageVirtuals()
 	for _, entry := range entries {
 		name := path.Base(entry.Remote())
-		if name == "." || name == ".." {
+		if d.vfs.Opt.Links {
+			name, _ = strings.CutSuffix(name, fs.LinkSuffix)
+		}
+		// Check after removing the suffix so "...rclonelink" can't
+		// become an entry called ".."
+		if name == "" || name == "." || name == ".." {
 			continue
 		}
 		node := d.items[name]
@@ -636,22 +755,25 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 			if node == nil || !node.IsDir() {
 				node = newDir(d.vfs, d.f, d, item)
 			}
+			dir := node.(*Dir)
+			dir.mu.Lock()
+			dir.modTime = item.ModTime(d.vfs.ctx)
+			dir.entry = item
 			if dirTree != nil {
-				dir := node.(*Dir)
-				dir.mu.Lock()
 				err = dir._readDirFromDirTree(dirTree, when)
 				if err != nil {
 					dir.read = time.Time{}
 				} else {
 					dir.read = when
-				}
-				dir.mu.Unlock()
-				if err != nil {
-					return err
+					dir.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 				}
 			}
+			dir.mu.Unlock()
+			if err != nil {
+				return err
+			}
 		default:
-			err = errors.Errorf("unknown type %T", item)
+			err = fmt.Errorf("unknown type %T", item)
 			fs.Errorf(d, "readDir error: %v", err)
 			return err
 		}
@@ -668,7 +790,7 @@ func (d *Dir) readDirTree() error {
 	d.mu.RUnlock()
 	when := time.Now()
 	fs.Debugf(path, "Reading directory tree")
-	dt, err := walk.NewDirTree(context.TODO(), f, path, false, -1)
+	dt, err := walk.NewDirTree(d.vfs.ctx, f, path, false, -1)
 	if err != nil {
 		return err
 	}
@@ -681,6 +803,7 @@ func (d *Dir) readDirTree() error {
 	}
 	fs.Debugf(d.path, "Reading directory tree done in %s", time.Since(when))
 	d.read = when
+	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 	return nil
 }
 
@@ -692,6 +815,51 @@ func (d *Dir) readDir() error {
 	return d._readDir()
 }
 
+// jsonErrorf formats the string according to a format specifier and
+// returns the resulting string as a JSON blob with key "error"
+func jsonErrorf(format string, a ...any) []byte {
+	errMsg := fmt.Sprintf(format, a...)
+	jsonBlob, _ := json.MarshalIndent(map[string]string{"error": errMsg}, "", "\t")
+	return jsonBlob
+}
+
+// stat a single metadata item in the directory
+//
+// Returns true if it is a metadata name
+func (d *Dir) statMetadata(leaf, baseLeaf string) (metaNode Node, err error) {
+	// Find original file - note that this is recursing into stat()
+	node, err := d.stat(baseLeaf)
+	if err != nil {
+		return node, err
+	}
+	// Read the metadata from the original entry into a JSON dump
+	entry := node.DirEntry()
+	var metadataDump []byte
+	if entry != nil {
+		metadata, err := fs.GetMetadata(d.vfs.ctx, entry)
+		if err != nil {
+			metadataDump = jsonErrorf("failed to read metadata: %v", err)
+		} else if metadata == nil {
+			metadataDump = []byte("{}") // no metadata to read
+		} else {
+			metadataDump, err = json.MarshalIndent(metadata, "", "\t")
+			if err != nil {
+				metadataDump = jsonErrorf("failed to write metadata: %v", err)
+			}
+		}
+	} else {
+		metadataDump = []byte("{}") // no metadata yet when an object is being written
+	}
+	// Make a memory based file with metadataDump in
+	remote := path.Join(d.path, leaf)
+	o := object.NewMemoryObject(remote, node.ModTime(), metadataDump)
+	f := newFile(d, d.path, o, leaf)
+	// Base the metadata inode number off the real file inode number
+	// to keep it constant
+	f.inode = node.Inode() ^ (1 << 63)
+	return f, nil
+}
+
 // stat a single item in the directory
 //
 // returns ENOENT if not found.
@@ -699,26 +867,46 @@ func (d *Dir) readDir() error {
 // contains files with names that differ only by case.
 func (d *Dir) stat(leaf string) (Node, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	err := d._readDir()
 	if err != nil {
+		d.mu.Unlock()
 		return nil, err
 	}
 	item, ok := d.items[leaf]
+	d.mu.Unlock()
 
-	if !ok && d.vfs.Opt.CaseInsensitive {
-		leafLower := strings.ToLower(leaf)
+	// Look for a metadata file
+	if !ok {
+		if baseLeaf, found := d.vfs.isMetadataFile(leaf); found {
+			node, err := d.statMetadata(leaf, baseLeaf)
+			if err != nil {
+				return nil, err
+			}
+			// Add metadata file to directory as virtual object
+			d.addObject(node)
+			return node, nil
+		}
+	}
+
+	ci := fs.GetConfig(d.vfs.ctx)
+	normUnicode := !ci.NoUnicodeNormalization
+	normCase := ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive
+	if !ok && (normUnicode || normCase) {
+		leafNormalized := operations.ToNormal(leaf, normUnicode, normCase) // this handles both case and unicode normalization
+		d.mu.Lock()
 		for name, node := range d.items {
-			if strings.ToLower(name) == leafLower {
+			if operations.ToNormal(name, normUnicode, normCase) == leafNormalized {
 				if ok {
-					// duplicate case insensitive match is an error
-					return nil, errors.Errorf("duplicate filename %q detected with --vfs-case-insensitive set", leaf)
+					// duplicate normalized match is an error
+					d.mu.Unlock()
+					return nil, fmt.Errorf("duplicate filename %q detected with case/unicode normalization settings", leaf)
 				}
-				// found a case insensitive match
+				// found a normalized match
 				ok = true
 				item = node
 			}
 		}
+		d.mu.Unlock()
 	}
 
 	if !ok {
@@ -840,9 +1028,28 @@ func (d *Dir) Open(flags int) (fd Handle, err error) {
 	return newDirHandle(d), nil
 }
 
+// checkName returns EINVAL if name isn't a single safe path element,
+// that is it is empty, "." or "..", or contains a "/".
+//
+// Such a name can't be a child of the directory and would make a node
+// whose path is outside it (or outside the VFS root, since at the root
+// path.Join("", "..") preserves the "..").
+func (d *Dir) checkName(name string) error {
+	if err := sanitize.Leaf(name); err != nil {
+		fs.Errorf(d, "Refusing unsafe name: %v", err)
+		return EINVAL
+	}
+	return nil
+}
+
 // Create makes a new file node
+//
+// It returns EINVAL if name isn't a single safe path element.
 func (d *Dir) Create(name string, flags int) (*File, error) {
 	// fs.Debugf(path, "Dir.Create")
+	if err := d.checkName(name); err != nil {
+		return nil, err
+	}
 	// Return existing node if one exists
 	node, err := d.stat(name)
 	switch err {
@@ -863,14 +1070,23 @@ func (d *Dir) Create(name string, flags int) (*File, error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
 	}
+	if err = d.SetModTime(time.Now()); err != nil {
+		fs.Errorf(d, "Dir.Create failed to set modtime on parent dir: %v", err)
+		return nil, err
+	}
 	// This gets added to the directory when the file is opened for write
 	return newFile(d, d.Path(), nil, name), nil
 }
 
 // Mkdir creates a new directory
+//
+// It returns EINVAL if name isn't a single safe path element.
 func (d *Dir) Mkdir(name string) (*Dir, error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
+	}
+	if err := d.checkName(name); err != nil {
+		return nil, err
 	}
 	path := path.Join(d.path, name)
 	node, err := d.stat(name)
@@ -889,7 +1105,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 		return nil, err
 	}
 	// fs.Debugf(path, "Dir.Mkdir")
-	err = d.f.Mkdir(context.TODO(), path)
+	err = d.f.Mkdir(d.vfs.ctx, path)
 	if err != nil {
 		fs.Errorf(d, "Dir.Mkdir failed to create directory: %v", err)
 		return nil, err
@@ -897,6 +1113,10 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 	fsDir := fs.NewDir(path, time.Now())
 	dir := newDir(d.vfs, d.f, d, fsDir)
 	d.addObject(dir)
+	if err = d.SetModTime(time.Now()); err != nil {
+		fs.Errorf(d, "Dir.Mkdir failed to set modtime on parent dir: %v", err)
+		return nil, err
+	}
 	// fs.Debugf(path, "Dir.Mkdir OK")
 	return dir, nil
 }
@@ -917,11 +1137,20 @@ func (d *Dir) Remove() error {
 		return ENOTEMPTY
 	}
 	// remove directory
-	err = d.f.Rmdir(context.TODO(), d.path)
+	err = d.f.Rmdir(d.vfs.ctx, d.path)
 	if err != nil {
 		fs.Errorf(d, "Dir.Remove failed to remove directory: %v", err)
 		return err
 	}
+	// The directory is gone, so no listing will resolve its virtual
+	// entries, which can only be deletes as it was empty. They must be
+	// removed now, or they will be counted in every parent and
+	// cache forgets blocked as a consequence
+	d.mu.Lock()
+	for leaf := range d.virtual {
+		d._deleteVirtual(leaf)
+	}
+	d.mu.Unlock()
 	// Remove the item from the parent directory listing
 	if d.parent != nil {
 		d.parent.delObject(d.Name())
@@ -968,14 +1197,23 @@ func (d *Dir) RemoveName(name string) error {
 		fs.Errorf(d, "Dir.Remove error: %v", err)
 		return err
 	}
+	if err = d.SetModTime(time.Now()); err != nil {
+		fs.Errorf(d, "Dir.Remove failed to set modtime on parent dir: %v", err)
+		return err
+	}
 	return node.Remove()
 }
 
 // Rename the file
+//
+// It returns EINVAL if newName isn't a single safe path element.
 func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	// fs.Debugf(d, "BEFORE\n%s", d.dump())
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
+	}
+	if err := destDir.checkName(newName); err != nil {
+		return err
 	}
 	oldPath := path.Join(d.path, oldName)
 	newPath := path.Join(destDir.path, newName)
@@ -985,10 +1223,12 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 		return err
 	}
+	// oldName may only match oldNode with case or unicode normalization
+	oldLeaf := oldNode.Name()
 	switch x := oldNode.DirEntry().(type) {
 	case nil:
 		if oldFile, ok := oldNode.(*File); ok {
-			if err = oldFile.rename(context.TODO(), destDir, newName); err != nil {
+			if err = oldFile.rename(d.vfs.ctx, destDir, newName); err != nil {
 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 				return err
 			}
@@ -998,30 +1238,30 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		}
 	case fs.Object:
 		if oldFile, ok := oldNode.(*File); ok {
-			if err = oldFile.rename(context.TODO(), destDir, newName); err != nil {
+			if err = oldFile.rename(d.vfs.ctx, destDir, newName); err != nil {
 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 				return err
 			}
 		} else {
-			err := errors.Errorf("Fs %q can't rename file that is not a vfs.File", d.f)
+			err := fmt.Errorf("Fs %q can't rename file that is not a vfs.File", d.f)
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 			return err
 		}
 	case fs.Directory:
 		features := d.f.Features()
 		if features.DirMove == nil && features.Move == nil && features.Copy == nil {
-			err := errors.Errorf("Fs %q can't rename directories (no DirMove, Move or Copy)", d.f)
+			err := fmt.Errorf("Fs %q can't rename directories (no DirMove, Move or Copy)", d.f)
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 			return err
 		}
 		srcRemote := x.Remote()
 		dstRemote := newPath
-		err = operations.DirMove(context.TODO(), d.f, srcRemote, dstRemote)
+		err = operations.DirMove(d.vfs.ctx, d.f, srcRemote, dstRemote)
 		if err != nil {
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 			return err
 		}
-		newDir := fs.NewDirCopy(context.TODO(), x).SetRemote(newPath)
+		newDir := fs.NewDirCopy(d.vfs.ctx, x).SetRemote(newPath)
 		// Update the node with the new details
 		if oldNode != nil {
 			if oldDir, ok := oldNode.(*Dir); ok {
@@ -1030,14 +1270,18 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 			}
 		}
 	default:
-		err = errors.Errorf("unknown type %T", oldNode)
+		err = fmt.Errorf("unknown type %T", oldNode)
 		fs.Errorf(d.path, "Dir.Rename error: %v", err)
 		return err
 	}
 
 	// Show moved - delete from old dir and add to new
-	d.delObject(oldName)
+	d.delObject(oldLeaf)
 	destDir.addObject(oldNode)
+	if err = d.SetModTime(time.Now()); err != nil {
+		fs.Errorf(d, "Dir.Rename failed to set modtime on parent dir: %v", err)
+		return err
+	}
 
 	// fs.Debugf(newPath, "Dir.Rename renamed from %q", oldPath)
 	// fs.Debugf(d, "AFTER\n%s", d.dump())

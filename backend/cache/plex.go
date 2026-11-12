@@ -1,4 +1,4 @@
-// +build !plan9,!js
+//go:build !plan9 && !js
 
 package cache
 
@@ -7,7 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -166,7 +166,7 @@ func (p *plexConnector) listenWebsocket() {
 								continue
 							}
 							var data []byte
-							data, err = ioutil.ReadAll(resp.Body)
+							data, err = io.ReadAll(resp.Body)
 							if err != nil {
 								continue
 							}
@@ -209,10 +209,10 @@ func (p *plexConnector) authenticate() error {
 	if err != nil {
 		return err
 	}
-	var data map[string]interface{}
+	var data map[string]any
 	err = json.NewDecoder(resp.Body).Decode(&data)
 	if err != nil {
-		return fmt.Errorf("failed to obtain token: %v", err)
+		return fmt.Errorf("failed to obtain token: %w", err)
 	}
 	tokenGen, ok := get(data, "user", "authToken")
 	if !ok {
@@ -273,11 +273,11 @@ func (p *plexConnector) isPlaying(co *Object) bool {
 }
 
 // adapted from: https://stackoverflow.com/a/28878037 (credit)
-func get(m interface{}, path ...interface{}) (interface{}, bool) {
+func get(m any, path ...any) (any, bool) {
 	for _, p := range path {
 		switch idx := p.(type) {
 		case string:
-			if mm, ok := m.(map[string]interface{}); ok {
+			if mm, ok := m.(map[string]any); ok {
 				if val, found := mm[idx]; found {
 					m = val
 					continue
@@ -285,7 +285,7 @@ func get(m interface{}, path ...interface{}) (interface{}, bool) {
 			}
 			return nil, false
 		case int:
-			if mm, ok := m.([]interface{}); ok {
+			if mm, ok := m.([]any); ok {
 				if len(mm) > idx {
 					m = mm[idx]
 					continue

@@ -13,7 +13,7 @@ func NewTokenDispenser(n int) *TokenDispenser {
 		tokens: make(chan struct{}, n),
 	}
 	// Fill up the upload tokens
-	for i := 0; i < n; i++ {
+	for range n {
 		td.tokens <- struct{}{}
 	}
 	return td
@@ -22,7 +22,6 @@ func NewTokenDispenser(n int) *TokenDispenser {
 // Get gets a token from the pool - don't forget to return it with Put
 func (td *TokenDispenser) Get() {
 	<-td.tokens
-	return
 }
 
 // Put returns a token

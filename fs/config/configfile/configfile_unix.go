@@ -1,7 +1,7 @@
 // Read, write and edit the config file
 // Unix specific functions.
 
-// +build darwin dragonfly freebsd linux netbsd openbsd solaris
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
 package configfile
 
@@ -14,7 +14,7 @@ import (
 	"github.com/rclone/rclone/fs"
 )
 
-// attemptCopyGroups tries to keep the group the same. User will be the one
+// attemptCopyGroup tries to keep the group the same. User will be the one
 // who is currently running this process.
 func attemptCopyGroup(fromPath, toPath string) {
 	info, err := os.Stat(fromPath)

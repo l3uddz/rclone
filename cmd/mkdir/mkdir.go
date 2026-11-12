@@ -1,3 +1,4 @@
+// Package mkdir provides the mkdir command.
 package mkdir
 
 import (
@@ -17,6 +18,9 @@ func init() {
 var commandDefinition = &cobra.Command{
 	Use:   "mkdir remote:path",
 	Short: `Make the path if it doesn't already exist.`,
+	Annotations: map[string]string{
+		"groups": "Important",
+	},
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(1, 1, command, args)
 		fdst := cmd.NewFsDir(args)

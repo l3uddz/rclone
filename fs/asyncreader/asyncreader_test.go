@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"strings"
 	"sync"
@@ -14,7 +13,6 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/rclone/rclone/lib/israce"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,7 +21,7 @@ import (
 func TestAsyncReader(t *testing.T) {
 	ctx := context.Background()
 
-	buf := ioutil.NopCloser(bytes.NewBufferString("Testbuffer"))
+	buf := io.NopCloser(bytes.NewBufferString("Testbuffer"))
 	ar, err := New(ctx, buf, 4)
 	require.NoError(t, err)
 
@@ -48,7 +46,7 @@ func TestAsyncReader(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test Close without reading everything
-	buf = ioutil.NopCloser(bytes.NewBuffer(make([]byte, 50000)))
+	buf = io.NopCloser(bytes.NewBuffer(make([]byte, 50000)))
 	ar, err = New(ctx, buf, 4)
 	require.NoError(t, err)
 	err = ar.Close()
@@ -59,7 +57,7 @@ func TestAsyncReader(t *testing.T) {
 func TestAsyncWriteTo(t *testing.T) {
 	ctx := context.Background()
 
-	buf := ioutil.NopCloser(bytes.NewBufferString("Testbuffer"))
+	buf := io.NopCloser(bytes.NewBufferString("Testbuffer"))
 	ar, err := New(ctx, buf, 4)
 	require.NoError(t, err)
 
@@ -85,7 +83,7 @@ func TestAsyncReaderErrors(t *testing.T) {
 	require.Error(t, err)
 
 	// invalid buffer number
-	buf := ioutil.NopCloser(bytes.NewBufferString("Testbuffer"))
+	buf := io.NopCloser(bytes.NewBufferString("Testbuffer"))
 	_, err = New(ctx, buf, 0)
 	require.Error(t, err)
 	_, err = New(ctx, buf, -1)
@@ -151,26 +149,26 @@ func TestAsyncReaderSizes(t *testing.T) {
 
 	var texts [31]string
 	str := ""
-	all := ""
-	for i := 0; i < len(texts)-1; i++ {
+	var all strings.Builder
+	for i := range len(texts) - 1 {
 		texts[i] = str + "\n"
-		all += texts[i]
+		all.WriteString(texts[i])
 		str += string(rune(i)%26 + 'a')
 	}
-	texts[len(texts)-1] = all
+	texts[len(texts)-1] = all.String()
 
-	for h := 0; h < len(texts); h++ {
+	for h := range len(texts) {
 		text := texts[h]
-		for i := 0; i < len(readMakers); i++ {
-			for j := 0; j < len(bufreaders); j++ {
-				for k := 0; k < len(bufsizes); k++ {
+		for i := range readMakers {
+			for j := range bufreaders {
+				for k := range bufsizes {
 					for l := 1; l < 10; l++ {
 						readmaker := readMakers[i]
 						bufreader := bufreaders[j]
 						bufsize := bufsizes[k]
 						read := readmaker.fn(strings.NewReader(text))
 						buf := bufio.NewReaderSize(read, bufsize)
-						ar, _ := New(ctx, ioutil.NopCloser(buf), l)
+						ar, _ := New(ctx, io.NopCloser(buf), l)
 						s := bufreader.fn(ar)
 						// "timeout" expects the Reader to recover, AsyncReader does not.
 						if s != text && readmaker.name != "timeout" {
@@ -192,26 +190,26 @@ func TestAsyncReaderWriteTo(t *testing.T) {
 
 	var texts [31]string
 	str := ""
-	all := ""
-	for i := 0; i < len(texts)-1; i++ {
+	var all strings.Builder
+	for i := range len(texts) - 1 {
 		texts[i] = str + "\n"
-		all += texts[i]
+		all.WriteString(texts[i])
 		str += string(rune(i)%26 + 'a')
 	}
-	texts[len(texts)-1] = all
+	texts[len(texts)-1] = all.String()
 
-	for h := 0; h < len(texts); h++ {
+	for h := range len(texts) {
 		text := texts[h]
-		for i := 0; i < len(readMakers); i++ {
-			for j := 0; j < len(bufreaders); j++ {
-				for k := 0; k < len(bufsizes); k++ {
+		for i := range readMakers {
+			for j := range bufreaders {
+				for k := range bufsizes {
 					for l := 1; l < 10; l++ {
 						readmaker := readMakers[i]
 						bufreader := bufreaders[j]
 						bufsize := bufsizes[k]
 						read := readmaker.fn(strings.NewReader(text))
 						buf := bufio.NewReaderSize(read, bufsize)
-						ar, _ := New(ctx, ioutil.NopCloser(buf), l)
+						ar, _ := New(ctx, io.NopCloser(buf), l)
 						dst := &bytes.Buffer{}
 						_, err := ar.WriteTo(dst)
 						if err != nil && err != io.EOF && err != iotest.ErrTimeout {
@@ -266,13 +264,11 @@ func testAsyncReaderClose(t *testing.T, writeto bool) {
 	var copyErr error
 	var wg sync.WaitGroup
 	started := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		close(started)
 		if writeto {
 			// exercise the WriteTo path
-			copyN, copyErr = a.WriteTo(ioutil.Discard)
+			copyN, copyErr = a.WriteTo(io.Discard)
 		} else {
 			// exercise the Read path
 			buf := make([]byte, 64*1024)
@@ -285,7 +281,7 @@ func testAsyncReaderClose(t *testing.T, writeto bool) {
 				}
 			}
 		}
-	}()
+	})
 	// Do some copying
 	<-started
 	time.Sleep(100 * time.Millisecond)
@@ -319,15 +315,12 @@ func TestAsyncReaderSkipBytes(t *testing.T) {
 		8000, len(data), BufferSize, 2 * BufferSize}
 
 	for buffers := 1; buffers <= 5; buffers++ {
-		if israce.Enabled && buffers > 1 {
-			t.Skip("FIXME Skipping further tests with race detector until https://github.com/golang/go/issues/27070 is fixed.")
-		}
 		t.Run(fmt.Sprintf("%d", buffers), func(t *testing.T) {
 			for _, initialRead := range initialReads {
 				t.Run(fmt.Sprintf("%d", initialRead), func(t *testing.T) {
 					for _, skip := range skips {
 						t.Run(fmt.Sprintf("%d", skip), func(t *testing.T) {
-							ar, err := New(ctx, ioutil.NopCloser(bytes.NewReader(data)), buffers)
+							ar, err := New(ctx, io.NopCloser(bytes.NewReader(data)), buffers)
 							require.NoError(t, err)
 
 							wantSkipFalse := false

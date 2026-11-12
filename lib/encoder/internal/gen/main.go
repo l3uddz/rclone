@@ -1,14 +1,16 @@
+// Package main provides utilities for encoder.
 package main
 
 import (
 	"flag"
 	"fmt"
-	"log"
 	"math/rand"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/encoder"
 )
 
@@ -42,6 +44,9 @@ var maskBits = []struct {
 	{encoder.EncodeSingleQuote, "EncodeSingleQuote"},
 	{encoder.EncodeBackQuote, "EncodeBackQuote"},
 	{encoder.EncodeLtGt, "EncodeLtGt"},
+	{encoder.EncodeSquareBracket, "EncodeSquareBracket"},
+	{encoder.EncodeSemicolon, "EncodeSemicolon"},
+	{encoder.EncodeExclamation, "EncodeExclamation"},
 	{encoder.EncodeDollar, "EncodeDollar"},
 	{encoder.EncodeDoubleQuote, "EncodeDoubleQuote"},
 	{encoder.EncodeColon, "EncodeColon"},
@@ -104,6 +109,21 @@ var allMappings = []mapping{{
 		'<', '>',
 	}, []rune{
 		'＜', '＞',
+	}}, {
+	encoder.EncodeSquareBracket, []rune{
+		'[', ']',
+	}, []rune{
+		'［', '］',
+	}}, {
+	encoder.EncodeSemicolon, []rune{
+		';',
+	}, []rune{
+		'；',
+	}}, {
+	encoder.EncodeExclamation, []rune{
+		'!',
+	}, []rune{
+		'！',
 	}}, {
 	encoder.EncodeDoubleQuote, []rune{
 		'"',
@@ -216,8 +236,8 @@ func main() {
 			fatalW(fd.WriteString(" "))("Write:")
 		}
 		in, out := buildTestString(
-			[]mapping{getMapping(m.mask)},                               // pick
-			[]mapping{getMapping(0)},                                    // quote
+			[]mapping{getMapping(m.mask)},             // pick
+			[]mapping{getMapping(encoder.EncodeZero)}, // quote
 			printables, fullwidthPrintables, encodables, encoded, greek) // fill
 		fatalW(fmt.Fprintf(fd, `{ // %d
 		mask: %s,
@@ -249,7 +269,7 @@ var testCasesSingleEdge = []testCase{
 			for idx, orig := range e.orig {
 				replace := e.replace[idx]
 				pairs := buildEdgeTestString(
-					[]edge{e}, []mapping{getMapping(0), getMapping(m.mask)}, // quote
+					[]edge{e}, []mapping{getMapping(encoder.EncodeZero), getMapping(m.mask)}, // quote
 					[][]rune{printables, fullwidthPrintables, encodables, encoded, greek}, // fill
 					func(rIn, rOut []rune, quoteOut []bool, testMappings []mapping) (out []stringPair) {
 						testL := len(rIn)
@@ -270,9 +290,9 @@ var testCasesSingleEdge = []testCase{
 								if j < i {
 									continue
 								}
-								rIn := append([]rune{}, rIn...)
-								rOut := append([]rune{}, rOut...)
-								quoteOut := append([]bool{}, quoteOut...)
+								rIn := slices.Clone(rIn)
+								rOut := slices.Clone(rOut)
+								quoteOut := slices.Clone(quoteOut)
 
 								for _, in := range []rune{orig, replace} {
 									expect, quote := in, false
@@ -373,15 +393,15 @@ var testCasesDoubleEdge = []testCase{
 				orig, replace := e1.orig[0], e1.replace[0]
 				edges := []edge{e1, e2}
 				pairs := buildEdgeTestString(
-					edges, []mapping{getMapping(0), getMapping(m.mask)}, // quote
+					edges, []mapping{getMapping(encoder.EncodeZero), getMapping(m.mask)}, // quote
 					[][]rune{printables, fullwidthPrintables, encodables, encoded, greek}, // fill
 					func(rIn, rOut []rune, quoteOut []bool, testMappings []mapping) (out []stringPair) {
 						testL := len(rIn)
 						for _, i := range []int{0, testL - 1} {
 							for _, secondOrig := range e2.orig {
-								rIn := append([]rune{}, rIn...)
-								rOut := append([]rune{}, rOut...)
-								quoteOut := append([]bool{}, quoteOut...)
+								rIn := slices.Clone(rIn)
+								rOut := slices.Clone(rOut)
+								quoteOut := slices.Clone(quoteOut)
 
 								rIn[1], rOut[1], quoteOut[1] = secondOrig, secondOrig, false
 								rIn[testL-2], rOut[testL-2], quoteOut[testL-2] = secondOrig, secondOrig, false
@@ -413,18 +433,18 @@ var testCasesDoubleEdge = []testCase{
 	fatalW(fmt.Fprint(fd, "\n}\n"))("Error writing test case:")
 }
 
-func fatal(err error, s ...interface{}) {
+func fatal(err error, s ...any) {
 	if err != nil {
-		log.Fatalln(append(s, err))
+		fs.Fatal(nil, fmt.Sprint(append(s, err)))
 	}
 }
-func fatalW(_ int, err error) func(...interface{}) {
+func fatalW(_ int, err error) func(...any) {
 	if err != nil {
-		return func(s ...interface{}) {
-			log.Fatalln(append(s, err))
+		return func(s ...any) {
+			fs.Fatal(nil, fmt.Sprint(append(s, err)))
 		}
 	}
-	return func(s ...interface{}) {}
+	return func(s ...any) {}
 }
 
 func invalidMask(mask encoder.MultiEncoder) bool {
@@ -453,17 +473,13 @@ func getMapping(mask encoder.MultiEncoder) mapping {
 }
 func collectEncodables(m []mapping) (out []rune) {
 	for _, s := range m {
-		for _, r := range s.src {
-			out = append(out, r)
-		}
+		out = append(out, s.src...)
 	}
 	return
 }
 func collectEncoded(m []mapping) (out []rune) {
 	for _, s := range m {
-		for _, r := range s.dst {
-			out = append(out, r)
-		}
+		out = append(out, s.dst...)
 	}
 	return
 }
@@ -482,10 +498,7 @@ func buildTestString(mappings, testMappings []mapping, fill ...[]rune) (string, 
 		rOut = append(rOut, m.dst...)
 	}
 	inL := len(rIn)
-	testL := inL * 3
-	if testL < 30 {
-		testL = 30
-	}
+	testL := max(inL*3, 30)
 	rIn = append(rIn, make([]rune, testL-inL)...)
 	rOut = append(rOut, make([]rune, testL-inL)...)
 	quoteOut := make([]bool, testL)
@@ -548,7 +561,7 @@ func buildEdgeTestString(edges []edge, testMappings []mapping, fill [][]rune,
 
 	// populate test strings with values from the `fill` set
 outer:
-	for pos := 0; pos < testL; pos++ {
+	for pos := range testL {
 		m := pos % len(fill)
 		i := rng.Intn(len(fill[m]))
 		r := fill[m][i]

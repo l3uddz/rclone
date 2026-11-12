@@ -1,9 +1,10 @@
+// Package cryptcheck provides the cryptcheck command.
 package cryptcheck
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/crypt"
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/check"
@@ -21,11 +22,10 @@ func init() {
 
 var commandDefinition = &cobra.Command{
 	Use:   "cryptcheck remote:path cryptedremote:path",
-	Short: `Cryptcheck checks the integrity of a crypted remote.`,
-	Long: `
-rclone cryptcheck checks a remote against a crypted remote.  This is
-the equivalent of running rclone check, but able to check the
-checksums of the crypted remote.
+	Short: `Cryptcheck checks the integrity of an encrypted remote.`,
+	Long: `Checks a remote against an [encrypted](/crypt/) remote. This is the equivalent
+of running rclone [check](/commands/rclone_check/), but able to check the
+checksums of the encrypted remote.
 
 For it to work the underlying remote of the cryptedremote must support
 some kind of checksum.
@@ -37,15 +37,23 @@ checksum of the file it has just encrypted.
 
 Use it like this
 
-    rclone cryptcheck /path/to/files encryptedremote:path
+` + "```console" + `
+rclone cryptcheck /path/to/files encryptedremote:path
+` + "```" + `
 
 You can use it like this also, but that will involve downloading all
-the files in remote:path.
+the files in ` + "`remote:path`" + `.
 
-    rclone cryptcheck remote:path encryptedremote:path
+` + "```console" + `
+rclone cryptcheck remote:path encryptedremote:path
+` + "```" + `
 
-After it has run it will log the status of the encryptedremote:.
+After it has run it will log the status of the ` + "`encryptedremote:`" + `.
 ` + check.FlagsHelp,
+	Annotations: map[string]string{
+		"versionIntroduced": "v1.36",
+		"groups":            "Filter,Listing,Check",
+	},
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 2, command, args)
 		fsrc, fdst := cmd.NewFsSrcDst(args)
@@ -55,18 +63,18 @@ After it has run it will log the status of the encryptedremote:.
 	},
 }
 
-// cryptCheck checks the integrity of a crypted remote
+// cryptCheck checks the integrity of an encrypted remote
 func cryptCheck(ctx context.Context, fdst, fsrc fs.Fs) error {
 	// Check to see fcrypt is a crypt
 	fcrypt, ok := fdst.(*crypt.Fs)
 	if !ok {
-		return errors.Errorf("%s:%s is not a crypt remote", fdst.Name(), fdst.Root())
+		return fmt.Errorf("%s:%s is not a crypt remote", fdst.Name(), fdst.Root())
 	}
 	// Find a hash to use
 	funderlying := fcrypt.UnWrap()
 	hashType := funderlying.Hashes().GetOne()
 	if hashType == hash.None {
-		return errors.Errorf("%s:%s does not support any hashes", funderlying.Name(), funderlying.Root())
+		return fmt.Errorf("%s:%s does not support any hashes", funderlying.Name(), funderlying.Root())
 	}
 	fs.Infof(nil, "Using %v for hash comparisons", hashType)
 
@@ -85,21 +93,21 @@ func cryptCheck(ctx context.Context, fdst, fsrc fs.Fs) error {
 		underlyingDst := cryptDst.UnWrap()
 		underlyingHash, err := underlyingDst.Hash(ctx, hashType)
 		if err != nil {
-			return true, false, errors.Wrapf(err, "error reading hash from underlying %v", underlyingDst)
+			return true, false, fmt.Errorf("error reading hash from underlying %v: %w", underlyingDst, err)
 		}
 		if underlyingHash == "" {
 			return false, true, nil
 		}
 		cryptHash, err := fcrypt.ComputeHash(ctx, cryptDst, src, hashType)
 		if err != nil {
-			return true, false, errors.Wrap(err, "error computing hash")
+			return true, false, fmt.Errorf("error computing hash: %w", err)
 		}
 		if cryptHash == "" {
 			return false, true, nil
 		}
 		if cryptHash != underlyingHash {
-			err = errors.Errorf("hashes differ (%s:%s) %q vs (%s:%s) %q", fdst.Name(), fdst.Root(), cryptHash, fsrc.Name(), fsrc.Root(), underlyingHash)
-			fs.Errorf(src, err.Error())
+			err = fmt.Errorf("hashes differ (%s:%s) %q vs (%s:%s) %q", fdst.Name(), fdst.Root(), cryptHash, fsrc.Name(), fsrc.Root(), underlyingHash)
+			fs.Errorf(src, "%s", err.Error())
 			return true, false, nil
 		}
 		return false, false, nil

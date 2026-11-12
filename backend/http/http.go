@@ -6,17 +6,18 @@ package http
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -34,37 +35,41 @@ var (
 func init() {
 	fsi := &fs.RegInfo{
 		Name:        "http",
-		Description: "http Connection",
+		Description: "HTTP",
 		NewFs:       NewFs,
+		CommandHelp: commandHelp,
+		MetadataInfo: &fs.MetadataInfo{
+			System: systemMetadataInfo,
+			Help:   `HTTP metadata keys are case insensitive and are always returned in lower case.`,
+		},
 		Options: []fs.Option{{
 			Name:     "url",
-			Help:     "URL of http host to connect to",
+			Help:     "URL of HTTP host to connect to.\n\nE.g. \"https://example.com\", or \"https://user:pass@example.com\" to use a username and password.",
 			Required: true,
-			Examples: []fs.OptionExample{{
-				Value: "https://example.com",
-				Help:  "Connect to example.com",
-			}, {
-				Value: "https://user:pass@example.com",
-				Help:  "Connect to example.com using a username and password",
-			}},
 		}, {
 			Name: "headers",
-			Help: `Set HTTP headers for all transactions
+			Help: `Set HTTP headers for all transactions.
 
-Use this to set additional HTTP headers for all transactions
+Use this to set additional HTTP headers for all transactions.
 
 The input format is comma separated list of key,value pairs.  Standard
 [CSV encoding](https://godoc.org/encoding/csv) may be used.
 
-For example to set a Cookie use 'Cookie,name=value', or '"Cookie","name=value"'.
+For example, to set a Cookie use 'Cookie,name=value', or '"Cookie","name=value"'.
 
 You can set multiple headers, e.g. '"Cookie","name=value","Authorization","xxx"'.
-`,
+
+The headers are only sent to the host in the configured URL. If the
+server redirects to another host (including a subdomain or a different
+port) the headers are not sent to it, or to any further hop in that
+redirect chain. When headers are set, a redirect from https to http is
+refused as it would send them in cleartext, even with
+--allow-https-downgrade.`,
 			Default:  fs.CommaSepList{},
 			Advanced: true,
 		}, {
 			Name: "no_slash",
-			Help: `Set this if the site doesn't end directories with /
+			Help: `Set this if the site doesn't end directories with /.
 
 Use this if your target website does not use / on the end of
 directories.
@@ -80,8 +85,9 @@ directories.`,
 			Advanced: true,
 		}, {
 			Name: "no_head",
-			Help: `Don't use HEAD requests to find file sizes in dir listing
+			Help: `Don't use HEAD requests.
 
+HEAD requests are mainly used to find file sizes in dir listing.
 If your site is being very slow to load then you can try this option.
 Normally rclone does a HEAD request for each potential file in a
 directory listing to:
@@ -90,25 +96,87 @@ directory listing to:
 - check it really exists
 - check to see if it is a directory
 
-If you set this option, rclone will not do the HEAD request.  This will mean
-
-- directory listings are much quicker
-- rclone won't have the times or sizes of any files
-- some files that don't exist may be in the listing
-`,
+If you set this option, rclone will not do the HEAD request. This will mean
+that directory listings are much quicker, but rclone won't have the times or
+sizes of any files, and some files that don't exist may be in the listing.`,
 			Default:  false,
 			Advanced: true,
+		}, {
+			Name: "no_head_size",
+			Help: `Set the reported file size for --http-no-head.
+
+When HEAD requests are disabled, rclone normally reports an unknown file size.
+Set this option to a non-negative value to report that size for every file,
+including 0. Leave it unset (the default, shown as "off") to keep reporting
+an unknown size.
+
+The configured size is authoritative. If it does not match the actual file
+size, transfers may fail their size check and retry unless --ignore-size is
+used. It can also make multi-thread transfers request incorrect ranges and
+make mounted files unreadable past the reported size.`,
+			Default:  fs.SizeSuffix(-1),
+			Advanced: true,
+		}, {
+			Name: "no_head_time",
+			Help: `Set a default modification time for --http-no-head.
+
+When HEAD requests are disabled, rclone normally reports an unset modification
+time. Set this option to report the specified time for every file instead.
+Changing the configured time later makes every file appear modified to a sync.`,
+			Default:  fs.Time{},
+			Advanced: true,
+		}, {
+			Name:    "no_escape",
+			Help:    "Do not escape URL metacharacters in path names.",
+			Default: false,
 		}},
 	}
 	fs.Register(fsi)
 }
 
+// system metadata keys which this backend owns
+var systemMetadataInfo = map[string]fs.MetadataHelp{
+	"cache-control": {
+		Help:    "Cache-Control header",
+		Type:    "string",
+		Example: "no-cache",
+	},
+	"content-disposition": {
+		Help:    "Content-Disposition header",
+		Type:    "string",
+		Example: "inline",
+	},
+	"content-disposition-filename": {
+		Help:    "Filename retrieved from Content-Disposition header",
+		Type:    "string",
+		Example: "file.txt",
+	},
+	"content-encoding": {
+		Help:    "Content-Encoding header",
+		Type:    "string",
+		Example: "gzip",
+	},
+	"content-language": {
+		Help:    "Content-Language header",
+		Type:    "string",
+		Example: "en-US",
+	},
+	"content-type": {
+		Help:    "Content-Type header",
+		Type:    "string",
+		Example: "text/plain",
+	},
+}
+
 // Options defines the configuration for this backend
 type Options struct {
-	Endpoint string          `config:"url"`
-	NoSlash  bool            `config:"no_slash"`
-	NoHead   bool            `config:"no_head"`
-	Headers  fs.CommaSepList `config:"headers"`
+	Endpoint   string          `config:"url"`
+	NoSlash    bool            `config:"no_slash"`
+	NoHead     bool            `config:"no_head"`
+	NoHeadSize fs.SizeSuffix   `config:"no_head_size"`
+	NoHeadTime fs.Time         `config:"no_head_time"`
+	Headers    fs.CommaSepList `config:"headers"`
+	NoEscape   bool            `config:"no_escape"`
 }
 
 // Fs stores the interface to the remote HTTP files
@@ -121,6 +189,7 @@ type Fs struct {
 	endpoint    *url.URL
 	endpointURL string // endpoint as a string
 	httpClient  *http.Client
+	fileName    string // set if we are pointing to a file
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -130,6 +199,13 @@ type Object struct {
 	size        int64
 	modTime     time.Time
 	contentType string
+
+	// Metadata as pointers to strings as they often won't be present
+	contentDisposition         *string // Content-Disposition: header
+	contentDispositionFilename *string // Filename retrieved from Content-Disposition: header
+	cacheControl               *string // Cache-Control: header
+	contentEncoding            *string // Content-Encoding: header
+	contentLanguage            *string // Content-Language: header
 }
 
 // statusError returns an error if the res contained an error
@@ -139,23 +215,90 @@ func statusError(res *http.Response, err error) error {
 	}
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		_ = res.Body.Close()
-		return errors.Errorf("HTTP Error %d: %s", res.StatusCode, res.Status)
+		return fmt.Errorf("HTTP Error: %s", res.Status)
 	}
 	return nil
 }
 
-// NewFs creates a new Fs object from the name and root. It connects to
-// the host specified in the config file.
-func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
-	// Parse config into Options struct
-	opt := new(Options)
-	err := configstruct.Set(m, opt)
-	if err != nil {
-		return nil, err
+// getFsEndpoint decides if url is to be considered a file or directory,
+// and returns a proper endpoint url to use for the fs.
+func getFsEndpoint(ctx context.Context, client *http.Client, url string, opt *Options) (string, bool) {
+	// If url ends with '/' it is already a proper url always assumed to be a directory.
+	if url[len(url)-1] == '/' {
+		return url, false
 	}
 
+	// If url does not end with '/' we send a HEAD request to decide
+	// if it is directory or file, and if directory appends the missing
+	// '/', or if file returns the directory url to parent instead.
+	createFileResult := func() (string, bool) {
+		fs.Debugf(nil, "If path is a directory you must add a trailing '/'")
+		parent, _ := path.Split(url)
+		return parent, true
+	}
+	createDirResult := func() (string, bool) {
+		fs.Debugf(nil, "To avoid the initial HEAD request add a trailing '/' to the path")
+		return url + "/", false
+	}
+
+	// If HEAD requests are not allowed we just have to assume it is a file.
+	if opt.NoHead {
+		fs.Debugf(nil, "Assuming path is a file as --http-no-head is set")
+		return createFileResult()
+	}
+
+	// Use a client which doesn't follow redirects so the server
+	// doesn't redirect http://host/dir to http://host/dir/
+	noRedir := *client
+	noRedir.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+	if err != nil {
+		fs.Debugf(nil, "Assuming path is a file as HEAD request could not be created: %v", err)
+		return createFileResult()
+	}
+	addHeaders(req, opt)
+	res, err := noRedir.Do(req)
+	if err != nil {
+		fs.Debugf(nil, "Assuming path is a file as HEAD request could not be sent: %v", err)
+		return createFileResult()
+	}
+	if res.StatusCode == http.StatusNotFound {
+		fs.Debugf(nil, "Assuming path is a directory as HEAD response is it does not exist as a file (%s)", res.Status)
+		return createDirResult()
+	}
+	if res.StatusCode == http.StatusMovedPermanently ||
+		res.StatusCode == http.StatusFound ||
+		res.StatusCode == http.StatusSeeOther ||
+		res.StatusCode == http.StatusTemporaryRedirect ||
+		res.StatusCode == http.StatusPermanentRedirect {
+		redir := res.Header.Get("Location")
+		if redir != "" {
+			if redir[len(redir)-1] == '/' {
+				fs.Debugf(nil, "Assuming path is a directory as HEAD response is redirect (%s) to a path that ends with '/': %s", res.Status, redir)
+				return createDirResult()
+			}
+			fs.Debugf(nil, "Assuming path is a file as HEAD response is redirect (%s) to a path that does not end with '/': %s", res.Status, redir)
+			return createFileResult()
+		}
+		fs.Debugf(nil, "Assuming path is a file as HEAD response is redirect (%s) but no location header", res.Status)
+		return createFileResult()
+	}
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		// Example is 403 (http.StatusForbidden) for servers not allowing HEAD requests.
+		fs.Debugf(nil, "Assuming path is a file as HEAD response is an error (%s)", res.Status)
+		return createFileResult()
+	}
+
+	fs.Debugf(nil, "Assuming path is a file as HEAD response is success (%s)", res.Status)
+	return createFileResult()
+}
+
+// Make the http connection with opt
+func (f *Fs) httpConnection(ctx context.Context, opt *Options) (isFile bool, err error) {
 	if len(opt.Headers)%2 != 0 {
-		return nil, errors.New("odd number of headers supplied")
+		return false, errors.New("odd number of headers supplied")
 	}
 
 	if !strings.HasSuffix(opt.Endpoint, "/") {
@@ -165,69 +308,83 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Parse the endpoint and stick the root onto it
 	base, err := url.Parse(opt.Endpoint)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	u, err := rest.URLJoin(base, rest.URLPathEscape(root))
+	u, err := rest.URLJoinRoot(base, f.root)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 
 	client := fshttp.NewClient(ctx)
-
-	var isFile = false
-	if !strings.HasSuffix(u.String(), "/") {
-		// Make a client which doesn't follow redirects so the server
-		// doesn't redirect http://host/dir to http://host/dir/
-		noRedir := *client
-		noRedir.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-		// check to see if points to a file
-		req, err := http.NewRequestWithContext(ctx, "HEAD", u.String(), nil)
-		if err == nil {
-			addHeaders(req, opt)
-			res, err := noRedir.Do(req)
-			err = statusError(res, err)
-			if err == nil {
-				isFile = true
-			}
-		}
+	// Without configured headers keep the default policy so
+	// --allow-https-downgrade can follow public mirrors that
+	// redirect from https to http.
+	if len(opt.Headers) > 0 {
+		client.CheckRedirect = checkRedirect(opt)
 	}
 
-	newRoot := u.String()
+	endpoint, isFile := getFsEndpoint(ctx, client, u.String(), opt)
+	fs.Debugf(nil, "Root: %s", endpoint)
+	u, err = url.Parse(endpoint)
+	if err != nil {
+		return false, err
+	}
+
+	// Update f with the new parameters
+	f.httpClient = client
+	f.endpoint = u
+	f.endpointURL = u.String()
+
 	if isFile {
-		// Point to the parent if this is a file
-		newRoot, _ = path.Split(u.String())
-	} else {
-		if !strings.HasSuffix(newRoot, "/") {
-			newRoot += "/"
+		// Correct root if definitely pointing to a file
+		f.fileName = path.Base(f.root)
+		f.root = path.Dir(f.root)
+		if f.root == "." || f.root == "/" {
+			f.root = ""
 		}
 	}
+	return isFile, nil
+}
 
-	u, err = url.Parse(newRoot)
+// NewFs creates a new Fs object from the name and root. It connects to
+// the host specified in the config file.
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := &Options{
+		NoHeadSize: fs.SizeSuffix(-1),
+	}
+	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, err
 	}
 
 	ci := fs.GetConfig(ctx)
 	f := &Fs{
-		name:        name,
-		root:        root,
-		opt:         *opt,
-		ci:          ci,
-		httpClient:  client,
-		endpoint:    u,
-		endpointURL: u.String(),
+		name: name,
+		root: root,
+		opt:  *opt,
+		ci:   ci,
 	}
 	f.features = (&fs.Features{
+		ReadMetadata:            true,
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
+
+	// Make the http connection
+	isFile, err := f.httpConnection(ctx, opt)
+	if err != nil {
+		return nil, err
+	}
+
 	if isFile {
+		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
 	}
+
 	if !strings.HasSuffix(f.endpointURL, "/") {
 		return nil, errors.New("internal error: url doesn't end with /")
 	}
+
 	return f, nil
 }
 
@@ -262,7 +419,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		fs:     f,
 		remote: remote,
 	}
-	err := o.stat(ctx)
+	err := o.head(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -271,16 +428,13 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // Join's the remote onto the base URL
 func (f *Fs) url(remote string) string {
-	return f.endpointURL + rest.URLPathEscape(remote)
-}
-
-// parse s into an int64, on failure return def
-func parseInt64(s string, def int64) int64 {
-	n, e := strconv.ParseInt(s, 10, 64)
-	if e != nil {
-		return def
+	trimmedRemote := strings.TrimLeft(remote, "/") // remove leading "/" since we always have it in f.endpointURL
+	if f.opt.NoEscape {
+		// Directly concatenate without escaping, no_escape behavior
+		return f.endpointURL + trimmedRemote
 	}
-	return n
+	// Default behavior
+	return f.endpointURL + rest.URLPathEscape(trimmedRemote)
 }
 
 // Errors returned by parseName
@@ -303,7 +457,7 @@ func parseName(base *url.URL, name string) (string, error) {
 	}
 	// check it doesn't have URL parameters
 	uStr := u.String()
-	if strings.Index(uStr, "?") >= 0 {
+	if strings.Contains(uStr, "?") {
 		return "", errFoundQuestionMark
 	}
 	// check that this is going back to the same host and scheme
@@ -365,12 +519,54 @@ func parse(base *url.URL, in io.Reader) (names []string, err error) {
 	return names, nil
 }
 
+// parseFilename extracts the filename from a Content-Disposition header
+func parseFilename(contentDisposition string) (string, error) {
+	// Normalize the contentDisposition to canonical MIME format
+	mediaType, params, err := mime.ParseMediaType(contentDisposition)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse contentDisposition: %v", err)
+	}
+
+	// Check if the contentDisposition is an attachment
+	if strings.ToLower(mediaType) != "attachment" {
+		return "", fmt.Errorf("not an attachment: %s", mediaType)
+	}
+
+	// Extract the filename from the parameters
+	filename, ok := params["filename"]
+	if !ok {
+		return "", fmt.Errorf("filename not found in contentDisposition")
+	}
+
+	// Decode filename if it contains special encoding
+	return textproto.TrimString(filename), nil
+}
+
 // Adds the configured headers to the request if any
 func addHeaders(req *http.Request, opt *Options) {
 	for i := 0; i < len(opt.Headers); i += 2 {
 		key := opt.Headers[i]
 		value := opt.Headers[i+1]
 		req.Header.Add(key, value)
+	}
+}
+
+// checkRedirect returns an http.Client.CheckRedirect function which
+// follows redirects but refuses an HTTPS to HTTP downgrade with
+// rest.ErrHTTPSDowngrade and strips the configured headers when the
+// redirect chain has left the originally requested host at any point.
+func checkRedirect(opt *Options) func(req *http.Request, via []*http.Request) error {
+	headers := make([]string, 0, len(opt.Headers)/2)
+	for i := 0; i < len(opt.Headers); i += 2 {
+		headers = append(headers, opt.Headers[i])
+	}
+	stripHeaders := rest.StripHeadersOnCrossHostRedirectFn(headers...)
+	return func(req *http.Request, via []*http.Request) error {
+		err := stripHeaders(req, via)
+		if errors.Is(err, rest.ErrHTTPSDowngrade) {
+			err = fmt.Errorf("%w (the configured headers would be sent to the plaintext target)", err)
+		}
+		return err
 	}
 }
 
@@ -384,15 +580,15 @@ func (f *Fs) readDir(ctx context.Context, dir string) (names []string, err error
 	URL := f.url(dir)
 	u, err := url.Parse(URL)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to readDir")
+		return nil, fmt.Errorf("failed to readDir: %w", err)
 	}
 	if !strings.HasSuffix(URL, "/") {
-		return nil, errors.Errorf("internal error: readDir URL %q didn't end in /", URL)
+		return nil, fmt.Errorf("internal error: readDir URL %q didn't end in /", URL)
 	}
 	// Do the request
 	req, err := http.NewRequestWithContext(ctx, "GET", URL, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "readDir failed")
+		return nil, fmt.Errorf("readDir failed: %w", err)
 	}
 	f.addHeaders(req)
 	res, err := f.httpClient.Do(req)
@@ -404,18 +600,18 @@ func (f *Fs) readDir(ctx context.Context, dir string) (names []string, err error
 	}
 	err = statusError(res, err)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to readDir")
+		return nil, fmt.Errorf("failed to readDir: %w", err)
 	}
 
-	contentType := strings.SplitN(res.Header.Get("Content-Type"), ";", 2)[0]
+	contentType, _, _ := strings.Cut(res.Header.Get("Content-Type"), ";")
 	switch contentType {
 	case "text/html":
 		names, err = parse(u, res.Body)
 		if err != nil {
-			return nil, errors.Wrap(err, "readDir")
+			return nil, fmt.Errorf("readDir: %w", err)
 		}
 	default:
-		return nil, errors.Errorf("Can't parse content type %q", contentType)
+		return nil, fmt.Errorf("can't parse content type %q", contentType)
 	}
 	return names, nil
 }
@@ -430,12 +626,23 @@ func (f *Fs) readDir(ctx context.Context, dir string) (names []string, err error
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	// pointed at a single file: only that file is visible
+	if f.fileName != "" {
+		if dir != "" {
+			return nil, fs.ErrorDirNotFound
+		}
+		obj, err := f.NewObject(ctx, f.fileName)
+		if err != nil {
+			return nil, err
+		}
+		return fs.DirEntries{obj}, nil
+	}
 	if !strings.HasSuffix(dir, "/") && dir != "" {
 		dir += "/"
 	}
 	names, err := f.readDir(ctx, dir)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error listing %q", dir)
+		return nil, fmt.Errorf("error listing %q: %w", dir, err)
 	}
 	var (
 		entriesMu sync.Mutex // to protect entries
@@ -448,33 +655,31 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		entries = append(entries, entry)
 		entriesMu.Unlock()
 	}
-	for i := 0; i < checkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range checkers {
+		wg.Go(func() {
 			for remote := range in {
 				file := &Object{
 					fs:     f,
 					remote: remote,
 				}
-				switch err := file.stat(ctx); err {
+				switch err := file.head(ctx); err {
 				case nil:
 					add(file)
 				case fs.ErrorNotAFile:
 					// ...found a directory not a file
-					add(fs.NewDir(remote, timeUnset))
+					add(fs.NewDir(remote, time.Time{}))
 				default:
 					fs.Debugf(remote, "skipping because of error: %v", err)
 				}
 			}
-		}()
+		})
 	}
 	for _, name := range names {
 		isDir := name[len(name)-1] == '/'
 		name = strings.TrimRight(name, "/")
 		remote := path.Join(dir, name)
 		if isDir {
-			add(fs.NewDir(remote, timeUnset))
+			add(fs.NewDir(remote, time.Time{}))
 		} else {
 			in <- remote
 		}
@@ -513,6 +718,9 @@ func (o *Object) String() string {
 
 // Remote the name of the remote HTTP file, relative to the fs root
 func (o *Object) Remote() string {
+	if o.contentDispositionFilename != nil {
+		return *o.contentDispositionFilename
+	}
 	return o.remote
 }
 
@@ -536,18 +744,21 @@ func (o *Object) url() string {
 	return o.fs.url(o.remote)
 }
 
-// stat updates the info field in the Object
-func (o *Object) stat(ctx context.Context) error {
+// head sends a HEAD request to update info fields in the Object
+func (o *Object) head(ctx context.Context) error {
 	if o.fs.opt.NoHead {
-		o.size = -1
+		o.size = int64(o.fs.opt.NoHeadSize)
 		o.modTime = timeUnset
+		if o.fs.opt.NoHeadTime.IsSet() {
+			o.modTime = time.Time(o.fs.opt.NoHeadTime)
+		}
 		o.contentType = fs.MimeType(ctx, o)
 		return nil
 	}
 	url := o.url()
 	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
-		return errors.Wrap(err, "stat failed")
+		return fmt.Errorf("stat failed: %w", err)
 	}
 	o.fs.addHeaders(req)
 	res, err := o.fs.httpClient.Do(req)
@@ -556,20 +767,49 @@ func (o *Object) stat(ctx context.Context) error {
 	}
 	err = statusError(res, err)
 	if err != nil {
-		return errors.Wrap(err, "failed to stat")
+		return fmt.Errorf("failed to stat: %w", err)
 	}
+	return o.decodeMetadata(ctx, res)
+}
+
+// decodeMetadata updates info fields in the Object according to HTTP response headers
+func (o *Object) decodeMetadata(ctx context.Context, res *http.Response) error {
 	t, err := http.ParseTime(res.Header.Get("Last-Modified"))
 	if err != nil {
 		t = timeUnset
 	}
-	o.size = parseInt64(res.Header.Get("Content-Length"), -1)
 	o.modTime = t
 	o.contentType = res.Header.Get("Content-Type")
+	o.size = rest.ParseSizeFromHeaders(res.Header)
+	contentDisposition := res.Header.Get("Content-Disposition")
+	if contentDisposition != "" {
+		o.contentDisposition = &contentDisposition
+	}
+	if o.contentDisposition != nil {
+		var filename string
+		filename, err = parseFilename(*o.contentDisposition)
+		if err == nil && filename != "" {
+			o.contentDispositionFilename = &filename
+		}
+	}
+	cacheControl := res.Header.Get("Cache-Control")
+	if cacheControl != "" {
+		o.cacheControl = &cacheControl
+	}
+	contentEncoding := res.Header.Get("Content-Encoding")
+	if contentEncoding != "" {
+		o.contentEncoding = &contentEncoding
+	}
+	contentLanguage := res.Header.Get("Content-Language")
+	if contentLanguage != "" {
+		o.contentLanguage = &contentLanguage
+	}
+
 	// If NoSlash is set then check ContentType to see if it is a directory
 	if o.fs.opt.NoSlash {
 		mediaType, _, err := mime.ParseMediaType(o.contentType)
 		if err != nil {
-			return errors.Wrapf(err, "failed to parse Content-Type: %q", o.contentType)
+			return fmt.Errorf("failed to parse Content-Type: %q: %w", o.contentType, err)
 		}
 		if mediaType == "text/html" {
 			return fs.ErrorNotAFile
@@ -595,7 +835,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	url := o.url()
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "Open failed")
+		return nil, fmt.Errorf("Open failed: %w", err)
 	}
 
 	// Add optional headers
@@ -608,7 +848,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	res, err := o.fs.httpClient.Do(req)
 	err = statusError(res, err)
 	if err != nil {
-		return nil, errors.Wrap(err, "Open failed")
+		return nil, fmt.Errorf("Open failed: %w", err)
+	}
+	if err = o.decodeMetadata(ctx, res); err != nil {
+		return nil, fmt.Errorf("decodeMetadata failed: %w", err)
 	}
 	return res.Body, nil
 }
@@ -643,10 +886,92 @@ func (o *Object) MimeType(ctx context.Context) string {
 	return o.contentType
 }
 
+var commandHelp = []fs.CommandHelp{{
+	Name:  "set",
+	Short: "Set command for updating the config parameters.",
+	Long: `This set command can be used to update the config parameters
+for a running http backend.
+
+Usage examples:
+
+` + "```console" + `
+rclone backend set remote: [-o opt_name=opt_value] [-o opt_name2=opt_value2]
+rclone rc backend/command command=set fs=remote: [-o opt_name=opt_value] [-o opt_name2=opt_value2]
+rclone rc backend/command command=set fs=remote: -o url=https://example.com
+` + "```" + `
+
+The option keys are named as they are in the config file.
+
+This rebuilds the connection to the http backend when it is called with
+the new parameters. Only new parameters need be passed as the values
+will default to those currently in use.
+
+It doesn't return anything.`,
+}}
+
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
+	switch name {
+	case "set":
+		newOpt := f.opt
+		err := configstruct.Set(configmap.Simple(opt), &newOpt)
+		if err != nil {
+			return nil, fmt.Errorf("reading config: %w", err)
+		}
+		_, err = f.httpConnection(ctx, &newOpt)
+		if err != nil {
+			return nil, fmt.Errorf("updating session: %w", err)
+		}
+		f.opt = newOpt
+		keys := []string{}
+		for k := range opt {
+			keys = append(keys, k)
+		}
+		fs.Logf(f, "Updated config values: %s", strings.Join(keys, ", "))
+		return nil, nil
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
+// Metadata returns metadata for an object
+//
+// It should return nil if there is no Metadata
+func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error) {
+	metadata = make(fs.Metadata, 6)
+	if o.contentType != "" {
+		metadata["content-type"] = o.contentType
+	}
+
+	// Set system metadata
+	setMetadata := func(k string, v *string) {
+		if v == nil || *v == "" {
+			return
+		}
+		metadata[k] = *v
+	}
+	setMetadata("content-disposition", o.contentDisposition)
+	setMetadata("content-disposition-filename", o.contentDispositionFilename)
+	setMetadata("cache-control", o.cacheControl)
+	setMetadata("content-language", o.contentLanguage)
+	setMetadata("content-encoding", o.contentEncoding)
+	return metadata, nil
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs          = &Fs{}
 	_ fs.PutStreamer = &Fs{}
 	_ fs.Object      = &Object{}
 	_ fs.MimeTyper   = &Object{}
+	_ fs.Commander   = &Fs{}
+	_ fs.Metadataer  = &Object{}
 )

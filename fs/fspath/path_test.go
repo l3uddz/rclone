@@ -3,7 +3,6 @@ package fspath
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,24 +19,40 @@ var (
 
 func TestCheckConfigName(t *testing.T) {
 	for _, test := range []struct {
-		in   string
-		want error
+		in      string
+		problem error
+		fixed   string
 	}{
-		{"remote", nil},
-		{"", errInvalidCharacters},
-		{":remote:", errInvalidCharacters},
-		{"remote:", errInvalidCharacters},
-		{"rem:ote", errInvalidCharacters},
-		{"rem/ote", errInvalidCharacters},
-		{"rem\\ote", errInvalidCharacters},
-		{"[remote", errInvalidCharacters},
-		{"*", errInvalidCharacters},
-		{"-remote", errCantStartWithDash},
-		{"r-emote-", nil},
-		{"_rem_ote_", nil},
+		{"remote", nil, "remote"},
+		{"REMOTE", nil, "REMOTE"},
+		{"", errInvalidCharacters, "_"},
+		{":remote:", errInvalidCharacters, "_remote_"},
+		{"remote:", errInvalidCharacters, "remote_"},
+		{"rem:ote", errInvalidCharacters, "rem_ote"},
+		{"rem/ote", errInvalidCharacters, "rem_ote"},
+		{"rem\\ote", errInvalidCharacters, "rem_ote"},
+		{"[remote", errInvalidCharacters, "_remote"},
+		{"*", errInvalidCharacters, "_"},
+		{"-remote", errInvalidCharacters, "_remote"},
+		{"r-emote-", nil, "r-emote-"},
+		{"---rem:::ote???", errInvalidCharacters, "_rem_ote_"},
+		{"_rem_ote_", nil, "_rem_ote_"},
+		{".", nil, "."},
+		{"..", nil, ".."},
+		{".r.e.m.o.t.e.", nil, ".r.e.m.o.t.e."},
+		{"rem ote", nil, "rem ote"},
+		{"user@example.com", nil, "user@example.com"},
+		{"user+junkmail@example.com", nil, "user+junkmail@example.com"},
+		{"blåbær", nil, "blåbær"},
+		{"chữ Quốc ngữ", nil, "chữ Quốc ngữ"},
+		{"remote ", errInvalidCharacters, "remote_"},
+		{" remote", errInvalidCharacters, "_remote"},
+		{" remote ", errInvalidCharacters, "_remote_"},
 	} {
-		got := CheckConfigName(test.in)
-		assert.Equal(t, test.want, got, test.in)
+		problem := CheckConfigName(test.in)
+		assert.Equal(t, test.problem, problem, test.in)
+		fixed := MakeConfigName(test.in)
+		assert.Equal(t, test.fixed, fixed, test.in)
 	}
 }
 
@@ -47,8 +62,21 @@ func TestCheckRemoteName(t *testing.T) {
 		want error
 	}{
 		{":remote:", nil},
+		{":REMOTE:", nil},
 		{":s3:", nil},
 		{"remote:", nil},
+		{".:", nil},
+		{"..:", nil},
+		{".r.e.m.o.t.e.:", nil},
+		{"-r-emote-:", errInvalidCharacters},
+		{"rem ote:", nil},
+		{"user@example.com:", nil},
+		{"user+junkmail@example.com:", nil},
+		{"blåbær:", nil},
+		{"chữ Quốc ngữ:", nil},
+		{"remote :", errInvalidCharacters},
+		{" remote:", errInvalidCharacters},
+		{" remote :", errInvalidCharacters},
 		{"", errInvalidCharacters},
 		{"rem:ote", errInvalidCharacters},
 		{"rem:ote:", errInvalidCharacters},
@@ -160,6 +188,27 @@ func TestParse(t *testing.T) {
 				Path:         "path/to/file",
 			},
 		}, {
+			in: ".:",
+			wantParsed: Parsed{
+				ConfigString: ".",
+				Name:         ".",
+				Path:         "",
+			},
+		}, {
+			in: "..:",
+			wantParsed: Parsed{
+				ConfigString: "..",
+				Name:         "..",
+				Path:         "",
+			},
+		}, {
+			in: ".:colon.txt",
+			wantParsed: Parsed{
+				ConfigString: ".",
+				Name:         ".",
+				Path:         "colon.txt",
+			},
+		}, {
 			in: "remote:path/to/file",
 			wantParsed: Parsed{
 				ConfigString: "remote",
@@ -177,13 +226,43 @@ func TestParse(t *testing.T) {
 				Path:         "/path/to/file",
 			},
 		}, {
-			in:      "rem.ote:/path/to/file",
+			in: "rem.ote:/path/to/file",
+			wantParsed: Parsed{
+				ConfigString: "rem.ote",
+				Name:         "rem.ote",
+				Path:         "/path/to/file",
+			},
+		}, {
+			in: "rem ote:/path/to/file",
+			wantParsed: Parsed{
+				ConfigString: "rem ote",
+				Name:         "rem ote",
+				Path:         "/path/to/file",
+			},
+		}, {
+			in:      "remote :/path/to/file",
+			wantErr: errInvalidCharacters,
+		}, {
+			in:      " remote:/path/to/file",
+			wantErr: errInvalidCharacters,
+		}, {
+			in:      " remote :/path/to/file",
+			wantErr: errInvalidCharacters,
+		}, {
+			in:      "rem#ote:/path/to/file",
 			wantErr: errInvalidCharacters,
 		}, {
 			in: ":backend:/path/to/file",
 			wantParsed: Parsed{
 				ConfigString: ":backend",
 				Name:         ":backend",
+				Path:         "/path/to/file",
+			},
+		}, {
+			in: ":back.end:/path/to/file",
+			wantParsed: Parsed{
+				ConfigString: ":back.end",
+				Name:         ":back.end",
 				Path:         "/path/to/file",
 			},
 		}, {
@@ -216,6 +295,20 @@ func TestParse(t *testing.T) {
 			wantParsed: Parsed{
 				Name: "",
 				Path: `\path\to\file`,
+			},
+			noWin: true,
+		}, {
+			in: `.`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `.`,
+			},
+			noWin: true,
+		}, {
+			in: `..`,
+			wantParsed: Parsed{
+				Name: "",
+				Path: `..`,
 			},
 			noWin: true,
 		}, {
@@ -369,7 +462,7 @@ func TestParse(t *testing.T) {
 		if *makeCorpus {
 			// write the test corpus for fuzzing
 			require.NoError(t, os.MkdirAll("corpus", 0777))
-			require.NoError(t, ioutil.WriteFile(fmt.Sprintf("corpus/%02d", testNumber), []byte(test.in), 0666))
+			require.NoError(t, os.WriteFile(fmt.Sprintf("corpus/%02d", testNumber), []byte(test.in), 0666))
 		}
 
 	}
@@ -388,7 +481,17 @@ func TestSplitFs(t *testing.T) {
 		{"remote:/potato", "remote:", "/potato", nil},
 		{"remote:/potato/potato", "remote:", "/potato/potato", nil},
 		{"remote:potato/sausage", "remote:", "potato/sausage", nil},
-		{"rem.ote:potato/sausage", "", "", errInvalidCharacters},
+		{"rem.ote:potato/sausage", "rem.ote:", "potato/sausage", nil},
+
+		{"rem ote:", "rem ote:", "", nil},
+		{"remote :", "", "", errInvalidCharacters},
+		{" remote:", "", "", errInvalidCharacters},
+		{" remote :", "", "", errInvalidCharacters},
+
+		{".:", ".:", "", nil},
+		{"..:", "..:", "", nil},
+		{".:potato/sausage", ".:", "potato/sausage", nil},
+		{"..:potato/sausage", "..:", "potato/sausage", nil},
 
 		{":remote:", ":remote:", "", nil},
 		{":remote:potato", ":remote:", "potato", nil},
@@ -396,7 +499,13 @@ func TestSplitFs(t *testing.T) {
 		{":remote:/potato", ":remote:", "/potato", nil},
 		{":remote:/potato/potato", ":remote:", "/potato/potato", nil},
 		{":remote:potato/sausage", ":remote:", "potato/sausage", nil},
+		{":rem.ote:potato/sausage", ":rem.ote:", "potato/sausage", nil},
 		{":rem[ote:potato/sausage", "", "", errInvalidCharacters},
+
+		{":.:", ":.:", "", nil},
+		{":..:", ":..:", "", nil},
+		{":.:potato/sausage", ":.:", "potato/sausage", nil},
+		{":..:potato/sausage", ":..:", "potato/sausage", nil},
 
 		{"/", "", "/", nil},
 		{"/root", "", "/root", nil},
@@ -429,7 +538,17 @@ func TestSplit(t *testing.T) {
 		{"remote:/potato", "remote:/", "potato", nil},
 		{"remote:/potato/potato", "remote:/potato/", "potato", nil},
 		{"remote:potato/sausage", "remote:potato/", "sausage", nil},
-		{"rem.ote:potato/sausage", "", "", errInvalidCharacters},
+		{"rem.ote:potato/sausage", "rem.ote:potato/", "sausage", nil},
+
+		{"rem ote:", "rem ote:", "", nil},
+		{"remote :", "", "", errInvalidCharacters},
+		{" remote:", "", "", errInvalidCharacters},
+		{" remote :", "", "", errInvalidCharacters},
+
+		{".:", ".:", "", nil},
+		{"..:", "..:", "", nil},
+		{".:potato/sausage", ".:potato/", "sausage", nil},
+		{"..:potato/sausage", "..:potato/", "sausage", nil},
 
 		{":remote:", ":remote:", "", nil},
 		{":remote:potato", ":remote:", "potato", nil},
@@ -437,7 +556,13 @@ func TestSplit(t *testing.T) {
 		{":remote:/potato", ":remote:/", "potato", nil},
 		{":remote:/potato/potato", ":remote:/potato/", "potato", nil},
 		{":remote:potato/sausage", ":remote:potato/", "sausage", nil},
+		{":rem.ote:potato/sausage", ":rem.ote:potato/", "sausage", nil},
 		{":rem[ote:potato/sausage", "", "", errInvalidCharacters},
+
+		{":.:", ":.:", "", nil},
+		{":..:", ":..:", "", nil},
+		{":.:potato/sausage", ":.:potato/", "sausage", nil},
+		{":..:potato/sausage", ":..:potato/", "sausage", nil},
 
 		{"/", "/", "", nil},
 		{"/root", "/", "root", nil},

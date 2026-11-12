@@ -1,7 +1,9 @@
+// Package seafile provides an interface to the Seafile storage system.
 package seafile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +15,6 @@ import (
 	"time"
 
 	"github.com/coreos/go-semver/semver"
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/seafile/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -29,6 +30,7 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -60,42 +62,47 @@ func init() {
 		Config:      Config,
 		Options: []fs.Option{{
 			Name:     configURL,
-			Help:     "URL of seafile host to connect to",
+			Help:     "URL of seafile host to connect to.",
 			Required: true,
 			Examples: []fs.OptionExample{{
 				Value: "https://cloud.seafile.com/",
-				Help:  "Connect to cloud.seafile.com",
+				Help:  "Connect to cloud.seafile.com.",
 			}},
+			Sensitive: true,
 		}, {
-			Name:     configUser,
-			Help:     "User name (usually email address)",
-			Required: true,
+			Name:      configUser,
+			Help:      "User name (usually email address).",
+			Required:  true,
+			Sensitive: true,
 		}, {
 			// Password is not required, it will be left blank for 2FA
 			Name:       configPassword,
-			Help:       "Password",
+			Help:       "Password.",
 			IsPassword: true,
+			Sensitive:  true,
 		}, {
 			Name:    config2FA,
-			Help:    "Two-factor authentication ('true' if the account has 2FA enabled)",
+			Help:    "Two-factor authentication ('true' if the account has 2FA enabled).",
 			Default: false,
 		}, {
 			Name: configLibrary,
-			Help: "Name of the library. Leave blank to access all non-encrypted libraries.",
+			Help: "Name of the library.\n\nLeave blank to access all non-encrypted libraries.",
 		}, {
 			Name:       configLibraryKey,
-			Help:       "Library password (for encrypted libraries only). Leave blank if you pass it through the command line.",
+			Help:       "Library password (for encrypted libraries only).\n\nLeave blank if you pass it through the command line.",
 			IsPassword: true,
+			Sensitive:  true,
 		}, {
 			Name:     configCreateLibrary,
-			Help:     "Should rclone create a library if it doesn't exist",
+			Help:     "Should rclone create a library if it doesn't exist.",
 			Advanced: true,
 			Default:  false,
 		}, {
 			// Keep the authentication token after entering the 2FA code
-			Name: configAuthToken,
-			Help: "Authentication token",
-			Hide: fs.OptionHideBoth,
+			Name:      configAuthToken,
+			Help:      "Authentication token.",
+			Hide:      fs.OptionHideBoth,
+			Sensitive: true,
 		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
@@ -105,7 +112,8 @@ func init() {
 				encoder.EncodeSlash |
 				encoder.EncodeBackSlash |
 				encoder.EncodeDoubleQuote |
-				encoder.EncodeInvalidUtf8),
+				encoder.EncodeInvalidUtf8 |
+				encoder.EncodeDot),
 		}},
 	})
 }
@@ -136,12 +144,22 @@ type Fs struct {
 	features            *fs.Features // optional features
 	endpoint            *url.URL     // URL of the host
 	endpointURL         string       // endpoint as a string
-	srv                 *rest.Client // the connection to the one drive server
+	srv                 *rest.Client // the connection to the server
 	pacer               *fs.Pacer    // pacer for API calls
 	authMu              sync.Mutex   // Mutex to protect library decryption
 	createDirMutex      sync.Mutex   // Protect creation of directories
 	useOldDirectoryAPI  bool         // Use the old API v2 if seafile < 7
 	moveDirNotAvailable bool         // Version < 7.0 don't have an API to move a directory
+	uploadModTime       bool         // Version >= 12.0.4 accepts last_modify when uploading a file
+	renew               *Renew       // Renew an encrypted library token
+}
+
+// minUploadModTimeVersion is the first server version which reads the
+// last_modify field of the upload form
+var minUploadModTimeVersion = *semver.New("12.0.4")
+
+func canUploadModTime(serverVersion *semver.Version) bool {
+	return !serverVersion.LessThan(minUploadModTimeVersion)
 }
 
 // ------------------------------------------------------------
@@ -171,14 +189,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		var err error
 		opt.Password, err = obscure.Reveal(opt.Password)
 		if err != nil {
-			return nil, errors.Wrap(err, "couldn't decrypt user password")
+			return nil, fmt.Errorf("couldn't decrypt user password: %w", err)
 		}
 	}
 	if opt.LibraryKey != "" {
 		var err error
 		opt.LibraryKey, err = obscure.Reveal(opt.LibraryKey)
 		if err != nil {
-			return nil, errors.Wrap(err, "couldn't decrypt library password")
+			return nil, fmt.Errorf("couldn't decrypt library password: %w", err)
 		}
 	}
 
@@ -197,7 +215,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:           *opt,
 		endpoint:      u,
 		endpointURL:   u.String(),
-		srv:           rest.NewClient(fshttp.NewClient(ctx)).SetRoot(u.String()),
+		srv:           rest.NewClient(newClient(ctx)).SetRoot(u.String()),
 		pacer:         getPacer(ctx, opt.URL),
 	}
 	f.features = (&fs.Features{
@@ -223,6 +241,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// It also does no support moving directories
 		f.moveDirNotAvailable = true
 	}
+	f.uploadModTime = canUploadModTime(serverVersion)
 
 	// Take the authentication token from the configuration first
 	token := f.opt.AuthToken
@@ -267,6 +286,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			}
 			// And remove the public link feature
 			f.features.PublicLink = nil
+
+			// renew the library password every 45 minutes
+			f.renew = NewRenew(45*time.Minute, func() error {
+				return f.authorizeLibrary(context.Background(), libraryID)
+			})
 		}
 	} else {
 		// Deactivate the cleaner feature since there's no library selected
@@ -282,12 +306,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 		_, err := f.NewObject(ctx, remote)
 		if err != nil {
-			if errors.Cause(err) == fs.ErrorObjectNotFound || errors.Cause(err) == fs.ErrorNotAFile {
+			if errors.Is(err, fs.ErrorObjectNotFound) || errors.Is(err, fs.ErrorNotAFile) {
 				// File doesn't exist so return the original f
 				f.rootDirectory = rootDirectory
 				return f, nil
 			}
 			return f, err
+		}
+		// Correct root if definitely pointing to a file
+		f.root = path.Dir(f.root)
+		if f.root == "." || f.root == "/" {
+			f.root = ""
 		}
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
@@ -296,86 +325,110 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 }
 
 // Config callback for 2FA
-func Config(ctx context.Context, name string, m configmap.Mapper) {
-	ci := fs.GetConfig(ctx)
+func Config(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 	serverURL, ok := m.Get(configURL)
 	if !ok || serverURL == "" {
 		// If there's no server URL, it means we're trying an operation at the backend level, like a "rclone authorize seafile"
-		fmt.Print("\nOperation not supported on this remote.\nIf you need a 2FA code on your account, use the command:\n\nrclone config reconnect <remote name>:\n\n")
-		return
-	}
-
-	// Stop if we are running non-interactive config
-	if ci.AutoConfirm {
-		return
+		return nil, errors.New("operation not supported on this remote. If you need a 2FA code on your account, use the command: rclone config reconnect <remote name>: ")
 	}
 
 	u, err := url.Parse(serverURL)
 	if err != nil {
-		fs.Errorf(nil, "Invalid server URL %s", serverURL)
-		return
+		return nil, fmt.Errorf("invalid server URL %s", serverURL)
 	}
 
 	is2faEnabled, _ := m.Get(config2FA)
 	if is2faEnabled != "true" {
-		fmt.Println("Two-factor authentication is not enabled on this account.")
-		return
+		// no need to do anything here
+		return nil, nil
 	}
 
 	username, _ := m.Get(configUser)
 	if username == "" {
-		fs.Errorf(nil, "A username is required")
-		return
+		return nil, errors.New("a username is required")
 	}
 
 	password, _ := m.Get(configPassword)
 	if password != "" {
 		password, _ = obscure.Reveal(password)
 	}
-	// Just make sure we do have a password
-	for password == "" {
-		fmt.Print("Two-factor authentication: please enter your password (it won't be saved in the configuration)\npassword> ")
-		password = config.ReadPassword()
-	}
 
-	// Create rest client for getAuthorizationToken
-	url := u.String()
-	if !strings.HasPrefix(url, "/") {
-		url += "/"
-	}
-	srv := rest.NewClient(fshttp.NewClient(ctx)).SetRoot(url)
-
-	// We loop asking for a 2FA code
-	for {
-		code := ""
-		for code == "" {
-			fmt.Print("Two-factor authentication: please enter your 2FA code\n2fa code> ")
-			code = config.ReadLine()
+	switch config.State {
+	case "":
+		// Empty state means it's the first call to the Config function
+		if password == "" {
+			return fs.ConfigPassword("password", "config_password", "Two-factor authentication: please enter your password (it won't be saved in the configuration)")
+		}
+		// password was successfully loaded from the config
+		return fs.ConfigGoto("2fa")
+	case "password":
+		// password should be coming from the previous state (entered by the user)
+		password = config.Result
+		if password == "" {
+			return fs.ConfigError("", "Password can't be blank")
+		}
+		// save it into the configuration file and keep going
+		m.Set(configPassword, obscure.MustObscure(password))
+		return fs.ConfigGoto("2fa")
+	case "2fa":
+		return fs.ConfigInput("2fa_do", "config_2fa", "Two-factor authentication: please enter your 2FA code")
+	case "2fa_do":
+		code := config.Result
+		if code == "" {
+			return fs.ConfigError("2fa", "2FA codes can't be blank")
 		}
 
+		// Create rest client for getAuthorizationToken
+		url := u.String()
+		if !strings.HasSuffix(url, "/") {
+			url += "/"
+		}
+		srv := rest.NewClient(newClient(ctx)).SetRoot(url)
+
+		// We loop asking for a 2FA code
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		fmt.Println("Authenticating...")
 		token, err := getAuthorizationToken(ctx, srv, username, password, code)
 		if err != nil {
-			fmt.Printf("Authentication failed: %v\n", err)
-			tryAgain := strings.ToLower(config.ReadNonEmptyLine("Do you want to try again (y/n)?"))
-			if tryAgain != "y" && tryAgain != "yes" {
-				// The user is giving up, we're done here
-				break
-			}
+			return fs.ConfigConfirm("2fa_error", true, "config_retry", fmt.Sprintf("Authentication failed: %v\n\nTry Again?", err))
 		}
-		if token != "" {
-			fmt.Println("Success!")
-			// Let's save the token into the configuration
-			m.Set(configAuthToken, token)
-			// And delete any previous entry for password
-			m.Set(configPassword, "")
-			// And we're done here
-			break
+		if token == "" {
+			return fs.ConfigConfirm("2fa_error", true, "config_retry", "Authentication failed - no token returned.\n\nTry Again?")
 		}
+		// Let's save the token into the configuration
+		m.Set(configAuthToken, token)
+		// And delete any previous entry for password
+		m.Set(configPassword, "")
+		// And we're done here
+		return nil, nil
+	case "2fa_error":
+		if config.Result == "true" {
+			return fs.ConfigGoto("2fa")
+		}
+		return nil, errors.New("2fa authentication failed")
 	}
+	return nil, fmt.Errorf("unknown state %q", config.State)
+}
+
+// newClient returns the HTTP client used to talk to the Seafile API.
+//
+// It refuses redirects which downgrade HTTPS to plaintext HTTP as
+// following one would send the authorization token, or the password
+// during configuration, in cleartext.
+func newClient(ctx context.Context) *http.Client {
+	client := fshttp.NewClient(ctx)
+	client.CheckRedirect = rest.RefuseHTTPSDowngradeRedirectFn
+	return client
+}
+
+// Shutdown the Fs
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.renew == nil {
+		return nil
+	}
+	f.renew.Shutdown()
+	return nil
 }
 
 // sets the AuthorizationToken up
@@ -449,7 +502,7 @@ func (f *Fs) Root() string {
 // String converts this Fs to a string
 func (f *Fs) String() string {
 	if f.libraryName == "" {
-		return fmt.Sprintf("seafile root")
+		return "seafile root"
 	}
 	library := "library"
 	if f.encrypted {
@@ -463,7 +516,10 @@ func (f *Fs) String() string {
 
 // Precision of the ModTimes in this Fs
 func (f *Fs) Precision() time.Duration {
-	// The API doesn't support setting the modified time
+	// The modification time can only be set when uploading, and only from v12.0.4
+	if f.uploadModTime {
+		return time.Second
+	}
 	return fs.ModTimeNotSupported
 }
 
@@ -519,7 +575,6 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	o := &Object{
 		fs:            f,
 		libraryID:     libraryID,
-		id:            fileDetails.ID,
 		remote:        remote,
 		pathInLibrary: filePath,
 		modTime:       modTime,
@@ -667,9 +722,9 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 
 // Copy src to this remote using server-side copy operations.
 //
-// This is stored with the remote path given
+// This is stored with the remote path given.
 //
-// It returns the destination Object and a possible error
+// It returns the destination Object and a possible error.
 //
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
@@ -718,9 +773,9 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 // Move src to this remote using server-side move operations.
 //
-// This is stored with the remote path given
+// This is stored with the remote path given.
 //
-// It returns the destination Object and a possible error
+// It returns the destination Object and a possible error.
 //
 // If it isn't possible then return fs.ErrorCantMove
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
@@ -882,7 +937,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// 1- rename source
 	err = srcFs.renameDir(ctx, srcLibraryID, srcPath, tempName)
 	if err != nil {
-		return errors.Wrap(err, "Cannot rename source directory to a temporary name")
+		return fmt.Errorf("cannot rename source directory to a temporary name: %w", err)
 	}
 
 	// 2- move source to destination
@@ -896,7 +951,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// 3- rename destination back to source name
 	err = f.renameDir(ctx, dstLibraryID, path.Join(dstDir, tempName), dstName)
 	if err != nil {
-		return errors.Wrap(err, "Cannot rename temporary directory to destination name")
+		return fmt.Errorf("cannot rename temporary directory to destination name: %w", err)
 	}
 
 	return nil
@@ -919,7 +974,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // CleanUp the trash in the Fs
 func (f *Fs) CleanUp(ctx context.Context) error {
 	if f.libraryName == "" {
-		return errors.New("Cannot clean up at the root of the seafile server: please select a library to clean up")
+		return errors.New("cannot clean up at the root of the seafile server, please select a library to clean up")
 	}
 	libraryID, err := f.getLibraryID(ctx, f.libraryName)
 	if err != nil {
@@ -968,7 +1023,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	libraryName, filePath := f.splitPath(remote)
 	if libraryName == "" {
 		// We cannot share the whole seafile server, we need at least a library
-		return "", errors.New("Cannot share the root of the seafile server. Please select a library to share")
+		return "", errors.New("cannot share the root of the seafile server, please select a library to share")
 	}
 	libraryID, err := f.getLibraryID(ctx, libraryName)
 	if err != nil {
@@ -980,9 +1035,9 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	if err != nil {
 		return "", err
 	}
-	if shareLinks != nil && len(shareLinks) > 0 {
+	if len(shareLinks) > 0 {
 		for _, shareLink := range shareLinks {
-			if shareLink.IsExpired == false {
+			if !shareLink.IsExpired {
 				return shareLink.Link, nil
 			}
 		}
@@ -1049,7 +1104,7 @@ func (f *Fs) isLibraryInCache(libraryName string) bool {
 		return false
 	}
 	value, found := f.libraries.GetMaybe(librariesCacheKey)
-	if found == false {
+	if !found {
 		return false
 	}
 	libraries := value.([]api.Library)
@@ -1126,7 +1181,7 @@ func (f *Fs) mkLibrary(ctx context.Context, libraryName, password string) error 
 	}
 	// Stores the library details into the cache
 	value, found := f.libraries.GetMaybe(librariesCacheKey)
-	if found == false {
+	if !found {
 		// Don't update the cache at that point
 		return nil
 	}
@@ -1139,7 +1194,11 @@ func (f *Fs) mkLibrary(ctx context.Context, libraryName, password string) error 
 	return nil
 }
 
-// splitPath returns the library name and the full path inside the library
+// splitPath returns the library name and the full path inside the library.
+//
+// The path is returned in NFC: Seafile stores names in NFC whatever form it
+// is given but looks them up byte for byte. Library names are stored verbatim
+// so they are left untouched.
 func (f *Fs) splitPath(dir string) (library, folder string) {
 	library = f.libraryName
 	folder = dir
@@ -1150,6 +1209,7 @@ func (f *Fs) splitPath(dir string) (library, folder string) {
 		// Adds the root folder to the path to get a full path
 		folder = path.Join(f.rootDirectory, folder)
 	}
+	folder = norm.NFC.String(folder)
 	return
 }
 
@@ -1208,7 +1268,6 @@ func (f *Fs) buildDirEntries(parentPath, libraryID, parentPathInLibrary string, 
 		} else if entry.Type == api.FileTypeFile {
 			object := &Object{
 				fs:            f,
-				id:            entry.ID,
 				remote:        filePath,
 				pathInLibrary: filePathInLibrary,
 				size:          entry.Size,
@@ -1283,7 +1342,7 @@ func (f *Fs) getCachedLibraries(ctx context.Context) ([]api.Library, error) {
 	f.librariesMutex.Lock()
 	defer f.librariesMutex.Unlock()
 
-	libraries, err := f.libraries.Get(librariesCacheKey, func(key string) (value interface{}, ok bool, error error) {
+	libraries, err := f.libraries.Get(librariesCacheKey, func(key string) (value any, ok bool, error error) {
 		// Load the libraries if not present in the cache
 		libraries, err := f.getLibraries(ctx)
 		if err != nil {
@@ -1326,6 +1385,6 @@ var (
 	_ fs.PutStreamer  = &Fs{}
 	_ fs.PublicLinker = &Fs{}
 	_ fs.UserInfoer   = &Fs{}
+	_ fs.Shutdowner   = &Fs{}
 	_ fs.Object       = &Object{}
-	_ fs.IDer         = &Object{}
 )

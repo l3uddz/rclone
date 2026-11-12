@@ -1,10 +1,10 @@
 ---
 title: "HTTP Remote"
 description: "Read only remote for HTTP servers"
+versionIntroduced: "v1.37"
 ---
 
-{{< icon "fa fa-globe" >}} HTTP
--------------------------------------------------
+# HTTP
 
 The HTTP remote is a read only remote for reading files of a
 webserver.  The webserver should provide file listings which rclone
@@ -13,17 +13,42 @@ webservers such as Apache/Nginx/Caddy and will likely work with file
 listings from most web servers.  (If it doesn't then please file an
 issue, or send a pull request!)
 
-Paths are specified as `remote:` or `remote:path/to/dir`.
+Paths are specified as `remote:` or `remote:path`.
+
+The `remote:` represents the configured [url](#http-url), and any path following
+it will be resolved relative to this url, according to the URL standard. This
+means with remote url `https://beta.rclone.org/branch` and path `fix`, the
+resolved URL will be `https://beta.rclone.org/branch/fix`, while with path
+`/fix` the resolved URL will be `https://beta.rclone.org/fix` as the absolute
+path is resolved from the root of the domain. The path can't change the scheme,
+host or user of the configured url, so a path such as `//other.example.com/fix`
+is rejected.
+
+If the path following the `remote:` ends with `/` it will be assumed to point
+to a directory. If the path does not end with `/`, then a HEAD request is sent
+and the response used to decide if it is treated as a file or a directory
+(run with `-vv` to see details). When [--http-no-head](#http-no-head) is
+specified, a path without ending `/` is always assumed to be a file. If rclone
+incorrectly assumes the path is a file, the solution is to specify the path with
+ending `/`. When you know the path is a directory, ending it with `/` is always
+better as it avoids the initial HEAD request.
+
+To just download a single file it is easier to use
+[copyurl](/commands/rclone_copyurl/).
+
+## Configuration
 
 Here is an example of how to make a remote called `remote`.  First
 run:
 
-     rclone config
+```console
+rclone config
+```
 
 This will guide you through an interactive setup process:
 
-```
-No remotes found - make a new one
+```text
+No remotes found, make a new one?
 n) New remote
 s) Set configuration password
 q) Quit config
@@ -32,7 +57,7 @@ name> remote
 Type of storage to configure.
 Choose a number from below, or type in your own value
 [snip]
-XX / http Connection
+XX / HTTP
    \ "http"
 [snip]
 Storage> http
@@ -42,10 +67,11 @@ Choose a number from below, or type in your own value
    \ "https://example.com"
 url> https://beta.rclone.org
 Remote config
---------------------
-[remote]
-url = https://beta.rclone.org
---------------------
+Configuration complete.
+Options:
+- type: http
+- url: https://beta.rclone.org
+Keep this "remote" remote?
 y) Yes this is OK
 e) Edit this remote
 d) Delete this remote
@@ -70,71 +96,130 @@ This remote is called `remote` and can now be used like this
 
 See all the top level directories
 
-    rclone lsd remote:
+```console
+rclone lsd remote:
+```
 
 List the contents of a directory
 
-    rclone ls remote:directory
+```console
+rclone ls remote:directory
+```
 
 Sync the remote `directory` to `/home/local/directory`, deleting any excess files.
 
-    rclone sync -i remote:directory /home/local/directory
+```console
+rclone sync --interactive remote:directory /home/local/directory
+```
 
-### Read only ###
+### Read only
 
 This remote is read only - you can't upload files to an HTTP server.
 
-### Modified time ###
+### Servers without directory listings
+
+Rclone normally needs the HTTP server to return a parseable directory
+listing in order to discover files. However if the path points
+directly at a single file (i.e. it does not end with `/` and the
+initial HEAD request reports it as a file), rclone will skip the
+parent directory listing entirely and access the file directly.
+
+This means rclone can be used to download individual files on HTTP
+servers that have directory listings disabled, as long as you know the
+exact URL of each file. For example, given a server that serves
+`https://example.com/path/file.txt` but returns an error or an
+unparseable response for `https://example.com/path/`:
+
+```console
+rclone copy --http-url https://example.com :http:path/file.txt /tmp/
+```
+
+You can use this as a remote in other rclone commands too:
+
+```console
+rclone hashsum crc32 --http-url "https://getsamplefiles.com" :archive::http:download/zip/sample-1.zip
+```
+
+If you just want to download a file or multiple files by URL then
+using [copyurl](/commands/rclone_copyurl/) is more efficient.
+
+### Modification times
 
 Most HTTP servers store time accurate to 1 second.
 
-### Checksum ###
+### Checksum
 
 No checksums are stored.
 
-### Usage without a config file ###
+### Usage without a config file
 
 Since the http remote only has one config parameter it is easy to use
 without a config file:
 
-    rclone lsd --http-url https://beta.rclone.org :http:
+```console
+rclone lsd --http-url https://beta.rclone.org :http:
+```
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/http/http.go then run make backenddocs" >}}
-### Standard Options
+or:
 
-Here are the standard options specific to http (http Connection).
+```console
+rclone lsd :http,url='https://beta.rclone.org':
+```
+
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/http/http.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
+### Standard options
+
+Here are the Standard options specific to http (HTTP).
 
 #### --http-url
 
-URL of http host to connect to
+URL of HTTP host to connect to.
+
+E.g. "https://example.com", or "https://user:pass@example.com" to use a username and password.
+
+Properties:
 
 - Config:      url
 - Env Var:     RCLONE_HTTP_URL
 - Type:        string
-- Default:     ""
-- Examples:
-    - "https://example.com"
-        - Connect to example.com
-    - "https://user:pass@example.com"
-        - Connect to example.com using a username and password
+- Required:    true
 
-### Advanced Options
+#### --http-no-escape
 
-Here are the advanced options specific to http (http Connection).
+Do not escape URL metacharacters in path names.
+
+Properties:
+
+- Config:      no_escape
+- Env Var:     RCLONE_HTTP_NO_ESCAPE
+- Type:        bool
+- Default:     false
+
+### Advanced options
+
+Here are the Advanced options specific to http (HTTP).
 
 #### --http-headers
 
-Set HTTP headers for all transactions
+Set HTTP headers for all transactions.
 
-Use this to set additional HTTP headers for all transactions
+Use this to set additional HTTP headers for all transactions.
 
 The input format is comma separated list of key,value pairs.  Standard
 [CSV encoding](https://godoc.org/encoding/csv) may be used.
 
-For example to set a Cookie use 'Cookie,name=value', or '"Cookie","name=value"'.
+For example, to set a Cookie use 'Cookie,name=value', or '"Cookie","name=value"'.
 
 You can set multiple headers, e.g. '"Cookie","name=value","Authorization","xxx"'.
 
+The headers are only sent to the host in the configured URL. If the
+server redirects to another host (including a subdomain or a different
+port) the headers are not sent to it, or to any further hop in that
+redirect chain. When headers are set, a redirect from https to http is
+refused as it would send them in cleartext, even with
+--allow-https-downgrade.
+
+Properties:
 
 - Config:      headers
 - Env Var:     RCLONE_HTTP_HEADERS
@@ -143,7 +228,7 @@ You can set multiple headers, e.g. '"Cookie","name=value","Authorization","xxx"'
 
 #### --http-no-slash
 
-Set this if the site doesn't end directories with /
+Set this if the site doesn't end directories with /.
 
 Use this if your target website does not use / on the end of
 directories.
@@ -156,6 +241,8 @@ URLs from them rather than downloading them.
 Note that this may cause rclone to confuse genuine HTML files with
 directories.
 
+Properties:
+
 - Config:      no_slash
 - Env Var:     RCLONE_HTTP_NO_SLASH
 - Type:        bool
@@ -163,8 +250,9 @@ directories.
 
 #### --http-no-head
 
-Don't use HEAD requests to find file sizes in dir listing
+Don't use HEAD requests.
 
+HEAD requests are mainly used to find file sizes in dir listing.
 If your site is being very slow to load then you can try this option.
 Normally rclone does a HEAD request for each potential file in a
 directory listing to:
@@ -173,20 +261,129 @@ directory listing to:
 - check it really exists
 - check to see if it is a directory
 
-If you set this option, rclone will not do the HEAD request.  This will mean
+If you set this option, rclone will not do the HEAD request. This will mean
+that directory listings are much quicker, but rclone won't have the times or
+sizes of any files, and some files that don't exist may be in the listing.
 
-- directory listings are much quicker
-- rclone won't have the times or sizes of any files
-- some files that don't exist may be in the listing
-
+Properties:
 
 - Config:      no_head
 - Env Var:     RCLONE_HTTP_NO_HEAD
 - Type:        bool
 - Default:     false
 
-{{< rem autogenerated options stop >}}
-### Limitations
+#### --http-no-head-size
+
+Set the reported file size for --http-no-head.
+
+When HEAD requests are disabled, rclone normally reports an unknown file size.
+Set this option to a non-negative value to report that size for every file,
+including 0. Leave it unset (the default, shown as "off") to keep reporting
+an unknown size.
+
+The configured size is authoritative. If it does not match the actual file
+size, transfers may fail their size check and retry unless --ignore-size is
+used. It can also make multi-thread transfers request incorrect ranges and
+make mounted files unreadable past the reported size.
+
+Properties:
+
+- Config:      no_head_size
+- Env Var:     RCLONE_HTTP_NO_HEAD_SIZE
+- Type:        SizeSuffix
+- Default:     off
+
+#### --http-no-head-time
+
+Set a default modification time for --http-no-head.
+
+When HEAD requests are disabled, rclone normally reports an unset modification
+time. Set this option to report the specified time for every file instead.
+Changing the configured time later makes every file appear modified to a sync.
+
+Properties:
+
+- Config:      no_head_time
+- Env Var:     RCLONE_HTTP_NO_HEAD_TIME
+- Type:        Time
+- Default:     off
+
+#### --http-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_HTTP_DESCRIPTION
+- Type:        string
+- Required:    false
+
+### Metadata
+
+HTTP metadata keys are case insensitive and are always returned in lower case.
+
+Here are the possible system metadata items for the http backend.
+
+| Name | Help | Type | Example | Read Only |
+|------|------|------|---------|-----------|
+| cache-control | Cache-Control header | string | no-cache | N |
+| content-disposition | Content-Disposition header | string | inline | N |
+| content-disposition-filename | Filename retrieved from Content-Disposition header | string | file.txt | N |
+| content-encoding | Content-Encoding header | string | gzip | N |
+| content-language | Content-Language header | string | en-US | N |
+| content-type | Content-Type header | string | text/plain | N |
+
+See the [metadata](/docs/#metadata) docs for more info.
+
+## Backend commands
+
+Here are the commands specific to the http backend.
+
+Run them with:
+
+```console
+rclone backend COMMAND remote:
+```
+
+The help below will explain what arguments each command takes.
+
+See the [backend](/commands/rclone_backend/) command for more
+info on how to pass options and arguments.
+
+These can be run on a running backend using the rc command
+[backend/command](/rc/#backend-command).
+
+### set
+
+Set command for updating the config parameters.
+
+```console
+rclone backend set remote: [options] [<arguments>+]
+```
+
+This set command can be used to update the config parameters
+for a running http backend.
+
+Usage examples:
+
+```console
+rclone backend set remote: [-o opt_name=opt_value] [-o opt_name2=opt_value2]
+rclone rc backend/command command=set fs=remote: [-o opt_name=opt_value] [-o opt_name2=opt_value2]
+rclone rc backend/command command=set fs=remote: -o url=https://example.com
+```
+
+The option keys are named as they are in the config file.
+
+This rebuilds the connection to the http backend when it is called with
+the new parameters. Only new parameters need be passed as the values
+will default to those currently in use.
+
+It doesn't return anything.
+
+<!-- autogenerated options stop -->
+
+## Limitations
 
 `rclone about` is not supported by the HTTP backend. Backends without
 this capability cannot determine free space for an rclone mount or
@@ -194,5 +391,4 @@ use policy `mfs` (most free space) as a member of an rclone union
 remote.
 
 See [List of backends that do not support rclone about](https://rclone.org/overview/#optional-features)
-See [rclone about](https://rclone.org/commands/rclone_about/)
-
+and [rclone about](https://rclone.org/commands/rclone_about/).

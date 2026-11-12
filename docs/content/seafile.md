@@ -1,36 +1,44 @@
 ---
 title: "Seafile"
 description: "Seafile"
+versionIntroduced: "v1.52"
 ---
 
-{{< icon "fa fa-server" >}}Seafile
-----------------------------------------
+# Seafile
 
 This is a backend for the [Seafile](https://www.seafile.com/) storage service:
+
 - It works with both the free community edition or the professional edition.
-- Seafile versions 6.x and 7.x are all supported.
+- Seafile versions 6.x, 7.x, 8.x and 9.x are all supported.
 - Encrypted libraries are also supported.
 - It supports 2FA enabled users
+- Using a Library API Token is **not** supported
 
-### Root mode vs Library mode ###
+## Configuration
 
 There are two distinct modes you can setup your remote:
-- you point your remote to the **root of the server**, meaning you don't specify a library during the configuration:
-Paths are specified as `remote:library`. You may put subdirectories in too, e.g. `remote:library/path/to/dir`.
+
+- you point your remote to the **root of the server**, meaning you don't
+  specify a library during the configuration: Paths are specified as
+  `remote:library`. You may put subdirectories in too, e.g. `remote:library/path/to/dir`.
 - you point your remote to a specific library during the configuration:
-Paths are specified as `remote:path/to/dir`. **This is the recommended mode when using encrypted libraries**. (_This mode is possibly slightly faster than the root mode_)
+  Paths are specified as `remote:path/to/dir`. **This is the recommended mode when using encrypted libraries**.
+  (*This mode is possibly slightly faster than the root mode*)
 
-### Configuration in root mode ###
+### Configuration in root mode
 
-Here is an example of making a seafile configuration for a user with **no** two-factor authentication.  First run
+Here is an example of making a seafile configuration for a user with **no**
+two-factor authentication.  First run
 
-    rclone config
+```console
+rclone config
+```
 
 This will guide you through an interactive setup process. To authenticate
 you will need the URL of your server, your email (or username) and your password.
 
-```
-No remotes found - make a new one
+```text
+No remotes found, make a new one\?
 n) New remote
 s) Set configuration password
 q) Quit config
@@ -95,31 +103,42 @@ d) Delete this remote
 y/e/d> y
 ```
 
-This remote is called `seafile`. It's pointing to the root of your seafile server and can now be used like this:
+This remote is called `seafile`. It's pointing to the root of your seafile
+server and can now be used like this:
 
 See all libraries
 
-    rclone lsd seafile:
+```console
+rclone lsd seafile:
+```
 
 Create a new library
 
-    rclone mkdir seafile:library
+```console
+rclone mkdir seafile:library
+```
 
 List the contents of a library
 
-    rclone ls seafile:library
+```console
+rclone ls seafile:library
+```
 
 Sync `/home/local/directory` to the remote library, deleting any
 excess files in the library.
 
-    rclone sync -i /home/local/directory seafile:library
-
-### Configuration in library mode ###
-
-Here's an example of a configuration in library mode with a user that has the two-factor authentication enabled. Your 2FA code will be asked at the end of the configuration, and will attempt to authenticate you:
-
+```console
+rclone sync --interactive /home/local/directory seafile:library
 ```
-No remotes found - make a new one
+
+### Configuration in library mode
+
+Here's an example of a configuration in library mode with a user that has the
+two-factor authentication enabled. Your 2FA code will be asked at the end of
+the configuration, and will attempt to authenticate you:
+
+```text
+No remotes found, make a new one\?
 n) New remote
 s) Set configuration password
 q) Quit config
@@ -188,38 +207,69 @@ d) Delete this remote
 y/e/d> y
 ```
 
-You'll notice your password is blank in the configuration. It's because we only need the password to authenticate you once.
+You'll notice your password is blank in the configuration. It's because we only
+need the password to authenticate you once.
 
-You specified `My Library` during the configuration. The root of the remote is pointing at the
-root of the library `My Library`:
+You specified `My Library` during the configuration. The root of the remote is
+pointing at the root of the library `My Library`:
 
 See all files in the library:
 
-    rclone lsd seafile:
+```console
+rclone lsd seafile:
+```
 
 Create a new directory inside the library
 
-    rclone mkdir seafile:directory
+```console
+rclone mkdir seafile:directory
+```
 
 List the contents of a directory
 
-    rclone ls seafile:directory
+```console
+rclone ls seafile:directory
+```
 
 Sync `/home/local/directory` to the remote library, deleting any
 excess files in the library.
 
-    rclone sync -i /home/local/directory seafile:
+```console
+rclone sync --interactive /home/local/directory seafile:
+```
 
-
-### --fast-list ###
+### --fast-list
 
 Seafile version 7+ supports `--fast-list` which allows you to use fewer
 transactions in exchange for more memory. See the [rclone
 docs](/docs/#fast-list) for more details.
 Please note this is not supported on seafile server version 6.x
 
+### Modification times and hashes
 
-#### Restricted filename characters
+Seafile doesn't support hashes.
+
+From Seafile server version 12.0.4, rclone sends the modification time of
+a file when uploading it, and Seafile keeps it with an accuracy of 1 second.
+The modification time can't be changed without uploading the file again, so
+when only the modification time differs rclone uploads the file again.
+Server-side copy and move keep the modification time.
+
+With older servers the modification time is the time of the upload, and
+rclone compares files by size only.
+
+Files uploaded by older rclone versions, or to a server older than 12.0.4,
+have the time of the upload as their modification time. On a server from
+12.0.4, the first `rclone sync` or `rclone copy` with this version uploads
+them once more, as their modification time differs from the source. To
+avoid that, keep comparing by size with `--size-only`.
+
+The first `rclone bisync` run with this version on a server from 12.0.4
+stops with "all files were changed", as the listings written by older
+versions hold the modification times of the source for the remote. Run it
+once with `--resync`, which uploads the files again.
+
+### Restricted filename characters
 
 In addition to the [default restricted characters set](/overview/#restricted-characters)
 the following characters are also replaced:
@@ -233,77 +283,97 @@ the following characters are also replaced:
 Invalid UTF-8 bytes will also be [replaced](/overview/#invalid-utf8),
 as they can't be used in JSON strings.
 
-### Seafile and rclone link ###
+Seafile stores file and directory names in Unicode NFC form whatever form
+they are uploaded in, so rclone normalizes names to NFC before sending them.
+Listings therefore always show NFC names, even for files created with
+decomposed (NFD) names as macOS produces them. Library names are not
+normalized as Seafile keeps them exactly as entered.
+
+### Seafile and rclone link
 
 Rclone supports generating share links for non-encrypted libraries only.
 They can either be for a file or a directory:
 
-```
-rclone link seafile:seafile-tutorial.doc
+```console
+$ rclone link seafile:seafile-tutorial.doc
 http://my.seafile.server/f/fdcd8a2f93f84b8b90f4/
 
 ```
 
 or if run on a directory you will get:
 
-```
-rclone link seafile:dir
+```console
+$ rclone link seafile:dir
 http://my.seafile.server/d/9ea2455f6f55478bbb0d/
 ```
 
-Please note a share link is unique for each file or directory. If you run a link command on a file/dir
-that has already been shared, you will get the exact same link.
+Please note a share link is unique for each file or directory. If you run a link
+command on a file/dir that has already been shared, you will get the exact same link.
 
-### Compatibility ###
+### Compatibility
 
-It has been actively tested using the [seafile docker image](https://github.com/haiwen/seafile-docker) of these versions:
+It has been actively developed using the [seafile docker image](https://github.com/haiwen/seafile-docker)
+of these versions:
+
 - 6.3.4 community edition
 - 7.0.5 community edition
 - 7.1.3 community edition
+- 9.0.10 community edition
 
 Versions below 6.0 are not supported.
 Versions between 6.0 and 6.3 haven't been tested and might not work properly.
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/seafile/seafile.go then run make backenddocs" >}}
-### Standard Options
+Each new version of `rclone` is automatically tested against the [latest docker image](https://hub.docker.com/r/seafileltd/seafile-mc/)
+of the seafile community server.
 
-Here are the standard options specific to seafile (seafile).
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/seafile/seafile.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
+### Standard options
+
+Here are the Standard options specific to seafile (seafile).
 
 #### --seafile-url
 
-URL of seafile host to connect to
+URL of seafile host to connect to.
+
+Properties:
 
 - Config:      url
 - Env Var:     RCLONE_SEAFILE_URL
 - Type:        string
-- Default:     ""
+- Required:    true
 - Examples:
-    - "https://cloud.seafile.com/"
-        - Connect to cloud.seafile.com
+  - "https://cloud.seafile.com/"
+    - Connect to cloud.seafile.com.
 
 #### --seafile-user
 
-User name (usually email address)
+User name (usually email address).
+
+Properties:
 
 - Config:      user
 - Env Var:     RCLONE_SEAFILE_USER
 - Type:        string
-- Default:     ""
+- Required:    true
 
 #### --seafile-pass
 
-Password
+Password.
 
 **NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
+
+Properties:
 
 - Config:      pass
 - Env Var:     RCLONE_SEAFILE_PASS
 - Type:        string
-- Default:     ""
+- Required:    false
 
 #### --seafile-2fa
 
-Two-factor authentication ('true' if the account has 2FA enabled)
+Two-factor authentication ('true' if the account has 2FA enabled).
+
+Properties:
 
 - Config:      2fa
 - Env Var:     RCLONE_SEAFILE_2FA
@@ -312,40 +382,41 @@ Two-factor authentication ('true' if the account has 2FA enabled)
 
 #### --seafile-library
 
-Name of the library. Leave blank to access all non-encrypted libraries.
+Name of the library.
+
+Leave blank to access all non-encrypted libraries.
+
+Properties:
 
 - Config:      library
 - Env Var:     RCLONE_SEAFILE_LIBRARY
 - Type:        string
-- Default:     ""
+- Required:    false
 
 #### --seafile-library-key
 
-Library password (for encrypted libraries only). Leave blank if you pass it through the command line.
+Library password (for encrypted libraries only).
+
+Leave blank if you pass it through the command line.
 
 **NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).
+
+Properties:
 
 - Config:      library_key
 - Env Var:     RCLONE_SEAFILE_LIBRARY_KEY
 - Type:        string
-- Default:     ""
+- Required:    false
 
-#### --seafile-auth-token
+### Advanced options
 
-Authentication token
-
-- Config:      auth_token
-- Env Var:     RCLONE_SEAFILE_AUTH_TOKEN
-- Type:        string
-- Default:     ""
-
-### Advanced Options
-
-Here are the advanced options specific to seafile (seafile).
+Here are the Advanced options specific to seafile (seafile).
 
 #### --seafile-create-library
 
-Should rclone create a library if it doesn't exist
+Should rclone create a library if it doesn't exist.
+
+Properties:
 
 - Config:      create_library
 - Env Var:     RCLONE_SEAFILE_CREATE_LIBRARY
@@ -354,14 +425,27 @@ Should rclone create a library if it doesn't exist
 
 #### --seafile-encoding
 
-This sets the encoding for the backend.
+The encoding for the backend.
 
-See: the [encoding section in the overview](/overview/#encoding) for more info.
+See the [encoding section in the overview](/overview/#encoding) for more info.
+
+Properties:
 
 - Config:      encoding
 - Env Var:     RCLONE_SEAFILE_ENCODING
-- Type:        MultiEncoder
-- Default:     Slash,DoubleQuote,BackSlash,Ctl,InvalidUtf8
+- Type:        Encoding
+- Default:     Slash,DoubleQuote,BackSlash,Ctl,InvalidUtf8,Dot
 
-{{< rem autogenerated options stop >}}
+#### --seafile-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_SEAFILE_DESCRIPTION
+- Type:        string
+- Required:    false
+
+<!-- autogenerated options stop -->
 

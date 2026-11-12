@@ -1,0 +1,233 @@
+package http
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+
+	"github.com/rclone/rclone/fs"
+)
+
+// parseAuthorization parses the Authorization header into user, pass
+// it returns a boolean as to whether the parse was successful
+func parseAuthorization(r *http.Request) (user, pass string, ok bool) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		s := strings.SplitN(authHeader, " ", 2)
+		if len(s) == 2 && strings.EqualFold(s[0], "Basic") {
+			b, err := base64.StdEncoding.DecodeString(s[1])
+			if err == nil {
+				parts := strings.SplitN(string(b), ":", 2)
+				user = parts[0]
+				if len(parts) > 1 {
+					pass = parts[1]
+					ok = true
+				}
+			}
+		}
+	}
+	return
+}
+
+// requireBasicAuth replies to the request asking the client for
+// basic auth credentials.
+func requireBasicAuth(w http.ResponseWriter, realm string) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`"`)
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = fmt.Fprintf(w, "%d %s\n", http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized))
+}
+
+// basicAuth returns middleware which authenticates with basic auth,
+// using check to see whether the user and password are valid.
+func basicAuth(realm string, check func(user, pass string) bool) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user, pass, ok := parseAuthorization(r)
+			if !ok || !check(user, pass) {
+				fs.Infof(r.URL.Path, "%s: Unauthorized request from %s", r.RemoteAddr, user)
+				requireBasicAuth(w, realm)
+				return
+			}
+			ctx := context.WithValue(r.Context(), ctxKeyUser, user)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// MiddlewareAuthCertificateUser instantiates middleware that extracts the authenticated user via client certificate common name
+func MiddlewareAuthCertificateUser() Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// r.TLS is nil on a plain HTTP listener (http:// prefix) where
+			// there can be no client certificate
+			if r.TLS != nil {
+				for _, cert := range r.TLS.PeerCertificates {
+					if cert.Subject.CommonName != "" {
+						r = r.WithContext(context.WithValue(r.Context(), ctxKeyUser, cert.Subject.CommonName))
+						next.ServeHTTP(w, r)
+						return
+					}
+				}
+			}
+			code := http.StatusUnauthorized
+			w.Header().Set("Content-Type", "text/plain")
+			http.Error(w, http.StatusText(code), code)
+		})
+	}
+}
+
+// MiddlewareAuthHtpasswd instantiates middleware that authenticates against the passed htpasswd file
+func MiddlewareAuthHtpasswd(path, realm string) Middleware {
+	fs.Infof(nil, "Using %q as htpasswd storage", path)
+	h := &htpasswdFile{path: path}
+	return basicAuth(realm, h.check)
+}
+
+// MiddlewareAuthBasic instantiates middleware that authenticates for a single user
+func MiddlewareAuthBasic(user, pass, realm, salt string) Middleware {
+	fs.Infof(nil, "Using --user %s --pass XXXX as authenticated user", user)
+	pass = md5Crypt(pass, salt, "$1$")
+	// Compare hashes of the users as ConstantTimeCompare returns
+	// early if the lengths differ which would reveal the user's length
+	userSum := sha256.Sum256([]byte(user))
+	return basicAuth(realm, func(u, p string) bool {
+		// Always hash the password so a wrong user takes as long to
+		// reject as a wrong password
+		uSum := sha256.Sum256([]byte(u))
+		userOK := subtle.ConstantTimeCompare(uSum[:], userSum[:]) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(md5Crypt(p, salt, "$1$")), []byte(pass)) == 1
+		return userOK && passOK
+	})
+}
+
+// MiddlewareAuthCustom instantiates middleware that authenticates using a custom function
+func MiddlewareAuthCustom(fn CustomAuthFn, realm string, userFromContext bool) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user, pass, ok := parseAuthorization(r)
+			if !ok && userFromContext {
+				user, ok = CtxGetUser(r.Context())
+			}
+
+			if !ok {
+				code := http.StatusUnauthorized
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm=%q, charset="UTF-8"`, realm))
+				http.Error(w, http.StatusText(code), code)
+				return
+			}
+
+			value, err := fn(r, user, pass)
+			if err != nil {
+				fs.Infof(r.URL.Path, "%s: Auth failed from %s: %v", r.RemoteAddr, user, err)
+				requireBasicAuth(w, realm)
+				return
+			}
+
+			if value != nil {
+				r = r.WithContext(context.WithValue(r.Context(), ctxKeyAuth, value))
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+var validUsernameRegexp = regexp.MustCompile(`^[\p{L}\d@._-]+$`)
+
+// MiddlewareAuthGetUserFromHeader middleware that bypasses authentication and extracts the user via a specified HTTP header(ideal for proxied setups).
+func MiddlewareAuthGetUserFromHeader(header string) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			username := strings.TrimSpace(r.Header.Get(header))
+			if username != "" && validUsernameRegexp.MatchString(username) {
+				r = r.WithContext(context.WithValue(r.Context(), ctxKeyUser, username))
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			code := http.StatusUnauthorized
+			w.Header().Set("Content-Type", "text/plain")
+			http.Error(w, http.StatusText(code), code)
+		})
+	}
+}
+
+var onlyOnceWarningAllowOrigin sync.Once
+
+// isCORSPreflight returns true if r is a browser CORS preflight request
+func isCORSPreflight(r *http.Request) bool {
+	return r.Method == "OPTIONS" && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != ""
+}
+
+// MiddlewareCORS instantiates middleware that adds the CORS headers to
+// every response if allowOrigin is set.
+//
+// It also answers CORS preflight requests itself. Browsers never
+// attach credentials to a preflight so it must succeed before any
+// authentication middleware sees it, and the browser only looks at
+// the Access-Control-* headers so it is not passed to the handler
+// whose answer could reveal information about the path to an
+// unauthenticated client.
+//
+// If allowOrigin is empty a preflight is treated like any other
+// request.
+func MiddlewareCORS(allowOrigin string) Middleware {
+	onlyOnceWarningAllowOrigin.Do(func() {
+		if allowOrigin == "*" {
+			fs.Logf(nil, "Warning: Allow origin set to *. This can cause serious security problems.")
+		}
+	})
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+			if allowOrigin != "" {
+				w.Header().Add("Access-Control-Allow-Origin", allowOrigin)
+				w.Header().Add("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, Destination, If, Lock-Token, Overwrite, Prefer, TimeOut, Translate")
+				w.Header().Add("Access-Control-Allow-Methods", "COPY, DELETE, GET, HEAD, LOCK, MKCOL, MOVE, OPTIONS, POST, PROPFIND, PROPPATCH, PUT, TRACE, UNLOCK")
+				w.Header().Add("Access-Control-Max-Age", "86400")
+				if isCORSPreflight(r) {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// MiddlewareResponseHeaders instantiates middleware that apply custom headers to every response
+func MiddlewareResponseHeaders(headers []*fs.HTTPOption) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for _, header := range headers {
+				w.Header().Set(header.Key, header.Value)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// MiddlewareStripPrefix instantiates middleware that removes the BaseURL from the path
+func MiddlewareStripPrefix(prefix string) Middleware {
+	return func(next http.Handler) http.Handler {
+		stripPrefixHandler := http.StripPrefix(prefix, next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Allow OPTIONS on the root only
+			if r.URL.Path == "/" && r.Method == "OPTIONS" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			stripPrefixHandler.ServeHTTP(w, r)
+		})
+	}
+}

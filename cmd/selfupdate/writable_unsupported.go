@@ -1,5 +1,4 @@
-// +build plan9 js
-// +build !noselfupdate
+//go:build (plan9 || js) && !noselfupdate
 
 package selfupdate
 

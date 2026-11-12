@@ -1,5 +1,4 @@
-// +build windows
-// +build !noselfupdate
+//go:build windows && !noselfupdate
 
 package selfupdate
 

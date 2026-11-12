@@ -2,7 +2,6 @@ package vfstest
 
 import (
 	"io"
-	"io/ioutil"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,10 +15,10 @@ func TestReadByByte(t *testing.T) {
 	run.createFile(t, "testfile", string(data))
 	run.checkDir(t, "testfile 10")
 
-	for i := 0; i < len(data); i++ {
+	for i := range data {
 		fd, err := run.os.Open(run.path("testfile"))
 		assert.NoError(t, err)
-		for j := 0; j < i; j++ {
+		for j := range i {
 			buf := make([]byte, 1)
 			n, err := io.ReadFull(fd, buf)
 			assert.NoError(t, err)
@@ -89,7 +88,7 @@ func TestReadSeek(t *testing.T) {
 	_, err = fd.Seek(5, io.SeekStart)
 	assert.NoError(t, err)
 
-	buf, err := ioutil.ReadAll(fd)
+	buf, err := io.ReadAll(fd)
 	assert.NoError(t, err)
 	assert.Equal(t, buf, []byte("HELLO"))
 
@@ -97,7 +96,7 @@ func TestReadSeek(t *testing.T) {
 	_, err = fd.Seek(10, io.SeekStart)
 	assert.NoError(t, err)
 
-	buf, err = ioutil.ReadAll(fd)
+	buf, err = io.ReadAll(fd)
 	assert.NoError(t, err)
 	assert.Equal(t, buf, []byte(""))
 
@@ -105,7 +104,7 @@ func TestReadSeek(t *testing.T) {
 	_, err = fd.Seek(1000000, io.SeekStart)
 	assert.NoError(t, err)
 
-	buf, err = ioutil.ReadAll(fd)
+	buf, err = io.ReadAll(fd)
 	assert.NoError(t, err)
 	assert.Equal(t, buf, []byte(""))
 
@@ -113,7 +112,7 @@ func TestReadSeek(t *testing.T) {
 	_, err = fd.Seek(0, io.SeekStart)
 	assert.NoError(t, err)
 
-	buf, err = ioutil.ReadAll(fd)
+	buf, err = io.ReadAll(fd)
 	assert.NoError(t, err)
 	assert.Equal(t, buf, []byte("helloHELLO"))
 

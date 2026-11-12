@@ -6,19 +6,19 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
-	"log"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/lib/readers"
 )
 
 // protocol errors
 var (
-	ErrorPrematureEOF  = errors.New("Premature EOF")
-	ErrorInvalidLength = errors.New("Invalid length")
-	ErrorZeroTerminate = errors.New("String must end with zero")
+	ErrorPrematureEOF  = errors.New("premature EOF")
+	ErrorInvalidLength = errors.New("invalid length")
+	ErrorZeroTerminate = errors.New("string must end with zero")
 )
 
 // BinWriter is a binary protocol writer
@@ -48,7 +48,7 @@ func (w *BinWriter) Reader() io.Reader {
 // WritePu16 writes a short as unsigned varint
 func (w *BinWriter) WritePu16(val int) {
 	if val < 0 || val > 65535 {
-		log.Fatalf("Invalid UInt16 %v", val)
+		panic(fmt.Sprintf("Invalid UInt16 %v", val))
 	}
 	w.WritePu64(int64(val))
 }
@@ -56,7 +56,7 @@ func (w *BinWriter) WritePu16(val int) {
 // WritePu32 writes a signed long as unsigned varint
 func (w *BinWriter) WritePu32(val int64) {
 	if val < 0 || val > 4294967295 {
-		log.Fatalf("Invalid UInt32 %v", val)
+		panic(fmt.Sprintf("Invalid UInt32 %v", val))
 	}
 	w.WritePu64(val)
 }
@@ -64,8 +64,13 @@ func (w *BinWriter) WritePu32(val int64) {
 // WritePu64 writes an unsigned (actually, signed) long as unsigned varint
 func (w *BinWriter) WritePu64(val int64) {
 	if val < 0 {
-		log.Fatalf("Invalid UInt64 %v", val)
+		panic(fmt.Sprintf("Invalid UInt64 %v", val))
 	}
+	w.b.Write(w.a[:binary.PutUvarint(w.a, uint64(val))])
+}
+
+// WriteP64 writes an signed long as unsigned varint
+func (w *BinWriter) WriteP64(val int64) {
 	w.b.Write(w.a[:binary.PutUvarint(w.a, uint64(val))])
 }
 
@@ -123,7 +128,7 @@ func (r *BinReader) check(err error) bool {
 		r.err = err
 	}
 	if err != io.EOF {
-		log.Fatalf("Error parsing response: %v", err)
+		panic(fmt.Sprintf("Error parsing response: %v", err))
 	}
 	return false
 }

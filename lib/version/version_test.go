@@ -26,6 +26,8 @@ func TestVersionAdd(t *testing.T) {
 		{t0, "potato-v2001-02-03-040506-123.txt", "potato-v2001-02-03-040506-123-v1970-01-01-010101-123.txt"},
 		{t0, "123.!!lipps", "123-v1970-01-01-010101-123.!!lipps"},
 		{t1, "potato", "potato-v2001-02-03-040506-123"},
+		{t1, ".potato", ".potato-v2001-02-03-040506-123"},
+		{t1, ".potato.conf", ".potato-v2001-02-03-040506-123.conf"},
 		{t1, "", "-v2001-02-03-040506-123"},
 	} {
 		actual := version.Add(test.in, test.t)
@@ -43,6 +45,8 @@ func TestVersionRemove(t *testing.T) {
 		{"potato-v1970-01-01-010101-123.txt", t0r, "potato.txt"},
 		{"potato-v2001-02-03-040506-123-v1970-01-01-010101-123.txt", t0r, "potato-v2001-02-03-040506-123.txt"},
 		{"potato-v2001-02-03-040506-123", t1, "potato"},
+		{".potato-v2001-02-03-040506-123", t1, ".potato"},
+		{".potato-v2001-02-03-040506-123.conf", t1, ".potato.conf"},
 		{"-v2001-02-03-040506-123", t1, ""},
 		{"potato-v2A01-02-03-040506-123", emptyT, "potato-v2A01-02-03-040506-123"},
 		{"potato-v2001-02-03-040506=123", emptyT, "potato-v2001-02-03-040506=123"},
@@ -66,6 +70,14 @@ func TestVersionMatch(t *testing.T) {
 		{"potato-v2001-02-03-040506-123", true},
 		{"-v2001-02-03-040506-123", true},
 		{"-v9999-99-99-999999-999", true},
+		{".potato-v2001-02-03-040506-123", true},
+		{".potato-v2001-02-03-040506-123.conf", true},
+		{"dir/potato-v2001-02-03-040506-123.txt", true},
+		{"potato-v2001-02-03-040506-123-final.txt", false},
+		{"potato-v2001-02-03-040506-1234.txt", false},
+		{"potato-v2001-02-03-040506-123.tar.gz", false},
+		{"dir-v2001-02-03-040506-123/potato.txt", false},
+		{"dir-v2001-02-03-040506-123/potato", false},
 	} {
 		actual := version.Match(test.in)
 		assert.Equal(t, test.expected, actual, test.in)

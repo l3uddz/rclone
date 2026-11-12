@@ -4,16 +4,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
-	"os"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/rclone/rclone/cmd"
-	"github.com/rclone/rclone/cmd/serve/httplib/httpflags"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configfile"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,7 +67,7 @@ func createOverwriteDeleteSeq(t testing.TB, path string) []TestRequest {
 // TestResticHandler runs tests on the restic handler code, especially in append-only mode.
 func TestResticHandler(t *testing.T) {
 	ctx := context.Background()
-	configfile.LoadConfig(ctx)
+	configfile.Install()
 	buf := make([]byte, 32)
 	_, err := io.ReadFull(rand.Reader, buf)
 	require.NoError(t, err)
@@ -112,28 +113,20 @@ func TestResticHandler(t *testing.T) {
 	}
 
 	// setup rclone with a local backend in a temporary directory
-	tempdir, err := ioutil.TempDir("", "rclone-restic-test-")
-	require.NoError(t, err)
+	tempdir := t.TempDir()
 
-	// make sure the tempdir is properly removed
-	defer func() {
-		err := os.RemoveAll(tempdir)
-		require.NoError(t, err)
-	}()
-
-	// globally set append-only mode
-	prev := appendOnly
-	appendOnly = true
-	defer func() {
-		appendOnly = prev // reset when done
-	}()
+	// set append-only mode
+	opt := newOpt()
+	opt.AppendOnly = true
 
 	// make a new file system in the temp dir
 	f := cmd.NewFsSrc([]string{tempdir})
-	srv := NewServer(f, &httpflags.Opt)
+	s, err := newServer(ctx, f, &opt)
+	require.NoError(t, err)
+	router := s.server.Router()
 
 	// create the repo
-	checkRequest(t, srv.ServeHTTP,
+	checkRequest(t, router.ServeHTTP,
 		newRequest(t, "POST", "/?create=true", nil),
 		[]wantFunc{wantCode(http.StatusOK)})
 
@@ -141,8 +134,65 @@ func TestResticHandler(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			for i, seq := range test.seq {
 				t.Logf("request %v: %v %v", i, seq.req.Method, seq.req.URL.Path)
-				checkRequest(t, srv.ServeHTTP, seq.req, seq.want)
+				checkRequest(t, router.ServeHTTP, seq.req, seq.want)
 			}
 		})
 	}
+}
+
+func TestAppendOnlyFailsClosedOnLookupError(t *testing.T) {
+	ctx := context.Background()
+	configfile.Install()
+
+	underlying := cmd.NewFsSrc([]string{t.TempDir()})
+	f := &newObjectErrorFs{
+		Fs:  underlying,
+		err: errors.New("lookup failed"),
+	}
+	opt := newOpt()
+	opt.AppendOnly = true
+	s, err := newServer(ctx, f, &opt)
+	require.NoError(t, err)
+
+	req := newRequest(t, "POST", "/config", strings.NewReader("replacement"))
+	checkRequest(t, s.server.Router().ServeHTTP, req, []wantFunc{wantCode(http.StatusInternalServerError)})
+
+	_, err = underlying.NewObject(ctx, "config")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+}
+
+func TestAppendOnlyConcurrentUploads(t *testing.T) {
+	configfile.Install()
+	opt := newOpt()
+	opt.AppendOnly = true
+	f := cmd.NewFsSrc([]string{t.TempDir()})
+	s, err := newServer(context.Background(), f, &opt)
+	require.NoError(t, err)
+	handler := s.server.Router().ServeHTTP
+
+	const uploads = 10
+	start := make(chan struct{})
+	results := make(chan int, uploads)
+	for range uploads {
+		go func() {
+			req := newRequest(t, "POST", "/config", strings.NewReader("config data"))
+			recorder := httptest.NewRecorder()
+			<-start
+			handler(recorder, req)
+			results <- recorder.Code
+		}()
+	}
+	close(start)
+
+	succeeded := 0
+	for range uploads {
+		if code := <-results; code == http.StatusOK {
+			succeeded++
+		} else {
+			assert.Equal(t, http.StatusForbidden, code)
+		}
+	}
+	assert.Equal(t, 1, succeeded)
+	checkRequest(t, handler, newRequest(t, "GET", "/config", nil),
+		[]wantFunc{wantCode(http.StatusOK), wantBody("config data")})
 }

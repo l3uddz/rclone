@@ -5,15 +5,16 @@ import (
 	"os"
 	"testing"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/text/unicode/norm"
 )
 
 func TestCaseSensitivity(t *testing.T) {
 	r := fstest.NewRun(t)
-	defer r.Finalise()
 
 	if r.Fremote.Features().CaseInsensitive {
 		t.Skip("Can't test case sensitivity - this remote is officially not case-sensitive")
@@ -23,7 +24,7 @@ func TestCaseSensitivity(t *testing.T) {
 	ctx := context.Background()
 	file1 := r.WriteObject(ctx, "FiLeA", "data1", t1)
 	file2 := r.WriteObject(ctx, "FiLeB", "data2", t2)
-	fstest.CheckItems(t, r.Fremote, file1, file2)
+	r.CheckRemoteItems(t, file1, file2)
 
 	// Create file3 with name differing from file2 name only by case.
 	// On a case-Sensitive remote this will be a separate file.
@@ -33,14 +34,14 @@ func TestCaseSensitivity(t *testing.T) {
 	file3 := r.WriteObject(ctx, "FilEb", "data3", t3)
 
 	// Create a case-Sensitive and case-INsensitive VFS
-	optCS := vfscommon.DefaultOpt
+	optCS := vfscommon.Opt
 	optCS.CaseInsensitive = false
-	vfsCS := New(r.Fremote, &optCS)
+	vfsCS := New(context.Background(), r.Fremote, &optCS)
 	defer cleanupVFS(t, vfsCS)
 
-	optCI := vfscommon.DefaultOpt
+	optCI := vfscommon.Opt
 	optCI.CaseInsensitive = true
-	vfsCI := New(r.Fremote, &optCI)
+	vfsCI := New(context.Background(), r.Fremote, &optCI)
 	defer cleanupVFS(t, vfsCI)
 
 	// Run basic checks that must pass on VFS of any type.
@@ -65,7 +66,7 @@ func TestCaseSensitivity(t *testing.T) {
 	}
 
 	// Continue with test as the underlying remote is fully case-Sensitive.
-	fstest.CheckItems(t, r.Fremote, file1, file2, file3)
+	r.CheckRemoteItems(t, file1, file2, file3)
 
 	// See how VFS handles case-INsensitive flag
 	assertFileDataVFS(t, vfsCI, "FiLeA", "data1")
@@ -160,4 +161,76 @@ func assertFileAbsentVFS(t *testing.T, vfs *VFS, name string) {
 	assert.Nil(t, fd)
 	assert.Error(t, err)
 	assert.Equal(t, err, ENOENT)
+}
+
+func TestUnicodeNormalization(t *testing.T) {
+	r := fstest.NewRun(t)
+
+	var (
+		nfc  = norm.NFC.String(norm.NFD.String("測試_Русский___ě_áñ"))
+		nfd  = norm.NFD.String(nfc)
+		both = "normal name with no special characters.txt"
+	)
+
+	// Create test files
+	ctx := context.Background()
+	file1 := r.WriteObject(ctx, both, "data1", t1)
+	file2 := r.WriteObject(ctx, nfc, "data2", t2)
+	r.CheckRemoteItems(t, file1, file2)
+
+	// Create VFS
+	opt := vfscommon.Opt
+	vfs := New(context.Background(), r.Fremote, &opt)
+	defer cleanupVFS(t, vfs)
+
+	// assert that both files are found under NFD-normalized names
+	assertFileDataVFS(t, vfs, norm.NFD.String(both), "data1")
+	assertFileDataVFS(t, vfs, nfd, "data2")
+
+	// change ci.NoUnicodeNormalization to true and verify that only file1 is found
+	ci := fs.GetConfig(ctx) // need to set the global config here as the *Dir methods don't take a ctx param
+	oldVal := ci.NoUnicodeNormalization
+	defer func() { fs.GetConfig(ctx).NoUnicodeNormalization = oldVal }() // restore the prior value after the test
+	ci.NoUnicodeNormalization = true
+	assertFileDataVFS(t, vfs, norm.NFD.String(both), "data1")
+	assertFileAbsentVFS(t, vfs, nfd)
+}
+
+func TestRenameByNormalizedName(t *testing.T) {
+	r := fstest.NewRun(t)
+	features := r.Fremote.Features()
+	if features.DirMove == nil && features.Move == nil && features.Copy == nil {
+		t.Skip("can't rename directories")
+	}
+
+	var (
+		nfc = norm.NFC.String(norm.NFD.String("ěáñ"))
+		nfd = norm.NFD.String(nfc)
+	)
+
+	ctx := context.Background()
+	r.WriteObject(ctx, "FiLeA", "data1", t1)
+	r.WriteObject(ctx, nfc+".txt", "data2", t2)
+
+	opt := vfscommon.Opt
+	opt.CaseInsensitive = true
+	vfs := New(ctx, r.Fremote, &opt)
+	defer cleanupVFS(t, vfs)
+
+	root, err := vfs.Root()
+	require.NoError(t, err)
+	_, err = root.Mkdir("DiRa")
+	require.NoError(t, err)
+	_, err = root.Mkdir(nfc)
+	require.NoError(t, err)
+
+	for _, names := range [][2]string{
+		{"FILEA", "file1"},
+		{nfd + ".txt", "file2"},
+		{"DIRA", "dir1"},
+		{nfd, "dir2"},
+	} {
+		require.NoError(t, root.Rename(names[0], names[1], root))
+	}
+	checkListing(t, root, []string{"dir1,0,true", "dir2,0,true", "file1,5,false", "file2,5,false"})
 }

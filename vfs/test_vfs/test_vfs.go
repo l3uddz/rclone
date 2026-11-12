@@ -7,8 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -17,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/lib/random"
 )
@@ -27,14 +26,8 @@ var (
 	number     = flag.Int("n", 4, "Number of tests to run simultaneously")
 	iterations = flag.Int("i", 100, "Iterations of the test")
 	timeout    = flag.Duration("timeout", 10*time.Second, "Inactivity time to detect a deadlock")
-	testNumber int32
+	testNumber atomic.Int32
 )
-
-// Seed the random number generator
-func init() {
-	rand.Seed(time.Now().UnixNano())
-
-}
 
 // Test contains stats about the running test which work for files or
 // directories
@@ -56,7 +49,7 @@ func NewTest(Dir string) *Test {
 		dir:    Dir,
 		name:   random.String(*nameLength),
 		isDir:  rand.Intn(2) == 0,
-		number: atomic.AddInt32(&testNumber, 1),
+		number: testNumber.Add(1),
 		timer:  time.NewTimer(*timeout),
 	}
 	width := int(math.Floor(math.Log10(float64(*number)))) + 1
@@ -98,21 +91,21 @@ func (t *Test) randomTest() {
 }
 
 // logf logs things - not shown unless -v
-func (t *Test) logf(format string, a ...interface{}) {
+func (t *Test) logf(format string, a ...any) {
 	if *verbose {
-		log.Printf(t.prefix+format, a...)
+		fs.Logf(nil, t.prefix+format, a)
 	}
 }
 
 // errorf logs errors
-func (t *Test) errorf(format string, a ...interface{}) {
-	log.Printf(t.prefix+"ERROR: "+format, a...)
+func (t *Test) errorf(format string, a ...any) {
+	fs.Logf(nil, t.prefix+"ERROR: "+format, a)
 }
 
 // list test
 func (t *Test) list() {
 	t.logf("list")
-	fis, err := ioutil.ReadDir(t.dir)
+	fis, err := os.ReadDir(t.dir)
 	if err != nil {
 		t.errorf("%s: failed to read directory: %v", t.dir, err)
 		return
@@ -274,7 +267,7 @@ func (t *Test) Tidy() {
 func (t *Test) RandomTests(iterations int, quit chan struct{}) {
 	var finished = make(chan struct{})
 	go func() {
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			t.randomTest()
 		}
 		close(finished)
@@ -293,23 +286,21 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) != 1 {
-		log.Fatalf("%s: Syntax [opts] <directory>", os.Args[0])
+		fs.Fatalf(nil, "%s: Syntax [opts] <directory>", os.Args[0])
 	}
 	dir := args[0]
-	_ = os.MkdirAll(dir, 0777)
+	_ = file.MkdirAll(dir, 0777)
 
 	var (
 		wg   sync.WaitGroup
 		quit = make(chan struct{}, *iterations)
 	)
-	for i := 0; i < *number; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range *number {
+		wg.Go(func() {
 			t := NewTest(dir)
 			defer t.Tidy()
 			t.RandomTests(*iterations, quit)
-		}()
+		})
 	}
 	wg.Wait()
 }

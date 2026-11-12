@@ -7,8 +7,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/rclone/rclone/fs"
 )
 
 // Func defines a type for a remote control function
@@ -20,7 +18,7 @@ type Call struct {
 	Path          string // path to activate this RC
 	Fn            Func   `json:"-"` // function to call
 	Title         string // help for the function
-	AuthRequired  bool   // if set then this call requires authorisation to be set
+	NoAuth        bool   // if set then this call does not require authentication
 	Help          string // multi-line markdown formatted help
 	NeedsRequest  bool   // if set then this call will be passed the original request object as _request
 	NeedsResponse bool   // if set then this call will be passed the original response object as _response
@@ -45,7 +43,7 @@ func (r *Registry) Add(call Call) {
 	defer r.mu.Unlock()
 	call.Path = strings.Trim(call.Path, "/")
 	call.Help = strings.TrimSpace(call.Help)
-	fs.Debugf(nil, "Adding path %q to remote control registry", call.Path)
+	// fs.Debugf(nil, "Adding path %q to remote control registry", call.Path) // disabled to make initialization less verbose
 	r.call[call.Path] = &call
 }
 

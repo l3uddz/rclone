@@ -1,17 +1,14 @@
-// +build linux freebsd
+//go:build linux
 
 package mount
 
 import (
-	"runtime"
 	"testing"
 
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/rclone/rclone/vfs/vfstest"
 )
 
 func TestMount(t *testing.T) {
-	if runtime.NumCPU() <= 2 {
-		t.Skip("FIXME skipping mount tests as they lock up on <= 2 CPUs - See: https://github.com/rclone/rclone/issues/3154")
-	}
-	vfstest.RunTests(t, false, mount)
+	vfstest.RunTests(t, false, vfscommon.CacheModeOff, true, mount)
 }

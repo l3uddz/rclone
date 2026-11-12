@@ -1,8 +1,10 @@
+// Package mailru provides an interface to the Mail.ru Cloud storage system.
 package mailru
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	gohash "hash"
 	"io"
@@ -16,7 +18,6 @@ import (
 
 	"encoding/hex"
 	"encoding/json"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 
@@ -35,19 +36,19 @@ import (
 	"github.com/rclone/rclone/fs/operations"
 
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 
-	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 )
 
 // Global constants
 const (
-	minSleepPacer   = 10 * time.Millisecond
-	maxSleepPacer   = 2 * time.Second
+	minSleepPacer   = 100 * time.Millisecond
+	maxSleepPacer   = 5 * time.Second
 	decayConstPacer = 2          // bigger for slower decay, exponential
 	metaExpirySec   = 20 * 60    // meta server expiration time
 	serverExpirySec = 3 * 60     // download server expiration time
@@ -68,30 +69,34 @@ var (
 )
 
 // Description of how to authorize
-var oauthConfig = &oauth2.Config{
+var oauthConfig = &oauthutil.Config{
 	ClientID:     api.OAuthClientID,
 	ClientSecret: "",
-	Endpoint: oauth2.Endpoint{
-		AuthURL:   api.OAuthURL,
-		TokenURL:  api.OAuthURL,
-		AuthStyle: oauth2.AuthStyleInParams,
-	},
+	AuthURL:      api.OAuthURL,
+	TokenURL:     api.OAuthURL,
+	AuthStyle:    oauth2.AuthStyleInParams,
 }
 
 // Register with Fs
 func init() {
-	MrHashType = hash.RegisterHash("MailruHash", 40, mrhash.New)
+	MrHashType = hash.RegisterHash("mailru", "MailruHash", 40, mrhash.New)
 	fs.Register(&fs.RegInfo{
 		Name:        "mailru",
 		Description: "Mail.ru Cloud",
 		NewFs:       NewFs,
-		Options: []fs.Option{{
-			Name:     "user",
-			Help:     "User name (usually email)",
-			Required: true,
+		Options: append(oauthutil.SharedOptions, []fs.Option{{
+			Name:      "user",
+			Help:      "User name (usually email).",
+			Required:  true,
+			Sensitive: true,
 		}, {
-			Name:       "pass",
-			Help:       "Password",
+			Name: "pass",
+			Help: `Password.
+
+This must be an app password - rclone will not work with your normal
+password. See the Configuration section in the docs for how to make an
+app password.
+`,
 			Required:   true,
 			IsPassword: true,
 		}, {
@@ -99,6 +104,7 @@ func init() {
 			Default:  true,
 			Advanced: false,
 			Help: `Skip full upload if there is another file with same data hash.
+
 This feature is called "speedup" or "put by hash". It is especially efficient
 in case of generally available files like popular books, video or audio clips,
 because files are searched by hash in all accounts of all mailru users.
@@ -119,6 +125,7 @@ streaming or partial uploads), it will not even try this optimization.`,
 			Default:  "*.mkv,*.avi,*.mp4,*.mp3,*.zip,*.gz,*.rar,*.pdf",
 			Advanced: true,
 			Help: `Comma separated list of file name patterns eligible for speedup (put by hash).
+
 Patterns are case insensitive and can contain '*' or '?' meta characters.`,
 			Examples: []fs.OptionExample{{
 				Value: "",
@@ -137,8 +144,9 @@ Patterns are case insensitive and can contain '*' or '?' meta characters.`,
 			Name:     "speedup_max_disk",
 			Default:  fs.SizeSuffix(3 * 1024 * 1024 * 1024),
 			Advanced: true,
-			Help: `This option allows you to disable speedup (put by hash) for large files
-(because preliminary hashing can exhaust you RAM or disk space)`,
+			Help: `This option allows you to disable speedup (put by hash) for large files.
+
+Reason is that preliminary hashing can exhaust your RAM or disk space.`,
 			Examples: []fs.OptionExample{{
 				Value: "0",
 				Help:  "Completely disable speedup (put by hash).",
@@ -168,7 +176,7 @@ Patterns are case insensitive and can contain '*' or '?' meta characters.`,
 			Name:     "check_hash",
 			Default:  true,
 			Advanced: true,
-			Help:     "What should copy do if file checksum is mismatched or invalid",
+			Help:     "What should copy do if file checksum is mismatched or invalid.",
 			Examples: []fs.OptionExample{{
 				Value: "true",
 				Help:  "Fail with error.",
@@ -182,6 +190,7 @@ Patterns are case insensitive and can contain '*' or '?' meta characters.`,
 			Advanced: true,
 			Hide:     fs.OptionHideBoth,
 			Help: `HTTP user agent used internally by client.
+
 Defaults to "rclone/VERSION" or "--user-agent" provided on command line.`,
 		}, {
 			Name:     "quirks",
@@ -189,6 +198,7 @@ Defaults to "rclone/VERSION" or "--user-agent" provided on command line.`,
 			Advanced: true,
 			Hide:     fs.OptionHideBoth,
 			Help: `Comma separated list of internal maintenance flags.
+
 This option must not be used by an ordinary user. It is intended only to
 facilitate remote troubleshooting of backend issues. Strict meaning of
 flags is not documented and not guaranteed to persist between releases.
@@ -203,7 +213,7 @@ Supported quirks: atomicmkdir binlist unknowndirs`,
 				encoder.EncodeWin | // :?"*<>|
 				encoder.EncodeBackSlash |
 				encoder.EncodeInvalidUtf8),
-		}},
+		}}...),
 	})
 }
 
@@ -264,7 +274,7 @@ func errorHandler(res *http.Response) (err error) {
 	}
 	serverError.Message = string(data)
 	if serverError.Message == "" || strings.HasPrefix(serverError.Message, "{") {
-		// Replace empty or JSON response with a human readable text.
+		// Replace empty or JSON response with a human-readable text.
 		serverError.Message = res.Status
 	}
 	serverError.Status = res.StatusCode
@@ -391,7 +401,7 @@ type quirks struct {
 }
 
 func (q *quirks) parseQuirks(option string) {
-	for _, flag := range strings.Split(option, ",") {
+	for flag := range strings.SplitSeq(option, ",") {
 		switch strings.ToLower(strings.TrimSpace(flag)) {
 		case "binlist":
 			// The official client sometimes uses a so called "bin" protocol,
@@ -427,13 +437,15 @@ func (f *Fs) authorize(ctx context.Context, force bool) (err error) {
 	if err != nil || !tokenIsValid(t) {
 		fs.Infof(f, "Valid token not found, authorizing.")
 		ctx := oauthutil.Context(ctx, f.cli)
-		t, err = oauthConfig.PasswordCredentialsToken(ctx, f.opt.Username, f.opt.Password)
+
+		oauth2Conf := oauthConfig.MakeOauth2Config()
+		t, err = oauth2Conf.PasswordCredentialsToken(ctx, f.opt.Username, f.opt.Password)
 	}
 	if err == nil && !tokenIsValid(t) {
-		err = errors.New("Invalid token")
+		err = errors.New("invalid token")
 	}
 	if err != nil {
-		return errors.Wrap(err, "Failed to authorize")
+		return fmt.Errorf("failed to authorize: %w", err)
 	}
 
 	if err = oauthutil.PutToken(f.name, f.m, t, false); err != nil {
@@ -502,7 +514,7 @@ func (f *Fs) reAuthorize(opts *rest.Opts, origErr error) error {
 func (f *Fs) accessToken() (string, error) {
 	token, err := f.source.Token()
 	if err != nil {
-		return "", errors.Wrap(err, "cannot refresh access token")
+		return "", fmt.Errorf("cannot refresh access token: %w", err)
 	}
 	return token.AccessToken, nil
 }
@@ -575,7 +587,7 @@ func readBodyWord(res *http.Response) (word string, err error) {
 		word = strings.Split(line, " ")[0]
 	}
 	if word == "" {
-		return "", errors.New("Empty reply from dispatcher")
+		return "", errors.New("empty reply from dispatcher")
 	}
 	return word, nil
 }
@@ -623,23 +635,19 @@ func (f *Fs) readItemMetaData(ctx context.Context, path string) (entry fs.DirEnt
 	return
 }
 
-// itemToEntry converts API item to rclone directory entry
+// itemToDirEntry converts API item to rclone directory entry
 // The dirSize return value is:
-//   <0 - for a file or in case of error
-//   =0 - for an empty directory
-//   >0 - for a non-empty directory
+//
+//	<0 - for a file or in case of error
+//	=0 - for an empty directory
+//	>0 - for a non-empty directory
 func (f *Fs) itemToDirEntry(ctx context.Context, item *api.ListItem) (entry fs.DirEntry, dirSize int, err error) {
 	remote, err := f.relPath(f.opt.Enc.ToStandardPath(item.Home))
 	if err != nil {
 		return nil, -1, err
 	}
 
-	mTime := int64(item.Mtime)
-	if mTime < 0 {
-		fs.Debugf(f, "Fixing invalid timestamp %d on mailru file %q", mTime, remote)
-		mTime = 0
-	}
-	modTime := time.Unix(mTime, 0)
+	modTime := time.Unix(int64(item.Mtime), 0)
 
 	isDir, err := f.isDir(item.Kind, remote)
 	if err != nil {
@@ -894,7 +902,7 @@ func (t *treeState) NextRecord() (fs.DirEntry, error) {
 		return nil, nil
 	case api.ListParseUnknown15:
 		skip := int(r.ReadPu32())
-		for i := 0; i < skip; i++ {
+		for range skip {
 			r.ReadPu32()
 			r.ReadPu32()
 		}
@@ -1191,7 +1199,7 @@ func (f *Fs) purgeWithCheck(ctx context.Context, dir string, check bool, opName 
 
 	_, dirSize, err := f.readItemMetaData(ctx, path)
 	if err != nil {
-		return errors.Wrapf(err, "%s failed", opName)
+		return fmt.Errorf("%s failed: %w", opName, err)
 	}
 	if check && dirSize > 0 {
 		return fs.ErrorDirectoryNotEmpty
@@ -1295,7 +1303,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't copy file")
+		return nil, fmt.Errorf("couldn't copy file: %w", err)
 	}
 	if response.Status != 200 {
 		return nil, fmt.Errorf("copy failed with code %d", response.Status)
@@ -1567,7 +1575,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	}
 
 	total := info.Body.Cloud.Space.BytesTotal
-	used := int64(info.Body.Cloud.Space.BytesUsed)
+	used := info.Body.Cloud.Space.BytesUsed
 
 	usage := &fs.Usage{
 		Total: fs.NewUsageValue(total),
@@ -1607,7 +1615,6 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	var (
-		fileBuf  []byte
 		fileHash []byte
 		newHash  []byte
 		slowHash bool
@@ -1653,15 +1660,19 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	// Attempt to put by calculating hash in memory
 	if trySpeedup && size <= int64(o.fs.opt.SpeedupMaxMem) {
-		fileBuf, err = ioutil.ReadAll(in)
-		if err != nil {
+		rw := multipart.NewRW()
+		defer func() {
+			_ = rw.Close()
+		}()
+		hasher := mrhash.New()
+		if _, err = io.Copy(rw, io.TeeReader(in, hasher)); err != nil {
 			return err
 		}
-		fileHash = mrhash.Sum(fileBuf)
+		fileHash = hasher.Sum(nil)
 		if o.putByHash(ctx, fileHash, src, "memory") {
 			return nil
 		}
-		wrapIn = bytes.NewReader(fileBuf)
+		wrapIn = rw
 		trySpeedup = false // speedup failed, force upload
 	}
 
@@ -1679,7 +1690,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 			spoolFile, mrHash, err := makeTempFile(ctx, tmpFs, wrapIn, src)
 			if err != nil {
-				return errors.Wrap(err, "Failed to create spool file")
+				return fmt.Errorf("failed to create spool file: %w", err)
 			}
 			if o.putByHash(ctx, mrHash, src, "spool") {
 				// If put by hash is successful, ignore transitive error
@@ -1695,9 +1706,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// Upload object data
 	if size <= mrhash.Size {
 		// Optimize upload: skip extra request if data fits in the hash buffer.
-		if fileBuf == nil {
-			fileBuf, err = ioutil.ReadAll(wrapIn)
-		}
+		var fileBuf []byte
+		fileBuf, err = io.ReadAll(wrapIn)
 		if fileHash == nil && err == nil {
 			fileHash = mrhash.Sum(fileBuf)
 		}
@@ -1718,7 +1728,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	if bytes.Compare(fileHash, newHash) != 0 {
+	if !bytes.Equal(fileHash, newHash) {
 		if o.fs.opt.CheckHash {
 			return mrhash.ErrorInvalidHash
 		}
@@ -1726,7 +1736,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	o.mrHash = newHash
 	o.size = size
-	o.modTime = src.ModTime(ctx)
+	// The server stores modtimes with second precision so truncate
+	// here too to keep the in-memory modtime identical to the one a
+	// fresh listing returns.
+	o.modTime = src.ModTime(ctx).Truncate(time.Second)
 	return o.addFileMetaData(ctx, true)
 }
 
@@ -1761,9 +1774,9 @@ func (f *Fs) eligibleForSpeedup(remote string, size int64, options ...fs.OpenOpt
 func (f *Fs) parseSpeedupPatterns(patternString string) (err error) {
 	f.speedupGlobs = nil
 	f.speedupAny = false
-	uniqueValidPatterns := make(map[string]interface{})
+	uniqueValidPatterns := make(map[string]any)
 
-	for _, pattern := range strings.Split(patternString, ",") {
+	for pattern := range strings.SplitSeq(patternString, ",") {
 		pattern = strings.ToLower(strings.TrimSpace(pattern))
 		if pattern == "" {
 			continue
@@ -1859,6 +1872,12 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64, options .
 		strHash string
 	)
 	err = o.fs.pacer.Call(func() (bool, error) {
+		// Rewind seekable bodies so a retry resends the whole file
+		if seeker, ok := in.(io.Seeker); ok {
+			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+				return false, err
+			}
+		}
 		res, err = o.fs.srv.Call(ctx, &opts)
 		if err == nil {
 			strHash, err = readBodyWord(res)
@@ -1958,10 +1977,10 @@ func (o *Object) readMetaData(ctx context.Context, force bool) error {
 	}
 	newObj, ok := entry.(*Object)
 	if !ok || dirSize >= 0 {
-		return fs.ErrorNotAFile
+		return fs.ErrorIsDir
 	}
 	if newObj.remote != o.remote {
-		return fmt.Errorf("File %q path has changed to %q", o.remote, newObj.remote)
+		return fmt.Errorf("file %q path has changed to %q", o.remote, newObj.remote)
 	}
 	o.hasMetaData = true
 	o.size = newObj.size
@@ -2029,7 +2048,11 @@ func (o *Object) Storable() bool {
 // Commits the datastore
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	// fs.Debugf(o, ">>> SetModTime [%v]", modTime)
-	o.modTime = modTime
+	//
+	// The server stores modtimes with second precision so truncate
+	// here too to keep the in-memory modtime identical to the one a
+	// fresh listing returns.
+	o.modTime = modTime.Truncate(time.Second)
 	return o.addFileMetaData(ctx, true)
 }
 
@@ -2051,7 +2074,7 @@ func (o *Object) addFileMetaData(ctx context.Context, overwrite bool) error {
 	req.WritePu16(0) // revision
 	req.WriteString(o.fs.opt.Enc.FromStandardPath(o.absPath()))
 	req.WritePu64(o.size)
-	req.WritePu64(o.modTime.Unix())
+	req.WriteP64(o.modTime.Unix())
 	req.WritePu32(0)
 	req.Write(o.mrHash)
 
@@ -2124,10 +2147,7 @@ func getTransferRange(size int64, options ...fs.OpenOption) (start int64, end in
 	if limit < 0 {
 		limit = size - offset
 	}
-	end = offset + limit
-	if end > size {
-		end = size
-	}
+	end = min(offset+limit, size)
 	partial = !(offset == 0 && end == size)
 	return offset, end, partial
 }
@@ -2207,7 +2227,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		fs.Debugf(o, "Server returned full content instead of range")
 		if start > 0 {
 			// Discard the beginning of the data
-			_, err = io.CopyN(ioutil.Discard, wrapStream, start)
+			_, err = io.CopyN(io.Discard, wrapStream, start)
 			if err != nil {
 				closeBody(res)
 				return nil, err
@@ -2257,7 +2277,7 @@ func (e *endHandler) handle(err error) error {
 	}
 
 	newHash := e.hasher.Sum(nil)
-	if bytes.Compare(o.mrHash, newHash) == 0 {
+	if bytes.Equal(o.mrHash, newHash) {
 		return io.EOF
 	}
 	if o.fs.opt.CheckHash {
@@ -2272,7 +2292,7 @@ type serverPool struct {
 	pool      pendingServerMap
 	mu        sync.Mutex
 	path      string
-	expirySec time.Duration
+	expirySec int
 	fs        *Fs
 }
 
@@ -2313,7 +2333,7 @@ func (p *serverPool) Dispatch(ctx context.Context, current string) (string, erro
 	})
 	if err != nil || url == "" {
 		closeBody(res)
-		return "", errors.Wrap(err, "Failed to request file server")
+		return "", fmt.Errorf("failed to request file server: %w", err)
 	}
 
 	p.addServer(url, now)
@@ -2379,7 +2399,7 @@ func (p *serverPool) addServer(url string, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	expiry := now.Add(p.expirySec * time.Second)
+	expiry := now.Add(time.Duration(p.expirySec) * time.Second)
 
 	expiryStr := []byte("-")
 	if p.fs.ci.LogLevel >= fs.LogLevelInfo {

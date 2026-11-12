@@ -1,19 +1,17 @@
 package dlna
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/xml"
-	"errors"
 	"fmt"
 	"io"
-	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/anacrolix/dms/soap"
@@ -35,7 +33,7 @@ func makeDefaultFriendlyName() string {
 func makeDeviceUUID(unique string) string {
 	h := md5.New()
 	if _, err := io.WriteString(h, unique); err != nil {
-		log.Panicf("makeDeviceUUID write failed: %s", err)
+		fs.Panicf(nil, "makeDeviceUUID write failed: %s", err)
 	}
 	buf := h.Sum(nil)
 	return upnp.FormatUUID(buf)
@@ -45,17 +43,21 @@ func makeDeviceUUID(unique string) string {
 func listInterfaces() []net.Interface {
 	ifs, err := net.Interfaces()
 	if err != nil {
-		log.Printf("list network interfaces: %v", err)
+		fs.Logf(nil, "list network interfaces: %v", err)
 		return []net.Interface{}
 	}
 
 	var active []net.Interface
 	for _, intf := range ifs {
-		if intf.Flags&net.FlagUp != 0 && intf.Flags&net.FlagMulticast != 0 && intf.MTU > 0 {
+		if isAppropriatelyConfigured(intf) {
 			active = append(active, intf)
 		}
 	}
 	return active
+}
+
+func isAppropriatelyConfigured(intf net.Interface) bool {
+	return intf.Flags&net.FlagUp != 0 && intf.Flags&net.FlagMulticast != 0 && intf.MTU > 0
 }
 
 func didlLite(chardata string) string {
@@ -63,60 +65,73 @@ func didlLite(chardata string) string {
 		` xmlns:dc="http://purl.org/dc/elements/1.1/"` +
 		` xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"` +
 		` xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"` +
-		` xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">` +
+		` xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"` +
+		` xmlns:sec="http://www.sec.co.kr/">` +
 		chardata +
 		`</DIDL-Lite>`
 }
 
-func mustMarshalXML(value interface{}) []byte {
+// adjustXML applies compatibility fixes to marshaled XML for DLNA clients
+// that have strict or non-standard XML parsing requirements.
+func adjustXML(xmlData []byte) string {
+	xmlStr := string(xmlData)
+	// Samsung TV compatibility: replace numeric entities with named entities.
+	// Samsung TVs have strict XML parsers that fail on numeric entities but accept named ones.
+	// Convert the "Big 5" XML entities to ensure maximum compatibility.
+	xmlStr = strings.ReplaceAll(xmlStr, "&#34;", "&quot;") // double quotes
+	xmlStr = strings.ReplaceAll(xmlStr, "&#39;", "&apos;") // apostrophes
+	xmlStr = strings.ReplaceAll(xmlStr, "&#38;", "&amp;")  // ampersands (rarely used by Go, but just in case)
+	xmlStr = strings.ReplaceAll(xmlStr, "&#60;", "&lt;")   // less than (rarely used by Go, but just in case)
+	xmlStr = strings.ReplaceAll(xmlStr, "&#62;", "&gt;")   // greater than (rarely used by Go, but just in case)
+	return xmlStr
+}
+
+func mustMarshalXML(value any) []byte {
 	ret, err := xml.MarshalIndent(value, "", "  ")
 	if err != nil {
-		log.Panicf("mustMarshalXML failed to marshal %v: %s", value, err)
+		fs.Panicf(nil, "mustMarshalXML failed to marshal %v: %s", value, err)
 	}
-	return ret
+	// Apply XML compatibility fixes for DLNA clients
+	adjustedXML := adjustXML(ret)
+	return []byte(adjustedXML)
+}
+
+// soapArg is an ordered SOAP response argument.
+type soapArg struct {
+	name  string
+	value string
+}
+
+// soapArgs creates a list of soapArg from pairs of name, value strings.
+// Panics if an odd number of strings is provided.
+func soapArgs(nameValuePairs ...string) []soapArg {
+	if len(nameValuePairs)%2 != 0 {
+		fs.Panicf(nil, "soapArgs: odd number of arguments")
+	}
+	args := make([]soapArg, len(nameValuePairs)/2)
+	for i := range args {
+		args[i] = soapArg{
+			name:  nameValuePairs[i*2],
+			value: nameValuePairs[i*2+1],
+		}
+	}
+	return args
 }
 
 // Marshal SOAP response arguments into a response XML snippet.
-func marshalSOAPResponse(sa upnp.SoapAction, args map[string]string) []byte {
-	soapArgs := make([]soap.Arg, 0, len(args))
-	for argName, value := range args {
-		soapArgs = append(soapArgs, soap.Arg{
-			XMLName: xml.Name{Local: argName},
-			Value:   value,
-		})
+// Argument order is preserved from the input slice, which is important
+// for compatibility with strict DLNA clients like Samsung TVs that
+// expect arguments in the order defined by the service SCPD.
+func marshalSOAPResponse(sa upnp.SoapAction, args []soapArg) []byte {
+	xmlArgs := make([]soap.Arg, len(args))
+	for i, arg := range args {
+		xmlArgs[i] = soap.Arg{
+			XMLName: xml.Name{Local: arg.name},
+			Value:   arg.value,
+		}
 	}
-	return []byte(fmt.Sprintf(`<u:%[1]sResponse xmlns:u="%[2]s">%[3]s</u:%[1]sResponse>`,
-		sa.Action, sa.ServiceURN.String(), mustMarshalXML(soapArgs)))
-}
-
-var serviceURNRegexp = regexp.MustCompile(`:service:(\w+):(\d+)$`)
-
-func parseServiceType(s string) (ret upnp.ServiceURN, err error) {
-	matches := serviceURNRegexp.FindStringSubmatch(s)
-	if matches == nil {
-		err = errors.New(s)
-		return
-	}
-	if len(matches) != 3 {
-		log.Panicf("Invalid serviceURNRegexp ?")
-	}
-	ret.Type = matches[1]
-	ret.Version, err = strconv.ParseUint(matches[2], 0, 0)
-	return
-}
-
-func parseActionHTTPHeader(s string) (ret upnp.SoapAction, err error) {
-	if s[0] != '"' || s[len(s)-1] != '"' {
-		return
-	}
-	s = s[1 : len(s)-1]
-	hashIndex := strings.LastIndex(s, "#")
-	if hashIndex == -1 {
-		return
-	}
-	ret.Action = s[hashIndex+1:]
-	ret.ServiceURN, err = parseServiceType(s[:hashIndex])
-	return
+	return fmt.Appendf(nil, `<u:%[1]sResponse xmlns:u="%[2]s">%[3]s</u:%[1]sResponse>`,
+		sa.Action, sa.ServiceURN.String(), mustMarshalXML(xmlArgs))
 }
 
 type loggingResponseWriter struct {
@@ -125,7 +140,7 @@ type loggingResponseWriter struct {
 	committed bool
 }
 
-func (lrw *loggingResponseWriter) logRequest(code int, err interface{}) {
+func (lrw *loggingResponseWriter) logRequest(code int, err any) {
 	// Choose appropriate log level based on response status code.
 	var level fs.LogLevel
 	if code < 400 && err == nil {
@@ -138,7 +153,7 @@ func (lrw *loggingResponseWriter) logRequest(code int, err interface{}) {
 		err = ""
 	}
 
-	fs.LogPrintf(level, lrw.request.URL, "%s %s %d %s %s",
+	fs.LogLevelPrintf(level, lrw.request.URL.Path, "%s %s %d %s %s",
 		lrw.request.RemoteAddr, lrw.request.Method, code,
 		lrw.request.Header.Get("SOAPACTION"), err)
 }
@@ -173,9 +188,10 @@ func logging(next http.Handler) http.Handler {
 // Error recovery and general request logging are left to logging().
 func traceLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		dump, err := httputil.DumpRequest(r, true)
 		if err != nil {
-			serveError(nil, w, "error dumping request", err)
+			serveError(ctx, nil, w, "error dumping request", err)
 			return
 		}
 		fs.Debugf(nil, "%s", dump)
@@ -192,9 +208,7 @@ func traceLogging(next http.Handler) http.Handler {
 		}
 
 		// copy from recorder to the real response writer
-		for k, v := range recorder.Header() {
-			w.Header()[k] = v
-		}
+		maps.Copy(w.Header(), recorder.Header())
 		w.WriteHeader(recorder.Code)
 		_, err = recorder.Body.WriteTo(w)
 		if err != nil {
@@ -213,8 +227,8 @@ func withHeader(name string, value string, next http.Handler) http.Handler {
 }
 
 // serveError returns an http.StatusInternalServerError and logs the error
-func serveError(what interface{}, w http.ResponseWriter, text string, err error) {
-	err = fs.CountError(err)
+func serveError(ctx context.Context, what any, w http.ResponseWriter, text string, err error) {
+	err = fs.CountError(ctx, err)
 	fs.Errorf(what, "%s: %v", text, err)
 	http.Error(w, text+".", http.StatusInternalServerError)
 }

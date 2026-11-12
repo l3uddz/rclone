@@ -22,7 +22,7 @@ func TestEncodeString(t *testing.T) {
 		mask MultiEncoder
 		want string
 	}{
-		{0, "None"},
+		{EncodeRaw, "Raw"},
 		{EncodeZero, "None"},
 		{EncodeDoubleQuote, "DoubleQuote"},
 		{EncodeDot, "Dot"},
@@ -44,7 +44,7 @@ func TestEncodeSet(t *testing.T) {
 		wantErr bool
 	}{
 		{"", 0, true},
-		{"None", 0, false},
+		{"Raw", EncodeRaw, false},
 		{"None", EncodeZero, false},
 		{"DoubleQuote", EncodeDoubleQuote, false},
 		{"Dot", EncodeDot, false},
@@ -178,7 +178,7 @@ func TestEncodeInvalidUnicode(t *testing.T) {
 func TestEncodeDot(t *testing.T) {
 	for i, tc := range []testCase{
 		{
-			mask: 0,
+			mask: EncodeZero,
 			in:   ".",
 			out:  ".",
 		}, {
@@ -186,7 +186,7 @@ func TestEncodeDot(t *testing.T) {
 			in:   ".",
 			out:  "．",
 		}, {
-			mask: 0,
+			mask: EncodeZero,
 			in:   "..",
 			out:  "..",
 		}, {
@@ -224,7 +224,7 @@ func TestDecodeHalf(t *testing.T) {
 			in:   "‛",
 			out:  "‛",
 		}, {
-			mask: 0,
+			mask: EncodeZero,
 			in:   "‛‛",
 			out:  "‛",
 		}, {
@@ -255,6 +255,44 @@ func TestDecodeHalf(t *testing.T) {
 	}
 }
 
+func TestEncodeQuoteBeforeRightEdge(t *testing.T) {
+	for i, tc := range []testCase{
+		{
+			mask: EncodeRightSpace,
+			in:   "a‛ ",
+			out:  "a‛‛␠",
+		}, {
+			mask: EncodeRightSpace,
+			in:   "‛‛ ",
+			out:  "‛‛‛‛␠",
+		}, {
+			mask: EncodeRightSpace,
+			in:   "a‛␠",
+			out:  "a‛‛‛␠",
+		}, {
+			mask: EncodeRightPeriod,
+			in:   "a‛.",
+			out:  "a‛‛．",
+		}, {
+			mask: EncodeRightCrLfHtVt,
+			in:   "a‛\t",
+			out:  "a‛‛␉",
+		},
+	} {
+		e := tc.mask
+		t.Run(strconv.FormatInt(int64(i), 10), func(t *testing.T) {
+			got := e.Encode(tc.in)
+			if got != tc.out {
+				t.Errorf("Encode(%q) want %q got %q", tc.in, tc.out, got)
+			}
+			got2 := e.Decode(got)
+			if got2 != tc.in {
+				t.Errorf("Decode(%q) want %q got %q", got, tc.in, got2)
+			}
+		})
+	}
+}
+
 const oneDrive = (Standard |
 	EncodeWin |
 	EncodeBackSlash |
@@ -266,54 +304,111 @@ const oneDrive = (Standard |
 	EncodeRightPeriod)
 
 var benchTests = []struct {
-	in  string
-	out string
+	in     string
+	outOld string
+	outNew string
 }{
-	{"", ""},
-	{"abc 123", "abc 123"},
-	{`\*<>?:|#%".~`, `＼＊＜＞？：｜＃％＂.~`},
-	{`\*<>?:|#%".~/\*<>?:|#%".~`, `＼＊＜＞？：｜＃％＂.~/＼＊＜＞？：｜＃％＂.~`},
-	{" leading space", " leading space"},
-	{"~leading tilde", "～leading tilde"},
-	{"trailing dot.", "trailing dot．"},
-	{" leading space/ leading space/ leading space", " leading space/ leading space/ leading space"},
-	{"~leading tilde/~leading tilde/~leading tilde", "～leading tilde/～leading tilde/～leading tilde"},
-	{"leading tilde/~leading tilde", "leading tilde/～leading tilde"},
-	{"trailing dot./trailing dot./trailing dot.", "trailing dot．/trailing dot．/trailing dot．"},
+	{
+		"",
+		"",
+		"",
+	},
+	{
+		"abc 123",
+		"abc 123",
+		"abc 123",
+	},
+	{
+		`\*<>?:|#%".~`,
+		`＼＊＜＞？：｜＃％＂.~`,
+		`＼＊＜＞？：｜＃％＂.~`,
+	},
+	{
+		`\*<>?:|#%".~/\*<>?:|#%".~`,
+		`＼＊＜＞？：｜＃％＂.~/＼＊＜＞？：｜＃％＂.~`,
+		`＼＊＜＞？：｜＃％＂.~／＼＊＜＞？：｜＃％＂.~`,
+	},
+	{
+		" leading space",
+		" leading space",
+		" leading space",
+	},
+	{
+		"~leading tilde",
+		"～leading tilde",
+		"～leading tilde",
+	},
+	{
+		"trailing dot.",
+		"trailing dot．",
+		"trailing dot．",
+	},
+	{
+		" leading space/ leading space/ leading space",
+		" leading space/ leading space/ leading space",
+		" leading space／ leading space／ leading space",
+	},
+	{
+		"~leading tilde/~leading tilde/~leading tilde",
+		"～leading tilde/～leading tilde/～leading tilde",
+		"～leading tilde／~leading tilde／~leading tilde",
+	},
+	{
+		"leading tilde/~leading tilde",
+		"leading tilde/～leading tilde",
+		"leading tilde／~leading tilde",
+	},
+	{
+		"trailing dot./trailing dot./trailing dot.",
+		"trailing dot．/trailing dot．/trailing dot．",
+		"trailing dot.／trailing dot.／trailing dot．",
+	},
 }
 
-func benchReplace(b *testing.B, f func(string) string) {
+func benchReplace(b *testing.B, f func(string) string, old bool) {
 	for range make([]struct{}, b.N) {
 		for _, test := range benchTests {
 			got := f(test.in)
-			if got != test.out {
-				b.Errorf("Encode(%q) want %q got %q", test.in, test.out, got)
+			out := test.outNew
+			if old {
+				out = test.outOld
+			}
+			if got != out {
+				b.Errorf("Encode(%q) want %q got %q", test.in, out, got)
 			}
 		}
 	}
 }
 
-func benchRestore(b *testing.B, f func(string) string) {
+func benchRestore(b *testing.B, f func(string) string, old bool) {
 	for range make([]struct{}, b.N) {
 		for _, test := range benchTests {
-			got := f(test.out)
+			out := test.outNew
+			if old {
+				out = test.outOld
+			}
+			got := f(out)
 			if got != test.in {
-				b.Errorf("Decode(%q) want %q got %q", got, test.in, got)
+				b.Errorf("Decode(%q) want %q got %q", out, test.in, got)
 			}
 		}
 	}
 }
+
 func BenchmarkOneDriveReplaceNew(b *testing.B) {
-	benchReplace(b, oneDrive.Encode)
+	benchReplace(b, oneDrive.Encode, false)
 }
+
 func BenchmarkOneDriveReplaceOld(b *testing.B) {
-	benchReplace(b, replaceReservedChars)
+	benchReplace(b, replaceReservedChars, true)
 }
+
 func BenchmarkOneDriveRestoreNew(b *testing.B) {
-	benchRestore(b, oneDrive.Decode)
+	benchRestore(b, oneDrive.Decode, false)
 }
+
 func BenchmarkOneDriveRestoreOld(b *testing.B) {
-	benchRestore(b, restoreReservedChars)
+	benchRestore(b, restoreReservedChars, true)
 }
 
 var (

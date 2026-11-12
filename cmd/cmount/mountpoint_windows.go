@@ -1,15 +1,14 @@
-// +build cmount
-// +build cgo
-// +build windows
+//go:build cmount && windows
 
 package cmount
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/file"
@@ -18,13 +17,13 @@ import (
 var isDriveRegex = regexp.MustCompile(`^[a-zA-Z]\:$`)
 var isDriveRootPathRegex = regexp.MustCompile(`^[a-zA-Z]\:\\$`)
 var isDriveOrRootPathRegex = regexp.MustCompile(`^[a-zA-Z]\:\\?$`)
-var isNetworkSharePathRegex = regexp.MustCompile(`^\\\\[^\\]+\\[^\\]`)
+var isNetworkSharePathRegex = regexp.MustCompile(`^\\\\[^\\\?]+\\[^\\]`)
 
 // isNetworkSharePath returns true if the given string is a valid network share path,
 // in the basic UNC format "\\Server\Share\Path", where the first two path components
 // are required ("\\Server\Share", which represents the volume).
 // Extended-length UNC format "\\?\UNC\Server\Share\Path" is not considered, as it is
-// not supported by cgofuse/winfsp.
+// not supported by cgofuse/winfsp, so returns false for any paths with prefix "\\?\".
 // Note: There is a UNCPath function in lib/file, but it refers to any extended-length
 // paths using prefix "\\?\", and not necessarily network resource UNC paths.
 func isNetworkSharePath(l string) bool {
@@ -80,7 +79,7 @@ func handleDefaultMountpath() (string, error) {
 func handleNetworkShareMountpath(mountpath string, opt *mountlib.Options) (string, error) {
 	// Assuming mount path is a valid network share path (UNC format, "\\Server\Share").
 	// Always mount as network drive, regardless of the NetworkMode option.
-	// Find an unused drive letter to use as mountpoint, the the supplied path can
+	// Find an unused drive letter to use as mountpoint, the supplied path can
 	// be used as volume prefix (network share path) instead of mountpoint.
 	if !opt.NetworkMode {
 		fs.Debugf(nil, "Forcing --network-mode because mountpoint path is network share UNC format")
@@ -94,14 +93,14 @@ func handleNetworkShareMountpath(mountpath string, opt *mountlib.Options) (strin
 }
 
 // handleLocalMountpath handles the case where mount path is a local file system path.
-func handleLocalMountpath(mountpath string, opt *mountlib.Options) (string, error) {
+func handleLocalMountpath(f fs.Fs, mountpath string, opt *mountlib.Options) (string, error) {
 	// Assuming path is drive letter or directory path, not network share (UNC) path.
 	// If drive letter: Must be given as a single character followed by ":" and nothing else.
 	// Else, assume directory path: Directory must not exist, but its parent must.
 	if _, err := os.Stat(mountpath); err == nil {
 		return "", errors.New("mountpoint path already exists: " + mountpath)
 	} else if !os.IsNotExist(err) {
-		return "", errors.Wrap(err, "failed to retrieve mountpoint path information")
+		return "", fmt.Errorf("failed to retrieve mountpoint path information: %w", err)
 	}
 	if isDriveRootPath(mountpath) { // Assume intention with "X:\" was "X:"
 		mountpath = mountpath[:len(mountpath)-1] // WinFsp needs drive mountpoints without trailing path separator
@@ -116,14 +115,17 @@ func handleLocalMountpath(mountpath string, opt *mountlib.Options) (string, erro
 		}
 		var err error
 		if mountpath, err = filepath.Abs(mountpath); err != nil { // Ensures parent is found but also more informative log messages
-			return "", errors.Wrap(err, "mountpoint path is not valid: "+mountpath)
+			return "", fmt.Errorf("mountpoint path is not valid: %s: %w", mountpath, err)
 		}
 		parent := filepath.Join(mountpath, "..")
 		if _, err = os.Stat(parent); err != nil {
 			if os.IsNotExist(err) {
 				return "", errors.New("parent of mountpoint directory does not exist: " + parent)
 			}
-			return "", errors.Wrap(err, "failed to retrieve mountpoint directory parent information")
+			return "", fmt.Errorf("failed to retrieve mountpoint directory parent information: %w", err)
+		}
+		if err = mountlib.CheckOverlap(f, mountpath); err != nil {
+			return "", err
 		}
 	}
 	return mountpath, nil
@@ -158,9 +160,19 @@ func handleVolumeName(opt *mountlib.Options, volumeName string) {
 
 // getMountpoint handles mounting details on Windows,
 // where disk and network based file systems are treated different.
-func getMountpoint(mountpath string, opt *mountlib.Options) (mountpoint string, err error) {
+func getMountpoint(f fs.Fs, mountpath string, opt *mountlib.Options) (mountpoint string, err error) {
+	// Inform about some options not relevant in this mode
+	if opt.AllowNonEmpty {
+		fs.Logf(nil, "--allow-non-empty flag does nothing on Windows")
+	}
+	if opt.AllowRoot {
+		fs.Logf(nil, "--allow-root flag does nothing on Windows")
+	}
+	if opt.AllowOther {
+		fs.Logf(nil, "--allow-other flag does nothing on Windows")
+	}
 
-	// First handle mountpath
+	// Handle mountpath
 	var volumeName string
 	if isDefaultPath(mountpath) {
 		// Mount path indicates defaults, which will automatically pick an unused drive letter.
@@ -172,10 +184,10 @@ func getMountpoint(mountpath string, opt *mountlib.Options) (mountpoint string, 
 		volumeName = mountpath[1:] // WinFsp requires volume prefix as UNC-like path but with only a single backslash
 	} else {
 		// Mount path is drive letter or directory path.
-		mountpoint, err = handleLocalMountpath(mountpath, opt)
+		mountpoint, err = handleLocalMountpath(f, mountpath, opt)
 	}
 
-	// Second handle volume name
+	// Handle volume name
 	handleVolumeName(opt, volumeName)
 
 	// Done, return mountpoint to be used, together with updated mount options.

@@ -1,4 +1,4 @@
-// +build linux darwin freebsd
+//go:build linux || darwin || freebsd || openbsd
 
 package vfstest
 
@@ -8,6 +8,7 @@ import (
 
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,7 +21,7 @@ func TestWriteFileDoubleClose(t *testing.T) {
 	}
 
 	out, err := osCreate(run.path("testdoubleclose"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	fd := out.Fd()
 
 	fd1, err := unix.Dup(int(fd))
@@ -45,7 +46,7 @@ func TestWriteFileDoubleClose(t *testing.T) {
 
 	// write to the other dup
 	_, err = unix.Write(fd2, buf)
-	if run.vfs.Opt.CacheMode < vfscommon.CacheModeWrites {
+	if run.vfsOpt.CacheMode < vfscommon.CacheModeWrites {
 		// produces an error if cache mode < writes
 		assert.Error(t, err, "input/output error")
 	} else {

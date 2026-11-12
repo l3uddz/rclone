@@ -9,24 +9,29 @@ package fstests
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/bits"
+	"net"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
@@ -35,6 +40,7 @@ import (
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/testserver"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pool"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/stretchr/testify/assert"
@@ -61,6 +67,8 @@ type ChunkedUploadConfig struct {
 	CeilChunkSize func(fs.SizeSuffix) fs.SizeSuffix
 	// More than one chunk is required on upload
 	NeedMultipleChunks bool
+	// Skip this particular remote
+	Skip bool
 }
 
 // SetUploadChunkSizer is a test only interface to change the upload chunk size at runtime
@@ -75,6 +83,14 @@ type SetUploadCutoffer interface {
 	// Change the configured UploadCutoff.
 	// Will only be called while no transfer is in progress.
 	SetUploadCutoff(fs.SizeSuffix) (fs.SizeSuffix, error)
+}
+
+// SetCopyCutoffer is a test only interface to change the copy cutoff size at runtime
+type SetCopyCutoffer interface {
+	// Change the configured CopyCutoff.
+	// Will only be called while no transfer is in progress.
+	// Return fs.ErrorNotImplemented if you can't implement this
+	SetCopyCutoff(fs.SizeSuffix) (fs.SizeSuffix, error)
 }
 
 // NextPowerOfTwo returns the current or next bigger power of two.
@@ -119,24 +135,6 @@ func objsToNames(objs []fs.Object) []string {
 	return names
 }
 
-// findObject finds the object on the remote
-func findObject(ctx context.Context, t *testing.T, f fs.Fs, Name string) fs.Object {
-	var obj fs.Object
-	var err error
-	sleepTime := 1 * time.Second
-	for i := 1; i <= *fstest.ListRetries; i++ {
-		obj, err = f.NewObject(ctx, Name)
-		if err == nil {
-			break
-		}
-		t.Logf("Sleeping for %v for findObject eventual consistency: %d/%d (%v)", sleepTime, i, *fstest.ListRetries, err)
-		time.Sleep(sleepTime)
-		sleepTime = (sleepTime * 3) / 2
-	}
-	require.NoError(t, err)
-	return obj
-}
-
 // retry f() until no retriable error
 func retry(t *testing.T, what string, f func() error) {
 	const maxTries = 10
@@ -153,32 +151,29 @@ func retry(t *testing.T, what string, f func() error) {
 	require.NoError(t, err, what)
 }
 
-// An fs.ObjectInfo that can override mime type
-type objectInfoWithMimeType struct {
-	fs.ObjectInfo
-	mimeType string
-}
-
-// Return a wrapped fs.ObjectInfo which returns the mime type given
-func overrideMimeType(o fs.ObjectInfo, mimeType string) fs.ObjectInfo {
-	return &objectInfoWithMimeType{
-		ObjectInfo: o,
-		mimeType:   mimeType,
+// checkFingerprint checks that the fingerprint of the in-memory
+// object (memory) exactly matches the fingerprint of the same object
+// read back from the remote (reloaded).
+func checkFingerprint(ctx context.Context, t *testing.T, memory, reloaded fs.Object) {
+	t.Helper()
+	for _, test := range []struct {
+		fast bool
+		name string
+	}{
+		{fast: false, name: "slow"},
+		{fast: true, name: "fast"},
+	} {
+		memoryFingerprint, reloadedFingerprint := fs.Fingerprint(ctx, memory, test.fast), fs.Fingerprint(ctx, reloaded, test.fast)
+		assert.Equal(t, memoryFingerprint, reloadedFingerprint, "%s fingerprint of object in memory (%v) should exactly match fingerprint read back from the remote (%v)", test.name, memoryFingerprint, reloadedFingerprint)
 	}
 }
 
-// MimeType that was overridden
-func (o *objectInfoWithMimeType) MimeType(ctx context.Context) string {
-	return o.mimeType
-}
-
-// check interface
-var _ fs.MimeTyper = (*objectInfoWithMimeType)(nil)
-
-// putTestContentsMimeType puts file with given contents to the remote and checks it but unlike TestPutLarge doesn't remove
+// PutTestContentsMetadata puts file with given contents to the remote and checks it but unlike TestPutLarge doesn't remove
 //
-// it uploads the object with the mimeType passed in if set
-func putTestContentsMimeType(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item, contents string, check bool, mimeType string) (string, fs.Object) {
+// It uploads the object with the mimeType and metadata passed in if set.
+//
+// It returns the object which will have been checked if check is set
+func PutTestContentsMetadata(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item, useFileHashes bool, contents string, check bool, mimeType string, metadata fs.Metadata, options ...fs.OpenOption) fs.Object {
 	var (
 		err        error
 		obj        fs.Object
@@ -190,63 +185,102 @@ func putTestContentsMimeType(ctx context.Context, t *testing.T, f fs.Fs, file *f
 		in := io.TeeReader(buf, uploadHash)
 
 		file.Size = int64(buf.Len())
-		obji := object.NewStaticObjectInfo(file.Path, file.ModTime, file.Size, true, nil, nil)
-		if mimeType != "" {
-			obji = overrideMimeType(obji, mimeType)
+		// The caller explicitly indicates whether the hashes in the file parameter should be used. If hashes is nil,
+		// then NewStaticObjectInfo will calculate default hashes for use in the check.
+		hashes := file.Hashes
+		if !useFileHashes {
+			hashes = nil
 		}
-		obj, err = f.Put(ctx, in, obji)
+		obji := object.NewStaticObjectInfo(file.Path, file.ModTime, file.Size, true, hashes, nil)
+		if mimeType != "" || metadata != nil {
+			// force the --metadata flag on temporarily
+			if metadata != nil {
+				ci := fs.GetConfig(ctx)
+				previousMetadata := ci.Metadata
+				ci.Metadata = true
+				defer func() {
+					ci.Metadata = previousMetadata
+				}()
+			}
+			obji.WithMetadata(metadata).WithMimeType(mimeType)
+		}
+		obj, err = f.Put(ctx, in, obji, options...)
 		return err
 	})
 	file.Hashes = uploadHash.Sums()
 	if check {
+		// Overwrite time with that in metadata if it is already specified
+		mtime, ok := metadata["mtime"]
+		if ok {
+			modTime, err := time.Parse(time.RFC3339Nano, mtime)
+			require.NoError(t, err)
+			file.ModTime = modTime
+		}
 		file.Check(t, obj, f.Precision())
 		// Re-read the object and check again
-		obj = findObject(ctx, t, f, file.Path)
+		liveObj := obj
+		obj = fstest.NewObject(ctx, t, f, file.Path)
 		file.Check(t, obj, f.Precision())
+		checkFingerprint(ctx, t, liveObj, obj)
 	}
-	return contents, obj
+	return obj
 }
 
 // PutTestContents puts file with given contents to the remote and checks it but unlike TestPutLarge doesn't remove
-func PutTestContents(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item, contents string, check bool) (string, fs.Object) {
-	return putTestContentsMimeType(ctx, t, f, file, contents, check, "")
+func PutTestContents(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item, contents string, check bool) fs.Object {
+	return PutTestContentsMetadata(ctx, t, f, file, false, contents, check, "", nil)
 }
 
 // testPut puts file with random contents to the remote
 func testPut(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item) (string, fs.Object) {
-	return PutTestContents(ctx, t, f, file, random.String(100), true)
+	return testPutMimeType(ctx, t, f, file, "", nil)
 }
 
 // testPutMimeType puts file with random contents to the remote and the mime type given
-func testPutMimeType(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item, mimeType string) (string, fs.Object) {
-	return putTestContentsMimeType(ctx, t, f, file, random.String(100), true, mimeType)
+func testPutMimeType(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item, mimeType string, metadata fs.Metadata) (string, fs.Object) {
+	contents := random.String(100)
+	// We just generated new contents, but file may contain hashes generated by a previous operation
+	if len(file.Hashes) > 0 {
+		file.Hashes = make(map[hash.Type]string)
+	}
+	return contents, PutTestContentsMetadata(ctx, t, f, file, false, contents, true, mimeType, metadata)
 }
 
-// TestPutLarge puts file to the remote, checks it and removes it on success.
-func TestPutLarge(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item) {
+// testPutLarge puts file to the remote, checks it and removes it on success.
+//
+// If stream is set, then it uploads the file with size -1
+func testPutLarge(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item, stream bool) {
 	var (
 		err        error
 		obj        fs.Object
 		uploadHash *hash.MultiHasher
 	)
+	inUse := pool.Global().InUse()
 	retry(t, "PutLarge", func() error {
 		r := readers.NewPatternReader(file.Size)
 		uploadHash = hash.NewMultiHasher()
 		in := io.TeeReader(r, uploadHash)
 
-		obji := object.NewStaticObjectInfo(file.Path, file.ModTime, file.Size, true, nil, nil)
+		size := file.Size
+		if stream {
+			size = -1
+		}
+		obji := object.NewStaticObjectInfo(file.Path, file.ModTime, size, true, nil, nil)
 		obj, err = f.Put(ctx, in, obji)
 		if file.Size == 0 && err == fs.ErrorCantUploadEmptyFiles {
 			t.Skip("Can't upload zero length files")
 		}
 		return err
 	})
+	assert.Equal(t, inUse, pool.Global().InUse(), "buffers not returned to the global pool after upload")
 	file.Hashes = uploadHash.Sums()
 	file.Check(t, obj, f.Precision())
 
 	// Re-read the object and check again
-	obj = findObject(ctx, t, f, file.Path)
+	liveObj := obj
+	obj = fstest.NewObject(ctx, t, f, file.Path)
 	file.Check(t, obj, f.Precision())
+	checkFingerprint(ctx, t, liveObj, obj)
 
 	// Download the object and check it is OK
 	downloadHash := hash.NewMultiHasher()
@@ -262,8 +296,18 @@ func TestPutLarge(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item)
 	require.NoError(t, obj.Remove(ctx))
 }
 
-// read the contents of an object as a string
-func readObject(ctx context.Context, t *testing.T, obj fs.Object, limit int64, options ...fs.OpenOption) string {
+// TestPutLarge puts file to the remote, checks it and removes it on success.
+func TestPutLarge(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item) {
+	testPutLarge(ctx, t, f, file, false)
+}
+
+// TestPutLargeStreamed puts file of unknown size to the remote, checks it and removes it on success.
+func TestPutLargeStreamed(ctx context.Context, t *testing.T, f fs.Fs, file *fstest.Item) {
+	testPutLarge(ctx, t, f, file, true)
+}
+
+// ReadObject reads the contents of an object as a string
+func ReadObject(ctx context.Context, t *testing.T, obj fs.Object, limit int64, options ...fs.OpenOption) string {
 	what := fmt.Sprintf("readObject(%q) limit=%d, options=%+v", obj, limit, options)
 	in, err := obj.Open(ctx, options...)
 	require.NoError(t, err, what)
@@ -271,7 +315,7 @@ func readObject(ctx context.Context, t *testing.T, obj fs.Object, limit int64, o
 	if limit >= 0 {
 		r = &io.LimitedReader{R: r, N: limit}
 	}
-	contents, err := ioutil.ReadAll(r)
+	contents, err := io.ReadAll(r)
 	require.NoError(t, err, what)
 	err = in.Close()
 	require.NoError(t, err, what)
@@ -283,28 +327,27 @@ type ExtraConfigItem struct{ Name, Key, Value string }
 
 // Opt is options for Run
 type Opt struct {
-	RemoteName                   string
-	NilObject                    fs.Object
-	ExtraConfig                  []ExtraConfigItem
-	SkipBadWindowsCharacters     bool     // skips unusable characters for windows if set
-	SkipFsMatch                  bool     // if set skip exact matching of Fs value
-	TiersToTest                  []string // List of tiers which can be tested in setTier test
-	ChunkedUpload                ChunkedUploadConfig
-	UnimplementableFsMethods     []string // List of methods which can't be implemented in this wrapping Fs
-	UnimplementableObjectMethods []string // List of methods which can't be implemented in this wrapping Fs
-	SkipFsCheckWrap              bool     // if set skip FsCheckWrap
-	SkipObjectCheckWrap          bool     // if set skip ObjectCheckWrap
-	SkipInvalidUTF8              bool     // if set skip invalid UTF-8 checks
+	RemoteName                      string
+	NilObject                       fs.Object
+	ExtraConfig                     []ExtraConfigItem
+	SkipBadWindowsCharacters        bool     // skips unusable characters for windows if set
+	SkipFsMatch                     bool     // if set skip exact matching of Fs value
+	TiersToTest                     []string // List of tiers which can be tested in setTier test
+	ChunkedUpload                   ChunkedUploadConfig
+	UnimplementableFsMethods        []string // List of Fs methods which can't be implemented in this wrapping Fs
+	UnimplementableObjectMethods    []string // List of Object methods which can't be implemented in this wrapping Fs
+	UnimplementableDirectoryMethods []string // List of Directory methods which can't be implemented in this wrapping Fs
+	SkipFsCheckWrap                 bool     // if set skip FsCheckWrap
+	SkipObjectCheckWrap             bool     // if set skip ObjectCheckWrap
+	SkipDirectoryCheckWrap          bool     // if set skip DirectoryCheckWrap
+	SkipInvalidUTF8                 bool     // if set skip invalid UTF-8 checks
+	SkipLeadingDot                  bool     // if set skip leading dot checks
+	QuickTestOK                     bool     // if set, run this test with make quicktest
 }
 
 // returns true if x is found in ss
 func stringsContains(x string, ss []string) bool {
-	for _, s := range ss {
-		if x == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(ss, x)
 }
 
 // toUpperASCII returns a copy of the string s with all Unicode
@@ -329,6 +372,9 @@ func removeConfigID(s string) string {
 	return s
 }
 
+// InternalTestFiles is the state of the remote at the moment the internal tests are called
+var InternalTestFiles []fstest.Item
+
 // Run runs the basic integration tests for a remote using the options passed in.
 //
 // They are structured in a hierarchical way so that dependencies for the tests can be created.
@@ -348,6 +394,7 @@ func Run(t *testing.T, opt *Opt) {
 		}
 		file1Contents string
 		file1MimeType = "text/csv"
+		file1Metadata = fs.Metadata{"rclonetest": "potato"}
 		file2         = fstest.Item{
 			ModTime: fstest.Time("2001-02-03T04:05:10.123123123Z"),
 			Path:    `hello? sausage/êé/Hello, 世界/ " ' @ < > & ? + ≠/z.txt`,
@@ -359,7 +406,7 @@ func Run(t *testing.T, opt *Opt) {
 		unwrappableFsMethods = []string{"Command"} // these Fs methods don't need to be wrapped ever
 	)
 
-	if strings.HasSuffix(os.Getenv("RCLONE_CONFIG"), "/notfound") && *fstest.RemoteName == "" {
+	if strings.HasSuffix(os.Getenv("RCLONE_CONFIG"), "/notfound") && *fstest.RemoteName == "" && !opt.QuickTestOK {
 		t.Skip("quicktest only")
 	}
 
@@ -387,8 +434,7 @@ func Run(t *testing.T, opt *Opt) {
 	// Skip if remote is not SetTier and GetTier capable
 	skipIfNotSetTier := func(t *testing.T) {
 		skipIfNotOk(t)
-		if f.Features().SetTier == false ||
-			f.Features().GetTier == false {
+		if !f.Features().SetTier || !f.Features().GetTier {
 			t.Skip("FS has no SetTier & GetTier interfaces")
 		}
 	}
@@ -405,7 +451,7 @@ func Run(t *testing.T, opt *Opt) {
 
 	// Set extra config if supplied
 	for _, item := range opt.ExtraConfig {
-		config.FileSet(item.Name, item.Key, item.Value)
+		config.FileSetValue(item.Name, item.Key, item.Value)
 	}
 	if *fstest.RemoteName != "" {
 		remoteName = *fstest.RemoteName
@@ -435,10 +481,14 @@ func Run(t *testing.T, opt *Opt) {
 	subRemoteName, subRemoteLeaf, err = fstest.RandomRemoteName(remoteName)
 	require.NoError(t, err)
 	f, err = fs.NewFs(context.Background(), subRemoteName)
-	if err == fs.ErrorNotFoundInConfigFile {
+	if errors.Is(err, fs.ErrorNotFoundInConfigFile) {
 		t.Logf("Didn't find %q in config file - skipping tests", remoteName)
 		return
 	}
+	require.NoError(t, err, fmt.Sprintf("unexpected error: %v", err))
+
+	// Get fsInfo which contains type, etc. of the fs
+	fsInfo, _, _, _, err := fs.ConfigFs(subRemoteName)
 	require.NoError(t, err, fmt.Sprintf("unexpected error: %v", err))
 
 	// Skip the rest if it failed
@@ -451,12 +501,12 @@ func Run(t *testing.T, opt *Opt) {
 			t.Skip("Skipping FsCheckWrap on this Fs")
 		}
 		ft := new(fs.Features).Fill(ctx, f)
-		if ft.UnWrap == nil {
+		if ft.UnWrap == nil && !f.Features().Overlay {
 			t.Skip("Not a wrapping Fs")
 		}
 		v := reflect.ValueOf(ft).Elem()
 		vType := v.Type()
-		for i := 0; i < v.NumField(); i++ {
+		for i := range v.NumField() {
 			vName := vType.Field(i).Name
 			if stringsContains(vName, opt.UnimplementableFsMethods) {
 				continue
@@ -491,14 +541,14 @@ func Run(t *testing.T, opt *Opt) {
 		assert.True(t, len(fsInfo.CommandHelp) > 0, "Command is declared, must return some help in CommandHelp")
 	})
 
-	// TestFsRmdirNotFound tests deleting a non existent directory
+	// TestFsRmdirNotFound tests deleting a nonexistent directory
 	t.Run("FsRmdirNotFound", func(t *testing.T) {
 		skipIfNotOk(t)
 		if isBucketBasedButNotRoot(f) {
-			t.Skip("Skipping test as non root bucket based remote")
+			t.Skip("Skipping test as non root bucket-based remote")
 		}
 		err := f.Rmdir(ctx, "")
-		assert.Error(t, err, "Expecting error on Rmdir non existent")
+		assert.Error(t, err, "Expecting error on Rmdir nonexistent")
 	})
 
 	// Make the directory
@@ -517,23 +567,78 @@ func Run(t *testing.T, opt *Opt) {
 	t.Run("FsName", func(t *testing.T) {
 		skipIfNotOk(t)
 		got := removeConfigID(f.Name())
-		want := remoteName[:strings.LastIndex(remoteName, ":")+1]
+		var want string
 		if isLocalRemote {
-			want = "local:"
+			want = "local"
+		} else {
+			want = remoteName[:strings.LastIndex(remoteName, ":")]
+			comma := strings.IndexRune(remoteName, ',')
+			if comma >= 0 {
+				want = want[:comma]
+			}
 		}
-		require.Equal(t, want, got+":")
+		require.Equal(t, want, got)
 	})
 
 	// TestFsRoot tests the Root method
 	t.Run("FsRoot", func(t *testing.T) {
 		skipIfNotOk(t)
-		name := removeConfigID(f.Name()) + ":"
-		root := f.Root()
+		got := f.Root()
+		want := subRemoteName
+		colon := strings.LastIndex(want, ":")
+		if colon >= 0 {
+			want = want[colon+1:]
+		}
 		if isLocalRemote {
 			// only check last path element on local
-			require.Equal(t, filepath.Base(subRemoteName), filepath.Base(root))
+			require.Equal(t, filepath.Base(subRemoteName), filepath.Base(got))
 		} else {
-			require.Equal(t, subRemoteName, name+root)
+			require.Equal(t, want, got)
+		}
+	})
+
+	// TestFsRootCannotChangeHost tests that a root beginning with //
+	// is treated as a path and can't move the remote to a host of the
+	// attacker's choosing.
+	//
+	// A root beginning with // is a network-path reference under the
+	// URL standard so a backend which resolves its root as a URL
+	// reference against a configured URL could send requests, and
+	// whatever credentials go with them, to the host named in the root.
+	t.Run("FsRootCannotChangeHost", func(t *testing.T) {
+		skipIfNotOk(t)
+		if !strings.HasSuffix(remoteName, ":") {
+			t.Skip("root of a path based remote can't be a network-path reference")
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer func() { _ = ln.Close() }()
+		var connections atomic.Int32
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				connections.Add(1)
+				// Reply with junk so the client fails at once rather than retrying a closed connection
+				_, _ = conn.Write([]byte("\x00\xff\x00\xff junk\n"))
+				_ = conn.Close()
+			}
+		}()
+		host := ln.Addr().String()
+		for _, root := range []string{
+			"//" + host + "/",
+			"//" + host + "/" + subRemoteLeaf + "/",
+			"//user:pass@" + host + "/",
+		} {
+			remote := remoteName + root
+			f, err := fs.NewFs(context.Background(), remote)
+			if err == nil {
+				// Not all backends contact the remote in NewFs
+				_, _ = f.List(context.Background(), "")
+			}
+			assert.Equal(t, int32(0), connections.Load(), "remote %q connected to the host named in its root", remote)
 		}
 	})
 
@@ -658,11 +763,16 @@ func Run(t *testing.T, opt *Opt) {
 				{"trailing VT", "trailing VT\v"},
 				{"trailing dot", "trailing dot."},
 				{"invalid UTF-8", "invalid utf-8\xfe"},
+				{"URL encoding", "test%46.txt"},
 			} {
 				t.Run(test.name, func(t *testing.T) {
 					if opt.SkipInvalidUTF8 && test.name == "invalid UTF-8" {
 						t.Skip("Skipping " + test.name)
 					}
+					if opt.SkipLeadingDot && test.name == "leading dot" {
+						t.Skip("Skipping " + test.name)
+					}
+
 					// turn raw strings into Standard encoding
 					fileName := encoder.Standard.Encode(test.path)
 					dirName := fileName
@@ -688,7 +798,7 @@ func Run(t *testing.T, opt *Opt) {
 			o, err := f.NewObject(ctx, "potato")
 			assert.Nil(t, o)
 			assert.Equal(t, fs.ErrorObjectNotFound, err)
-			// Now try an object in a non existing directory
+			// Now try an object in a nonexistent directory
 			o, err = f.NewObject(ctx, "directory/not/found/potato")
 			assert.Nil(t, o)
 			assert.Equal(t, fs.ErrorObjectNotFound, err)
@@ -720,9 +830,15 @@ func Run(t *testing.T, opt *Opt) {
 			// assert.Nil(t, obj) - FIXME some remotes return the object even on nil
 			assert.NotNil(t, err)
 
-			obj, err := f.NewObject(ctx, file2.Path)
-			assert.Nil(t, obj)
-			assert.Equal(t, fs.ErrorObjectNotFound, err)
+			retry(t, "FsPutError: test object does not exist", func() error {
+				obj, err := f.NewObject(ctx, file2.Path)
+				if err == nil {
+					return fserrors.RetryErrorf("object is present")
+				}
+				assert.Nil(t, obj)
+				assert.Equal(t, fs.ErrorObjectNotFound, err)
+				return nil
+			})
 		})
 
 		t.Run("FsPutZeroLength", func(t *testing.T) {
@@ -730,7 +846,7 @@ func Run(t *testing.T, opt *Opt) {
 
 			TestPutLarge(ctx, t, f, &fstest.Item{
 				ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
-				Path:    fmt.Sprintf("zero-length-file"),
+				Path:    "zero-length-file",
 				Size:    int64(0),
 			})
 		})
@@ -758,8 +874,91 @@ func Run(t *testing.T, opt *Opt) {
 
 			assert.NoError(t, out.Close())
 
-			obj := findObject(ctx, t, f, path)
-			assert.Equal(t, "abcdefghi", readObject(ctx, t, obj, -1), "contents of file differ")
+			obj := fstest.NewObject(ctx, t, f, path)
+			assert.Equal(t, "abcdefghi", ReadObject(ctx, t, obj, -1), "contents of file differ")
+
+			assert.NoError(t, obj.Remove(ctx))
+			assert.NoError(t, f.Rmdir(ctx, "writer-at-subdir"))
+		})
+
+		// TestFsOpenChunkWriter tests writing in chunks to fs
+		// then reads back the contents and check if they match
+		//
+		// The chunks are the size the chunk writer asks for, the
+		// last one short, as a multi-thread copy writes them
+		//
+		// go test -v -run 'TestIntegration/FsMkdir/FsOpenChunkWriter'
+		t.Run("FsOpenChunkWriter", func(t *testing.T) {
+			skipIfNotOk(t)
+			openChunkWriter := f.Features().OpenChunkWriter
+			if openChunkWriter == nil {
+				t.Skip("FS has no OpenChunkWriter interface")
+			}
+			size5MBs := 5 * 1024 * 1024
+			size1MB := 1 * 1024 * 1024
+			totalSize := int64(size5MBs*2 + size1MB)
+
+			// Ask for small chunks where the backend lets us so the
+			// file takes several of them
+			if setUploadChunkSizer, ok := f.(SetUploadChunkSizer); ok {
+				oldChunkSize, err := setUploadChunkSizer.SetUploadChunkSize(fs.SizeSuffix(size5MBs))
+				if err != nil {
+					t.Logf("Can't set the chunk size to %v: %v", fs.SizeSuffix(size5MBs), err)
+				} else {
+					defer func() {
+						_, err := setUploadChunkSizer.SetUploadChunkSize(oldChunkSize)
+						assert.NoError(t, err)
+					}()
+				}
+			}
+
+			path := "writer-at-subdir/writer-at-file"
+			open := func(size int64) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+				objSrc := object.NewStaticObjectInfo(path+"-WRONG-REMOTE", file1.ModTime, size, true, nil, nil)
+				return openChunkWriter(ctx, path, objSrc, &fs.ChunkOption{
+					ChunkSize: int64(size5MBs),
+				})
+			}
+			info, out, err := open(totalSize)
+			if errors.Is(err, fs.ErrorFileTooSmall) {
+				t.Skipf("file too small for multipart upload: %v", err)
+			}
+			require.NoError(t, err)
+			require.Greater(t, info.ChunkSize, int64(0), "chunk writer returned no chunk size")
+
+			// A backend whose chunk size couldn't be made small takes the
+			// file in fewer than three chunks, so start again with a file
+			// of two full chunks and a short one - unless the chunks are
+			// too big to hold in memory
+			if 2*info.ChunkSize >= totalSize && info.ChunkSize <= int64(128*fs.Mebi) {
+				require.NoError(t, out.Abort(ctx))
+				t.Logf("Chunk size %v leaves the file in fewer than three chunks, writing %v instead", fs.SizeSuffix(info.ChunkSize), fs.SizeSuffix(2*info.ChunkSize+int64(size1MB)))
+				totalSize = 2*info.ChunkSize + int64(size1MB)
+				info, out, err = open(totalSize)
+				require.NoError(t, err)
+			}
+
+			// Cut the file into chunks of the size the writer asked for
+			var contents []string
+			for offset := int64(0); offset < totalSize; offset += info.ChunkSize {
+				contents = append(contents, random.String(int(min(info.ChunkSize, totalSize-offset))))
+			}
+
+			// Write the chunks out of order, chunk 0 last
+			for i := 1; i <= len(contents); i++ {
+				chunkNumber := i % len(contents)
+				n, err := out.WriteChunk(ctx, chunkNumber, strings.NewReader(contents[chunkNumber]))
+				assert.NoError(t, err)
+				assert.Equal(t, int64(len(contents[chunkNumber])), n)
+			}
+
+			assert.NoError(t, out.Close(ctx))
+
+			obj := fstest.NewObject(ctx, t, f, path)
+			originalContents := strings.Join(contents, "")
+			fileContents := ReadObject(ctx, t, obj, -1)
+			isEqual := originalContents == fileContents
+			assert.True(t, isEqual, "contents of file differ")
 
 			assert.NoError(t, obj.Remove(ctx))
 			assert.NoError(t, f.Rmdir(ctx, "writer-at-subdir"))
@@ -862,7 +1061,7 @@ func Run(t *testing.T, opt *Opt) {
 			skipIfNotOk(t)
 			file1Contents, _ = testPut(ctx, t, f, &file1)
 			/* file2Contents = */ testPut(ctx, t, f, &file2)
-			file1Contents, _ = testPutMimeType(ctx, t, f, &file1, file1MimeType)
+			file1Contents, _ = testPutMimeType(ctx, t, f, &file1, file1MimeType, file1Metadata)
 			// Note that the next test will check there are no duplicated file names
 
 			// TestFsListDirFile2 tests the files are correctly uploaded by doing
@@ -873,7 +1072,7 @@ func Run(t *testing.T, opt *Opt) {
 					var objNames, dirNames []string
 					for i := 1; i <= *fstest.ListRetries; i++ {
 						objs, dirs, err := walk.GetAll(ctx, f, dir, true, 1)
-						if errors.Cause(err) == fs.ErrorDirNotFound {
+						if errors.Is(err, fs.ErrorDirNotFound) {
 							objs, dirs, err = walk.GetAll(ctx, f, dir, true, 1)
 						}
 						require.NoError(t, err)
@@ -974,7 +1173,7 @@ func Run(t *testing.T, opt *Opt) {
 				var err error
 				var objs []fs.Object
 				var dirs []fs.Directory
-				for i := 0; i < 2; i++ {
+				for range 2 {
 					dir, _ := path.Split(fileName)
 					dir = dir[:len(dir)-1]
 					objs, dirs, err = walk.GetAll(ctx, f, dir, true, -1)
@@ -1020,7 +1219,7 @@ func Run(t *testing.T, opt *Opt) {
 			// TestFsNewObject tests NewObject
 			t.Run("FsNewObject", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				file1.Check(t, obj, f.Precision())
 			})
 
@@ -1030,10 +1229,10 @@ func Run(t *testing.T, opt *Opt) {
 				if !f.Features().CaseInsensitive {
 					t.Skip("Not Case Insensitive")
 				}
-				obj := findObject(ctx, t, f, toUpperASCII(file1.Path))
+				obj := fstest.NewObject(ctx, t, f, toUpperASCII(file1.Path))
 				file1.Check(t, obj, f.Precision())
 				t.Run("Dir", func(t *testing.T) {
-					obj := findObject(ctx, t, f, toUpperASCII(file2.Path))
+					obj := fstest.NewObject(ctx, t, f, toUpperASCII(file2.Path))
 					file2.Check(t, obj, f.Precision())
 				})
 			})
@@ -1044,13 +1243,13 @@ func Run(t *testing.T, opt *Opt) {
 				fstest.CheckListing(t, f, []fstest.Item{file1, file2})
 			})
 
-			// TestFsNewObjectDir tests NewObject on a directory which should produce an error
+			// TestFsNewObjectDir tests NewObject on a directory which should produce fs.ErrorIsDir if possible or fs.ErrorObjectNotFound if not
 			t.Run("FsNewObjectDir", func(t *testing.T) {
 				skipIfNotOk(t)
 				dir := path.Dir(file2.Path)
 				obj, err := f.NewObject(ctx, dir)
 				assert.Nil(t, obj)
-				assert.NotNil(t, err)
+				assert.True(t, err == fs.ErrorIsDir || err == fs.ErrorObjectNotFound, fmt.Sprintf("Wrong error: expecting fs.ErrorIsDir or fs.ErrorObjectNotFound but got: %#v", err))
 			})
 
 			// TestFsPurge tests Purge
@@ -1090,6 +1289,70 @@ func Run(t *testing.T, opt *Opt) {
 				}, fs.GetModifyWindow(ctx, f))
 			})
 
+			// TestFsPurge tests Purge on the Root
+			t.Run("FsPurgeRoot", func(t *testing.T) {
+				skipIfNotOk(t)
+
+				// Check have Purge
+				doPurge := f.Features().Purge
+				if doPurge == nil {
+					t.Skip("FS has no Purge interface")
+				}
+
+				// put up a file to purge
+				fileToPurge := fstest.Item{
+					ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
+					Path:    "dirToPurgeFromRoot/fileToPurgeFromRoot.txt",
+				}
+				_, _ = testPut(ctx, t, f, &fileToPurge)
+
+				fstest.CheckListingWithPrecision(t, f, []fstest.Item{file1, file2, fileToPurge}, []string{
+					"dirToPurgeFromRoot",
+					"hello? sausage",
+					"hello? sausage/êé",
+					"hello? sausage/êé/Hello, 世界",
+					"hello? sausage/êé/Hello, 世界/ \" ' @ < > & ? + ≠",
+				}, fs.GetModifyWindow(ctx, f))
+
+				// Create a new Fs pointing at the directory
+				remoteName := subRemoteName + "/" + "dirToPurgeFromRoot"
+				fPurge, err := fs.NewFs(context.Background(), remoteName)
+				require.NoError(t, err)
+
+				// Now purge it from the root
+				err = operations.Purge(ctx, fPurge, "")
+				require.NoError(t, err)
+
+				fstest.CheckListingWithPrecision(t, f, []fstest.Item{file1, file2}, []string{
+					"hello? sausage",
+					"hello? sausage/êé",
+					"hello? sausage/êé/Hello, 世界",
+					"hello? sausage/êé/Hello, 世界/ \" ' @ < > & ? + ≠",
+				}, fs.GetModifyWindow(ctx, f))
+			})
+
+			// TestFsListRootedSubdir tests putting and listing with an Fs that is rooted at a subdirectory 2 levels down
+			TestFsListRootedSubdir := func(t *testing.T) {
+				skipIfNotOk(t)
+				newF, err := cache.Get(ctx, subRemoteName+"/hello? sausage/êé")
+				assert.NoError(t, err)
+				nestedFile := fstest.Item{
+					ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
+					Path:    "a/b/c/d/e.txt",
+				}
+				_, _ = testPut(ctx, t, newF, &nestedFile)
+
+				objs, dirs, err := walk.GetAll(ctx, newF, "", true, 10)
+				require.NoError(t, err)
+				assert.Equal(t, []string{`Hello, 世界/ " ' @ < > & ? + ≠/z.txt`, nestedFile.Path}, objsToNames(objs))
+				assert.Equal(t, []string{`Hello, 世界`, `Hello, 世界/ " ' @ < > & ? + ≠`, "a", "a/b", "a/b/c", "a/b/c/d"}, dirsToNames(dirs))
+
+				// cleanup
+				err = operations.Purge(ctx, newF, "a")
+				require.NoError(t, err)
+			}
+			t.Run("FsListRootedSubdir", TestFsListRootedSubdir)
+
 			// TestFsCopy tests Copy
 			t.Run("FsCopy", func(t *testing.T) {
 				skipIfNotOk(t)
@@ -1105,7 +1368,7 @@ func Run(t *testing.T, opt *Opt) {
 				file2Copy.Path += "-copy"
 
 				// do the copy
-				src := findObject(ctx, t, f, file2.Path)
+				src := fstest.NewObject(ctx, t, f, file2.Path)
 				dst, err := doCopy(ctx, src, file2Copy.Path)
 				if err == fs.ErrorCantCopy {
 					t.Skip("FS can't copy")
@@ -1117,11 +1380,72 @@ func Run(t *testing.T, opt *Opt) {
 
 				// Check dst lightly - list above has checked ModTime/Hashes
 				assert.Equal(t, file2Copy.Path, dst.Remote())
+				checkFingerprint(ctx, t, dst, fstest.NewObject(ctx, t, f, file2Copy.Path))
+
+				// check that mutating dst does not mutate src
+				if !strings.Contains(fs.ConfigStringFull(f), "copy_is_hardlink") {
+					err = dst.SetModTime(ctx, fstest.Time("2004-03-03T04:05:06.499999999Z"))
+					if err != fs.ErrorCantSetModTimeWithoutDelete && err != fs.ErrorCantSetModTime {
+						assert.NoError(t, err)
+						// Re-read the source and check its modtime
+						src = fstest.NewObject(ctx, t, f, src.Remote())
+						assert.False(t, src.ModTime(ctx).Equal(dst.ModTime(ctx)), "mutating dst should not mutate src -- is it Copying by pointer?")
+					}
+				}
 
 				// Delete copy
 				err = dst.Remove(ctx)
 				require.NoError(t, err)
 
+				// Test that server side copying files does the correct thing with metadata
+				t.Run("Metadata", func(t *testing.T) {
+					if !f.Features().WriteMetadata {
+						t.Skip("Skipping test as can't write metadata")
+					}
+					ctx, ci := fs.AddConfig(ctx)
+					ci.Metadata = true
+
+					// Create file with metadata
+					const srcName = "test metadata copy.txt"
+					const dstName = "test metadata copied.txt"
+					t1 := fstest.Time("2003-02-03T04:05:06.499999999Z")
+					t2 := fstest.Time("2004-03-03T04:05:06.499999999Z")
+					contents := random.String(100)
+					fileSrc := fstest.NewItem(srcName, contents, t1)
+					var testMetadata = fs.Metadata{
+						// System metadata supported by all backends
+						"mtime": t1.Format(time.RFC3339Nano),
+						// User metadata
+						"potato": "jersey",
+					}
+					oSrc := PutTestContentsMetadata(ctx, t, f, &fileSrc, false, contents, true, "text/plain", testMetadata)
+					fstest.CheckEntryMetadata(ctx, t, f, oSrc, testMetadata)
+
+					// Copy it with --metadata-set
+					ci.MetadataSet = fs.Metadata{
+						// System metadata supported by all backends
+						"mtime": t2.Format(time.RFC3339Nano),
+						// User metadata
+						"potato": "royal",
+					}
+					oDst, err := doCopy(ctx, oSrc, dstName)
+					require.NoError(t, err)
+					fileDst := fileSrc
+					fileDst.Path = dstName
+					fileDst.ModTime = t2
+					fstest.CheckListing(t, f, []fstest.Item{file1, file2, fileSrc, fileDst})
+
+					// Check metadata is correct
+					fstest.CheckEntryMetadata(ctx, t, f, oDst, ci.MetadataSet)
+					liveObj := oDst
+					oDst = fstest.NewObject(ctx, t, f, dstName)
+					fstest.CheckEntryMetadata(ctx, t, f, oDst, ci.MetadataSet)
+					checkFingerprint(ctx, t, liveObj, oDst)
+
+					// Remove test files
+					require.NoError(t, oSrc.Remove(ctx))
+					require.NoError(t, oDst.Remove(ctx))
+				})
 			})
 
 			// TestFsMove tests Move
@@ -1144,7 +1468,7 @@ func Run(t *testing.T, opt *Opt) {
 				// check happy path, i.e. no naming conflicts when rename and move are two
 				// separate operations
 				file2Move.Path = "other.txt"
-				src := findObject(ctx, t, f, file2.Path)
+				src := fstest.NewObject(ctx, t, f, file2.Path)
 				dst, err := doMove(ctx, src, file2Move.Path)
 				if err == fs.ErrorCantMove {
 					t.Skip("FS can't move")
@@ -1154,12 +1478,13 @@ func Run(t *testing.T, opt *Opt) {
 				fstest.CheckListing(t, f, []fstest.Item{file1, file2Move})
 				// Check dst lightly - list above has checked ModTime/Hashes
 				assert.Equal(t, file2Move.Path, dst.Remote())
+				checkFingerprint(ctx, t, dst, fstest.NewObject(ctx, t, f, file2Move.Path))
 				// 1: file name.txt
 				// 2: other.txt
 
 				// Check conflict on "rename, then move"
 				file1Move.Path = "moveTest/other.txt"
-				src = findObject(ctx, t, f, file1.Path)
+				src = fstest.NewObject(ctx, t, f, file1.Path)
 				_, err = doMove(ctx, src, file1Move.Path)
 				require.NoError(t, err)
 				fstest.CheckListing(t, f, []fstest.Item{file1Move, file2Move})
@@ -1167,14 +1492,14 @@ func Run(t *testing.T, opt *Opt) {
 				// 2: other.txt
 
 				// Check conflict on "move, then rename"
-				src = findObject(ctx, t, f, file1Move.Path)
+				src = fstest.NewObject(ctx, t, f, file1Move.Path)
 				_, err = doMove(ctx, src, file1.Path)
 				require.NoError(t, err)
 				fstest.CheckListing(t, f, []fstest.Item{file1, file2Move})
 				// 1: file name.txt
 				// 2: other.txt
 
-				src = findObject(ctx, t, f, file2Move.Path)
+				src = fstest.NewObject(ctx, t, f, file2Move.Path)
 				_, err = doMove(ctx, src, file2.Path)
 				require.NoError(t, err)
 				fstest.CheckListing(t, f, []fstest.Item{file1, file2})
@@ -1183,6 +1508,54 @@ func Run(t *testing.T, opt *Opt) {
 
 				// Tidy up moveTest directory
 				require.NoError(t, f.Rmdir(ctx, "moveTest"))
+
+				// Test that server side moving files does the correct thing with metadata
+				t.Run("Metadata", func(t *testing.T) {
+					if !f.Features().WriteMetadata {
+						t.Skip("Skipping test as can't write metadata")
+					}
+					ctx, ci := fs.AddConfig(ctx)
+					ci.Metadata = true
+
+					// Create file with metadata
+					const name = "test metadata move.txt"
+					const newName = "test metadata moved.txt"
+					t1 := fstest.Time("2003-02-03T04:05:06.499999999Z")
+					t2 := fstest.Time("2004-03-03T04:05:06.499999999Z")
+					file := fstest.NewItem(name, name, t1)
+					contents := random.String(100)
+					var testMetadata = fs.Metadata{
+						// System metadata supported by all backends
+						"mtime": t1.Format(time.RFC3339Nano),
+						// User metadata
+						"potato": "jersey",
+					}
+					o := PutTestContentsMetadata(ctx, t, f, &file, false, contents, true, "text/plain", testMetadata)
+					fstest.CheckEntryMetadata(ctx, t, f, o, testMetadata)
+
+					// Move it with --metadata-set
+					ci.MetadataSet = fs.Metadata{
+						// System metadata supported by all backends
+						"mtime": t2.Format(time.RFC3339Nano),
+						// User metadata
+						"potato": "royal",
+					}
+					newO, err := doMove(ctx, o, newName)
+					require.NoError(t, err)
+					file.Path = newName
+					file.ModTime = t2
+					fstest.CheckListing(t, f, []fstest.Item{file1, file2, file})
+
+					// Check metadata is correct
+					fstest.CheckEntryMetadata(ctx, t, f, newO, ci.MetadataSet)
+					liveObj := newO
+					newO = fstest.NewObject(ctx, t, f, newName)
+					fstest.CheckEntryMetadata(ctx, t, f, newO, ci.MetadataSet)
+					checkFingerprint(ctx, t, liveObj, newO)
+
+					// Remove test file
+					require.NoError(t, newO.Remove(ctx))
+				})
 			})
 
 			// Move src to this remote using server-side move operations.
@@ -1222,7 +1595,7 @@ func Run(t *testing.T, opt *Opt) {
 				// check remotes
 				// remote should not exist here
 				_, err = f.List(ctx, "")
-				assert.Equal(t, fs.ErrorDirNotFound, errors.Cause(err))
+				assert.True(t, errors.Is(err, fs.ErrorDirNotFound))
 				//fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{}, remote.Precision())
 				file1Copy := file1
 				file1Copy.Path = path.Join(newName, file1.Path)
@@ -1257,7 +1630,7 @@ func Run(t *testing.T, opt *Opt) {
 			t.Run("FsRmdirFull", func(t *testing.T) {
 				skipIfNotOk(t)
 				if isBucketBasedButNotRoot(f) {
-					t.Skip("Skipping test as non root bucket based remote")
+					t.Skip("Skipping test as non root bucket-based remote")
 				}
 				err := f.Rmdir(ctx, "")
 				require.Error(t, err, "Expecting error on RMdir on non empty remote")
@@ -1279,7 +1652,7 @@ func Run(t *testing.T, opt *Opt) {
 			// TestObjectString tests the Object String method
 			t.Run("ObjectString", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				assert.Equal(t, file1.Path, obj.String())
 				if opt.NilObject != nil {
 					assert.Equal(t, "<nil>", opt.NilObject.String())
@@ -1289,7 +1662,7 @@ func Run(t *testing.T, opt *Opt) {
 			// TestObjectFs tests the object can be found
 			t.Run("ObjectFs", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				// If this is set we don't do the direct comparison of
 				// the Fs from the object as it may be different
 				if opt.SkipFsMatch {
@@ -1308,21 +1681,21 @@ func Run(t *testing.T, opt *Opt) {
 			// TestObjectRemote tests the Remote is correct
 			t.Run("ObjectRemote", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				assert.Equal(t, file1.Path, obj.Remote())
 			})
 
 			// TestObjectHashes checks all the hashes the object supports
 			t.Run("ObjectHashes", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				file1.CheckHashes(t, obj)
 			})
 
 			// TestObjectModTime tests the ModTime of the object is correct
 			TestObjectModTime := func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				file1.CheckModTime(t, obj, obj.ModTime(ctx), f.Precision())
 			}
 			t.Run("ObjectModTime", TestObjectModTime)
@@ -1331,14 +1704,16 @@ func Run(t *testing.T, opt *Opt) {
 			t.Run("ObjectMimeType", func(t *testing.T) {
 				skipIfNotOk(t)
 				features := f.Features()
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				do, ok := obj.(fs.MimeTyper)
-				require.Equal(t, features.ReadMimeType, ok, "mismatch between Object.MimeType and Features.ReadMimeType")
 				if !ok {
+					require.False(t, features.ReadMimeType, "Features.ReadMimeType is set but Object.MimeType method not found")
 					t.Skip("MimeType method not supported")
 				}
 				mimeType := do.MimeType(ctx)
-				if features.WriteMimeType {
+				if !features.ReadMimeType {
+					require.Equal(t, "", mimeType, "Features.ReadMimeType is not set but Object.MimeType returned a non-empty MimeType")
+				} else if features.WriteMimeType {
 					assert.Equal(t, file1MimeType, mimeType, "can read and write mime types but failed")
 				} else {
 					if strings.ContainsRune(mimeType, ';') {
@@ -1349,11 +1724,147 @@ func Run(t *testing.T, opt *Opt) {
 				}
 			})
 
+			// TestObjectMetadata tests the Metadata of the object is correct
+			t.Run("ObjectMetadata", func(t *testing.T) {
+				skipIfNotOk(t)
+				ctx, ci := fs.AddConfig(ctx)
+				ci.Metadata = true
+				features := f.Features()
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
+				do, objectHasMetadata := obj.(fs.Metadataer)
+				if objectHasMetadata || features.ReadMetadata || features.WriteMetadata || features.UserMetadata {
+					fsInfo := fs.FindFromFs(f)
+					require.NotNil(t, fsInfo)
+					require.NotNil(t, fsInfo.MetadataInfo, "Object declares metadata support but no MetadataInfo in RegInfo")
+				}
+				if !objectHasMetadata {
+					require.False(t, features.ReadMetadata, "Features.ReadMetadata is set but Object.Metadata method not found")
+					t.Skip("Metadata method not supported")
+				}
+				metadata, err := do.Metadata(ctx)
+				require.NoError(t, err)
+				// check standard metadata
+				for k, v := range metadata {
+					switch k {
+					case "atime", "btime", "mtime":
+						mtime, err := time.Parse(time.RFC3339Nano, v)
+						require.NoError(t, err)
+						if k == "mtime" {
+							fstest.AssertTimeEqualWithPrecision(t, file1.Path, file1.ModTime, mtime, f.Precision())
+						}
+					}
+				}
+				if !features.ReadMetadata {
+					if metadata != nil && !features.Overlay {
+						require.Equal(t, "", metadata, "Features.ReadMetadata is not set but Object.Metadata returned a non nil Metadata: %#v", metadata)
+					}
+				} else if features.WriteMetadata {
+					require.NotNil(t, metadata)
+					if features.UserMetadata {
+						// check all the metadata bits we uploaded are present - there may be more we didn't write
+						for k, v := range file1Metadata {
+							assert.Equal(t, v, metadata[k], "can read and write metadata but failed on key %q (want=%+v, got=%+v)", k, file1Metadata, metadata)
+						}
+					}
+					// Now test we can set the mtime and content-type via the metadata and these take precedence
+					t.Run("mtime", func(t *testing.T) {
+						path := "metadatatest"
+						mtimeModTime := fstest.Time("2002-02-03T04:05:06.499999999Z")
+						modTime := fstest.Time("2003-02-03T04:05:06.499999999Z")
+						item := fstest.NewItem(path, path, modTime)
+						metaMimeType := "application/zip"
+						mimeType := "application/gzip"
+						metadata := fs.Metadata{
+							"mtime":        mtimeModTime.Format(time.RFC3339Nano),
+							"content-type": metaMimeType,
+						}
+						// This checks the mtime is correct also and returns the re-read object
+						_, obj := testPutMimeType(ctx, t, f, &item, mimeType, metadata)
+						defer func() {
+							assert.NoError(t, obj.Remove(ctx))
+						}()
+						// Check content-type got updated too
+						if features.ReadMimeType && features.WriteMimeType {
+							// read the object from scratch
+							o, err := f.NewObject(ctx, path)
+							require.NoError(t, err)
+
+							// Check the mimetype is correct
+							do, ok := o.(fs.MimeTyper)
+							require.True(t, ok)
+							gotMimeType := do.MimeType(ctx)
+							assert.Equal(t, metaMimeType, gotMimeType)
+						}
+					})
+				} // else: Have some metadata here we didn't write - can't really check it!
+			})
+
+			// TestObjectSetMetadata tests the SetMetadata of the object
+			t.Run("ObjectSetMetadata", func(t *testing.T) {
+				skipIfNotOk(t)
+				ctx, ci := fs.AddConfig(ctx)
+				ci.Metadata = true
+				features := f.Features()
+
+				// Test to see if SetMetadata is supported on an existing object before creating a new one
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
+				_, objectHasSetMetadata := obj.(fs.SetMetadataer)
+				if !objectHasSetMetadata {
+					t.Skip("SetMetadata method not supported")
+				}
+				if !features.Overlay {
+					require.True(t, features.WriteMetadata, "Features.WriteMetadata is false but Object.SetMetadata found")
+				}
+				if !features.ReadMetadata {
+					t.Skip("SetMetadata can't be tested without ReadMetadata")
+				}
+
+				// Create file with metadata
+				const fileName = "test set metadata.txt"
+				t1 := fstest.Time("2003-02-03T04:05:06.499999999Z")
+				t2 := fstest.Time("2004-03-03T04:05:06.499999999Z")
+				contents := random.String(100)
+				file := fstest.NewItem(fileName, contents, t1)
+				var testMetadata = fs.Metadata{
+					// System metadata supported by all backends
+					"mtime": t1.Format(time.RFC3339Nano),
+					// User metadata
+					"potato": "jersey",
+				}
+				obj = PutTestContentsMetadata(ctx, t, f, &file, true, contents, true, "text/plain", testMetadata)
+				fstest.CheckEntryMetadata(ctx, t, f, obj, testMetadata)
+				do, objectHasSetMetadata := obj.(fs.SetMetadataer)
+				require.True(t, objectHasSetMetadata)
+
+				// Set new metadata
+				err := do.SetMetadata(ctx, fs.Metadata{
+					// System metadata supported by all backends
+					"mtime": t2.Format(time.RFC3339Nano),
+					// User metadata
+					"potato": "royal",
+				})
+				if err == fs.ErrorNotImplemented {
+					t.Log("SetMetadata returned fs.ErrorNotImplemented")
+				} else {
+					require.NoError(t, err)
+					file.ModTime = t2
+					fstest.CheckListing(t, f, []fstest.Item{file1, file2, file})
+
+					// Check metadata is correct
+					fstest.CheckEntryMetadata(ctx, t, f, obj, ci.MetadataSet)
+					obj = fstest.NewObject(ctx, t, f, fileName)
+					fstest.CheckEntryMetadata(ctx, t, f, obj, ci.MetadataSet)
+				}
+
+				// Remove test file
+				require.NoError(t, obj.Remove(ctx))
+			})
+
 			// TestObjectSetModTime tests that SetModTime works
 			t.Run("ObjectSetModTime", func(t *testing.T) {
 				skipIfNotOk(t)
 				newModTime := fstest.Time("2011-12-13T14:15:16.999999999Z")
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				err := obj.SetModTime(ctx, newModTime)
 				if err == fs.ErrorCantSetModTime || err == fs.ErrorCantSetModTimeWithoutDelete {
 					t.Log(err)
@@ -1362,6 +1873,7 @@ func Run(t *testing.T, opt *Opt) {
 				require.NoError(t, err)
 				file1.ModTime = newModTime
 				file1.CheckModTime(t, obj, obj.ModTime(ctx), f.Precision())
+				checkFingerprint(ctx, t, obj, fstest.NewObject(ctx, t, f, file1.Path))
 				// And make a new object and read it from there too
 				TestObjectModTime(t)
 			})
@@ -1369,22 +1881,22 @@ func Run(t *testing.T, opt *Opt) {
 			// TestObjectSize tests that Size works
 			t.Run("ObjectSize", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				assert.Equal(t, file1.Size, obj.Size())
 			})
 
 			// TestObjectOpen tests that Open works
 			t.Run("ObjectOpen", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
-				assert.Equal(t, file1Contents, readObject(ctx, t, obj, -1), "contents of file1 differ")
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
+				assert.Equal(t, file1Contents, ReadObject(ctx, t, obj, -1), "contents of file1 differ")
 			})
 
 			// TestObjectOpenSeek tests that Open works with SeekOption
 			t.Run("ObjectOpenSeek", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
-				assert.Equal(t, file1Contents[50:], readObject(ctx, t, obj, -1, &fs.SeekOption{Offset: 50}), "contents of file1 differ after seek")
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
+				assert.Equal(t, file1Contents[50:], ReadObject(ctx, t, obj, -1, &fs.SeekOption{Offset: 50}), "contents of file1 differ after seek")
 			})
 
 			// TestObjectOpenRange tests that Open works with RangeOption
@@ -1392,7 +1904,7 @@ func Run(t *testing.T, opt *Opt) {
 			// go test -v -run 'TestIntegration/Test(Setup|Init|FsMkdir|FsPutFile1|FsPutFile2|FsUpdateFile1|ObjectOpenRange)$'
 			t.Run("ObjectOpenRange", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				for _, test := range []struct {
 					ro                 fs.RangeOption
 					wantStart, wantEnd int
@@ -1403,7 +1915,7 @@ func Run(t *testing.T, opt *Opt) {
 					{fs.RangeOption{Start: -1, End: 20}, 80, 100}, // if start is omitted this means get the final bytes
 					// {fs.RangeOption{Start: -1, End: -1}, 0, 100}, - this seems to work but the RFC doesn't define it
 				} {
-					got := readObject(ctx, t, obj, -1, &test.ro)
+					got := ReadObject(ctx, t, obj, -1, &test.ro)
 					foundAt := strings.Index(file1Contents, got)
 					help := fmt.Sprintf("%#v failed want [%d:%d] got [%d:%d]", test.ro, test.wantStart, test.wantEnd, foundAt, foundAt+len(got))
 					assert.Equal(t, file1Contents[test.wantStart:test.wantEnd], got, help)
@@ -1413,41 +1925,87 @@ func Run(t *testing.T, opt *Opt) {
 			// TestObjectPartialRead tests that reading only part of the object does the correct thing
 			t.Run("ObjectPartialRead", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
-				assert.Equal(t, file1Contents[:50], readObject(ctx, t, obj, 50), "contents of file1 differ after limited read")
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
+				assert.Equal(t, file1Contents[:50], ReadObject(ctx, t, obj, 50), "contents of file1 differ after limited read")
+			})
+
+			// TestObjectOpenFingerprint tests that opening an object - in particular
+			// with a range request - does not change its fingerprint.
+			//
+			// go test -v -run 'TestIntegration/FsMkdir/FsPutFiles/ObjectOpenFingerprint$'
+			t.Run("ObjectOpenFingerprint", func(t *testing.T) {
+				skipIfNotOk(t)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
+
+				// Read the whole object first so any lazily fetched hash
+				// is populated, then read a reference object to compare
+				// fingerprints against.
+				_ = ReadObject(ctx, t, obj, -1)
+				reference := fstest.NewObject(ctx, t, f, file1.Path)
+				_ = ReadObject(ctx, t, reference, -1)
+
+				// Opening the object in various ways must not change the fingerprint
+				for _, test := range []struct {
+					name    string
+					options []fs.OpenOption
+				}{
+					{name: "full read"},
+					{name: "seek read", options: []fs.OpenOption{&fs.SeekOption{Offset: 50}}},
+					{name: "range read", options: []fs.OpenOption{&fs.RangeOption{Start: 5, End: 15}}},
+					{name: "range read to end", options: []fs.OpenOption{&fs.RangeOption{Start: 80, End: -1}}},
+				} {
+					t.Run(test.name, func(t *testing.T) {
+						_ = ReadObject(ctx, t, obj, -1, test.options...)
+						checkFingerprint(ctx, t, obj, reference)
+					})
+				}
+
+				// A freshly fetched object must have the same fingerprint too
+				t.Run("refresh", func(t *testing.T) {
+					obj := fstest.NewObject(ctx, t, f, file1.Path)
+					_ = ReadObject(ctx, t, obj, -1)
+					checkFingerprint(ctx, t, obj, reference)
+				})
 			})
 
 			// TestObjectUpdate tests that Update works
 			t.Run("ObjectUpdate", func(t *testing.T) {
 				skipIfNotOk(t)
 				contents := random.String(200)
-				buf := bytes.NewBufferString(contents)
-				hash := hash.NewMultiHasher()
-				in := io.TeeReader(buf, hash)
+				var h *hash.MultiHasher
 
-				file1.Size = int64(buf.Len())
-				obj := findObject(ctx, t, f, file1.Path)
-				obji := object.NewStaticObjectInfo(file1.Path, file1.ModTime, int64(len(contents)), true, nil, obj.Fs())
-				err := obj.Update(ctx, in, obji)
-				require.NoError(t, err)
-				file1.Hashes = hash.Sums()
+				file1.Size = int64(len(contents))
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
+				remoteBefore := obj.Remote()
+				obji := object.NewStaticObjectInfo(file1.Path+"-should-be-ignored.bin", file1.ModTime, int64(len(contents)), true, nil, obj.Fs())
+				retry(t, "Update object", func() error {
+					buf := bytes.NewBufferString(contents)
+					h = hash.NewMultiHasher()
+					in := io.TeeReader(buf, h)
+					return obj.Update(ctx, in, obji)
+				})
+				remoteAfter := obj.Remote()
+				assert.Equal(t, remoteBefore, remoteAfter, "Remote should not change")
+				file1.Hashes = h.Sums()
 
 				// check the object has been updated
 				file1.Check(t, obj, f.Precision())
 
 				// Re-read the object and check again
-				obj = findObject(ctx, t, f, file1.Path)
+				liveObj := obj
+				obj = fstest.NewObject(ctx, t, f, file1.Path)
 				file1.Check(t, obj, f.Precision())
+				checkFingerprint(ctx, t, liveObj, obj)
 
 				// check contents correct
-				assert.Equal(t, contents, readObject(ctx, t, obj, -1), "contents of updated file1 differ")
+				assert.Equal(t, contents, ReadObject(ctx, t, obj, -1), "contents of updated file1 differ")
 				file1Contents = contents
 			})
 
 			// TestObjectStorable tests that Storable works
 			t.Run("ObjectStorable", func(t *testing.T) {
 				skipIfNotOk(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				require.NotNil(t, !obj.Storable(), "Expecting object to be storable")
 			})
 
@@ -1461,6 +2019,24 @@ func Run(t *testing.T, opt *Opt) {
 				fileRemote, err := fs.NewFs(context.Background(), remoteName)
 				require.NotNil(t, fileRemote)
 				assert.Equal(t, fs.ErrorIsFile, err)
+
+				// Check Fs.Root returns the right thing
+				t.Run("FsRoot", func(t *testing.T) {
+					skipIfNotOk(t)
+					got := fileRemote.Root()
+					remoteDir := path.Dir(remoteName)
+					want := remoteDir
+					colon := strings.LastIndex(want, ":")
+					if colon >= 0 {
+						want = want[colon+1:]
+					}
+					if isLocalRemote {
+						// only check last path element on local
+						require.Equal(t, filepath.Base(remoteDir), filepath.Base(got))
+					} else {
+						require.Equal(t, want, got)
+					}
+				})
 
 				if strings.HasPrefix(remoteName, "TestChunker") && strings.Contains(remoteName, "Nometa") {
 					// TODO fix chunker and remove this bypass
@@ -1495,6 +2071,9 @@ func Run(t *testing.T, opt *Opt) {
 				}
 				t.Logf("Opening root remote %q path %q from %q", configName, configLeaf, subRemoteName)
 				rootRemote, err := fs.NewFs(context.Background(), configName)
+				if errors.Is(err, fs.ErrorCantListRoot) {
+					t.Skip("Can't list from root on this remote")
+				}
 				require.NoError(t, err)
 
 				file1Root := file1
@@ -1516,7 +2095,7 @@ func Run(t *testing.T, opt *Opt) {
 					fstest.CheckListingWithRoot(t, rootRemote, configLeaf, []fstest.Item{file1Root, file2Root}, dirs, rootRemote.Precision())
 				})
 
-				// Check that that listing the entries is OK
+				// Check that listing the entries is OK
 				t.Run("ListEntries", func(t *testing.T) {
 					entries, err := rootRemote.List(context.Background(), configLeaf)
 					require.NoError(t, err)
@@ -1551,12 +2130,12 @@ func Run(t *testing.T, opt *Opt) {
 						}
 						return nil
 					})
-					if err != errFound && err != errTooMany {
+					if !errors.Is(err, errFound) && !errors.Is(err, errTooMany) {
 						assert.NoError(t, err)
 					}
-					if err != errTooMany {
-						assert.True(t, file1Found, "file1Root not found")
-						assert.True(t, file2Found, "file2Root not found")
+					if !errors.Is(err, errTooMany) {
+						assert.True(t, file1Found, "file1Root %q not found", file1Root.Path)
+						assert.True(t, file2Found, "file2Root %q not found", file2Root.Path)
 					} else {
 						t.Logf("Too many files to list - giving up")
 					}
@@ -1584,12 +2163,35 @@ func Run(t *testing.T, opt *Opt) {
 			t.Run("PublicLink", func(t *testing.T) {
 				skipIfNotOk(t)
 
-				doPublicLink := f.Features().PublicLink
-				if doPublicLink == nil {
+				publicLinkFunc := f.Features().PublicLink
+				if publicLinkFunc == nil {
 					t.Skip("FS has no PublicLinker interface")
 				}
 
-				expiry := fs.Duration(60 * time.Second)
+				type PublicLinkFunc func(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error)
+				wrapPublicLinkFunc := func(f PublicLinkFunc) PublicLinkFunc {
+					return func(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error) {
+						link, err = publicLinkFunc(ctx, remote, expire, unlink)
+						if err == nil {
+							return
+						}
+						// For OneDrive Personal, link expiry is a premium feature
+						// Don't let it fail the test (https://github.com/rclone/rclone/issues/5420)
+						if fsInfo.Name == "onedrive" && strings.Contains(err.Error(), "accountUpgradeRequired") {
+							t.Log("treating accountUpgradeRequired as success for PublicLink")
+							link, err = "bogus link to "+remote, nil
+						}
+						// For Kdrive, link expiry is a premium feature
+						if fsInfo.Name == "kdrive" && strings.Contains(err.Error(), "forbidden_error") && strings.Contains(err.Error(), "expiration date") {
+							t.Log("treating forbidden on expiration date as success for PublicLink")
+							link, err = "bogus link to "+remote, nil
+						}
+						return
+					}
+				}
+
+				expiry := fs.Duration(120 * time.Second)
+				doPublicLink := wrapPublicLinkFunc(publicLinkFunc)
 
 				// if object not found
 				link, err := doPublicLink(ctx, file1.Path+"_does_not_exist", expiry, false)
@@ -1615,7 +2217,7 @@ func Run(t *testing.T, opt *Opt) {
 				// sharing directory for the first time
 				path := path.Dir(file2.Path)
 				link3, err := doPublicLink(ctx, path, expiry, false)
-				if err != nil && (errors.Cause(err) == fs.ErrorCantShareDirectories || errors.Cause(err) == fs.ErrorObjectNotFound) {
+				if err != nil && (errors.Is(err, fs.ErrorCantShareDirectories) || errors.Is(err, fs.ErrorObjectNotFound)) {
 					t.Log("skipping directory tests as not supported on this backend")
 				} else {
 					require.NoError(t, err)
@@ -1633,10 +2235,12 @@ func Run(t *testing.T, opt *Opt) {
 					// ensure sub remote isn't empty
 					buf := bytes.NewBufferString("somecontent")
 					obji := object.NewStaticObjectInfo("somefile", time.Now(), int64(buf.Len()), true, nil, nil)
-					_, err = subRemote.Put(ctx, buf, obji)
-					require.NoError(t, err)
+					retry(t, "Put", func() error {
+						_, err := subRemote.Put(ctx, buf, obji)
+						return err
+					})
 
-					link4, err := subRemote.Features().PublicLink(ctx, "", expiry, false)
+					link4, err := wrapPublicLinkFunc(subRemote.Features().PublicLink)(ctx, "", expiry, false)
 					require.NoError(t, err, "Sharing root in a sub-remote should work")
 					require.NotEqual(t, "", link4, "Link should not be empty")
 				}
@@ -1645,7 +2249,7 @@ func Run(t *testing.T, opt *Opt) {
 			// TestSetTier tests SetTier and GetTier functionality
 			t.Run("SetTier", func(t *testing.T) {
 				skipIfNotSetTier(t)
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				setter, ok := obj.(fs.SetTierer)
 				assert.NotNil(t, ok)
 				getter, ok := obj.(fs.GetTierer)
@@ -1673,7 +2277,7 @@ func Run(t *testing.T, opt *Opt) {
 				if ft.UnWrap == nil {
 					t.Skip("Not a wrapping Fs")
 				}
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				_, unsupported := fs.ObjectOptionalInterfaces(obj)
 				for _, name := range unsupported {
 					if !stringsContains(name, opt.UnimplementableObjectMethods) {
@@ -1682,15 +2286,158 @@ func Run(t *testing.T, opt *Opt) {
 				}
 			})
 
+			// Run tests for bucket based Fs
+			// TestIntegration/FsMkdir/FsPutFiles/Bucket
+			t.Run("Bucket", func(t *testing.T) {
+				// Test if this Fs is bucket based - this test won't work for wrapped bucket based backends.
+				if !f.Features().BucketBased {
+					t.Skip("Not a bucket based backend")
+				}
+				if f.Features().CanHaveEmptyDirectories {
+					t.Skip("Can have empty directories")
+				}
+				if !f.Features().DoubleSlash {
+					t.Skip("Can't have // in paths")
+				}
+				// Create some troublesome file names
+				fileNames := []string{
+					file1.Path,
+					file2.Path,
+					".leadingdot",
+					"/.leadingdot",
+					"///tripleslash",
+					"//doubleslash",
+					"dir/.leadingdot",
+					"dir///tripleslash",
+					"dir//doubleslash",
+				}
+				dirNames := []string{
+					"hello? sausage",
+					"hello? sausage/êé",
+					"hello? sausage/êé/Hello, 世界",
+					"hello? sausage/êé/Hello, 世界/ \" ' @ < > & ? + ≠",
+					"/",
+					"//",
+					"///",
+					"dir",
+					"dir/",
+					"dir//",
+				}
+				t1 := fstest.Time("2003-02-03T04:05:06.499999999Z")
+				var objs []fs.Object
+				for _, fileName := range fileNames[2:] {
+					contents := "bad file name: " + fileName
+					file := fstest.NewItem(fileName, contents, t1)
+					objs = append(objs, PutTestContents(ctx, t, f, &file, contents, true))
+				}
+
+				// Check they arrived
+				// This uses walk.Walk with a max size set to make sure we don't use ListR
+				check := func(f fs.Fs, dir string, wantFileNames, wantDirNames []string) {
+					t.Helper()
+					var gotFileNames, gotDirNames []string
+					require.NoError(t, walk.Walk(ctx, f, dir, true, 100, func(path string, entries fs.DirEntries, err error) error {
+						if err != nil {
+							return err
+						}
+						for _, entry := range entries {
+							if _, isObj := entry.(fs.Object); isObj {
+								gotFileNames = append(gotFileNames, entry.Remote())
+							} else {
+								gotDirNames = append(gotDirNames, entry.Remote())
+							}
+						}
+						return nil
+					}))
+					sort.Strings(wantDirNames)
+					sort.Strings(wantFileNames)
+					sort.Strings(gotDirNames)
+					sort.Strings(gotFileNames)
+					assert.Equal(t, wantFileNames, gotFileNames)
+					assert.Equal(t, wantDirNames, gotDirNames)
+				}
+				check(f, "", fileNames, dirNames)
+				check(f, "/", []string{
+					"/.leadingdot",
+					"///tripleslash",
+					"//doubleslash",
+				}, []string{
+					"//",
+					"///",
+				})
+				check(f, "//", []string{
+					"///tripleslash",
+					"//doubleslash",
+				}, []string{
+					"///",
+				})
+				check(f, "dir", []string{
+					"dir/.leadingdot",
+					"dir///tripleslash",
+					"dir//doubleslash",
+				}, []string{
+					"dir/",
+					"dir//",
+				})
+				check(f, "dir/", []string{
+					"dir///tripleslash",
+					"dir//doubleslash",
+				}, []string{
+					"dir//",
+				})
+				check(f, "dir//", []string{
+					"dir///tripleslash",
+				}, nil)
+
+				// Now create a backend not at the root of a bucket
+				f2, err := fs.NewFs(ctx, subRemoteName+"/dir")
+				require.NoError(t, err)
+				check(f2, "", []string{
+					".leadingdot",
+					"//tripleslash",
+					"/doubleslash",
+				}, []string{
+					"/",
+					"//",
+				})
+				check(f2, "/", []string{
+					"//tripleslash",
+					"/doubleslash",
+				}, []string{
+					"//",
+				})
+				check(f2, "//", []string{
+					"//tripleslash",
+				}, []string(nil))
+
+				// Remove the objects
+				for _, obj := range objs {
+					assert.NoError(t, obj.Remove(ctx))
+				}
+
+				// Check they are gone
+				fstest.CheckListingWithPrecision(t, f, []fstest.Item{file1, file2}, []string{
+					"hello? sausage",
+					"hello? sausage/êé",
+					"hello? sausage/êé/Hello, 世界",
+					"hello? sausage/êé/Hello, 世界/ \" ' @ < > & ? + ≠",
+				}, fs.GetModifyWindow(ctx, f))
+			})
+
+			// State of remote at the moment the internal tests are called
+			InternalTestFiles = []fstest.Item{file1, file2}
+
 			// TestObjectRemove tests Remove
 			t.Run("ObjectRemove", func(t *testing.T) {
 				skipIfNotOk(t)
 				// remove file1
-				obj := findObject(ctx, t, f, file1.Path)
+				obj := fstest.NewObject(ctx, t, f, file1.Path)
 				err := obj.Remove(ctx)
 				require.NoError(t, err)
 				// check listing without modtime as TestPublicLink may change the modtime
 				fstest.CheckListingWithPrecision(t, f, []fstest.Item{file2}, nil, fs.ModTimeNotSupported)
+				// Show the internal tests file2 is gone
+				InternalTestFiles = []fstest.Item{file2}
 			})
 
 			// TestAbout tests the About optional interface
@@ -1749,8 +2496,10 @@ func Run(t *testing.T, opt *Opt) {
 						file.Size = int64(contentSize) // use correct size when checking
 						file.Check(t, obj, f.Precision())
 						// Re-read the object and check again
-						obj = findObject(ctx, t, f, file.Path)
+						liveObj := obj
+						obj = fstest.NewObject(ctx, t, f, file.Path)
 						file.Check(t, obj, f.Precision())
+						checkFingerprint(ctx, t, liveObj, obj)
 						require.NoError(t, obj.Remove(ctx))
 					})
 				}
@@ -1777,6 +2526,10 @@ func Run(t *testing.T, opt *Opt) {
 				t.Skip("not running with -short")
 			}
 
+			if opt.ChunkedUpload.Skip {
+				t.Skip("skipping as ChunkedUpload.Skip is set")
+			}
+
 			setUploadChunkSizer, _ := f.(SetUploadChunkSizer)
 			if setUploadChunkSizer == nil {
 				t.Skipf("%T does not implement SetUploadChunkSizer", f)
@@ -1784,18 +2537,12 @@ func Run(t *testing.T, opt *Opt) {
 
 			setUploadCutoffer, _ := f.(SetUploadCutoffer)
 
-			minChunkSize := opt.ChunkedUpload.MinChunkSize
-			if minChunkSize < 100 {
-				minChunkSize = 100
-			}
+			minChunkSize := max(opt.ChunkedUpload.MinChunkSize, 100)
 			if opt.ChunkedUpload.CeilChunkSize != nil {
 				minChunkSize = opt.ChunkedUpload.CeilChunkSize(minChunkSize)
 			}
 
-			maxChunkSize := 2 * fs.MebiByte
-			if maxChunkSize < 2*minChunkSize {
-				maxChunkSize = 2 * minChunkSize
-			}
+			maxChunkSize := max(2*fs.Mebi, 2*minChunkSize)
 			if opt.ChunkedUpload.MaxChunkSize > 0 && maxChunkSize > opt.ChunkedUpload.MaxChunkSize {
 				maxChunkSize = opt.ChunkedUpload.MaxChunkSize
 			}
@@ -1871,8 +2618,407 @@ func Run(t *testing.T, opt *Opt) {
 								Path:    fmt.Sprintf("chunked-%s-%s.bin", cs.String(), fileSize.String()),
 								Size:    int64(fileSize),
 							})
+							t.Run("Streamed", func(t *testing.T) {
+								if f.Features().PutStream == nil {
+									t.Skip("FS has no PutStream interface")
+								}
+								TestPutLargeStreamed(ctx, t, f, &fstest.Item{
+									ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
+									Path:    fmt.Sprintf("chunked-%s-%s-streamed.bin", cs.String(), fileSize.String()),
+									Size:    int64(fileSize),
+								})
+							})
 						})
 					}
+				})
+			}
+		})
+
+		// TestFsPutRetry tests that an upload survives a transient HTTP
+		// failure without corrupting the object
+		t.Run("FsPutRetry", func(t *testing.T) {
+			skipIfNotOk(t)
+
+			// faults are the transient failures injected into the
+			// first request carrying upload data
+			faults := []struct {
+				name       string
+				statusCode int
+				err        error
+			}{
+				{name: "Status500", statusCode: http.StatusInternalServerError},
+				// io.ErrUnexpectedEOF is in fserrors' portable list of
+				// retriable errors, unlike syscall.ECONNRESET which
+				// doesn't exist on plan9.
+				{name: "NetError", err: &net.OpError{Op: "write", Net: "tcp", Err: io.ErrUnexpectedEOF}},
+			}
+
+			// putRetry uploads size bytes to remote, failing the first
+			// request carrying at least minBody bytes of body with the
+			// given fault before it is sent. Put must then either
+			// succeed with the correct contents or fail cleanly, and
+			// any pooled buffers it used must be returned.
+			putRetry := func(t *testing.T, remote string, size, minBody int64, statusCode int, faultErr error) {
+				var faulted atomic.Bool
+				fshttp.SetFaultInjector(func(req *http.Request) (int, error) {
+					if faulted.Load() {
+						return 0, nil
+					}
+					if req.Body == nil || req.Body == http.NoBody {
+						return 0, nil
+					}
+					if req.ContentLength > 0 {
+						if req.ContentLength < minBody {
+							return 0, nil
+						}
+					} else {
+						// The length is unknown (e.g. a multipart
+						// form) so peek at the body to see whether it
+						// carries at least minBody bytes of data,
+						// replaying the peeked bytes if the request is
+						// sent on. This stops the fault being spent on
+						// a small API call sent with unknown length.
+						peek := make([]byte, minBody)
+						n, _ := io.ReadFull(req.Body, peek)
+						req.Body = struct {
+							io.Reader
+							io.Closer
+						}{io.MultiReader(bytes.NewReader(peek[:n]), req.Body), req.Body}
+						if int64(n) < minBody {
+							return 0, nil
+						}
+					}
+					if !faulted.CompareAndSwap(false, true) {
+						return 0, nil
+					}
+					return statusCode, faultErr
+				})
+				defer fshttp.SetFaultInjector(nil)
+
+				file := fstest.Item{
+					ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
+					Path:    remote,
+					Size:    size,
+				}
+				// Remove anything left behind if the test fails part way
+				t.Cleanup(func() {
+					obj, err := f.NewObject(ctx, remote)
+					if err == nil {
+						_ = obj.Remove(ctx)
+					}
+				})
+				inUse := pool.Global().InUse()
+				uploadHash := hash.NewMultiHasher()
+				in := io.TeeReader(readers.NewPatternReader(size), uploadHash)
+				obji := object.NewStaticObjectInfo(remote, file.ModTime, size, true, nil, nil)
+				obj, err := f.Put(ctx, in, obji)
+				fshttp.SetFaultInjector(nil)
+				assert.Equal(t, inUse, pool.Global().InUse(), "buffers not returned to the global pool after upload")
+				file.Hashes = uploadHash.Sums()
+
+				// checkAndRemove checks obj has the expected contents
+				// then removes it
+				checkAndRemove := func(obj fs.Object) {
+					file.Check(t, obj, f.Precision())
+					downloadHash := hash.NewMultiHasher()
+					download, err := obj.Open(ctx)
+					require.NoError(t, err)
+					n, err := io.Copy(downloadHash, download)
+					require.NoError(t, err)
+					assert.Equal(t, size, n)
+					require.NoError(t, download.Close())
+					assert.Equal(t, file.Hashes, downloadHash.Sums())
+					assert.NoError(t, obj.Remove(ctx))
+				}
+
+				if !faulted.Load() {
+					if err == nil {
+						assert.NoError(t, obj.Remove(ctx))
+					}
+					t.Skip("no upload request could be faulted")
+				}
+				if err != nil {
+					// A clean failure is acceptable but the object must
+					// not have been left behind with the wrong contents
+					t.Logf("Put returned an error after the injected failure (acceptable): %v", err)
+					obj, err := f.NewObject(ctx, remote)
+					if errors.Is(err, fs.ErrorObjectNotFound) {
+						return
+					}
+					require.NoError(t, err)
+					checkAndRemove(obj)
+					return
+				}
+				require.NotNil(t, obj)
+				file.Check(t, obj, f.Precision())
+				// Re-read the object, which waits for it to become visible
+				checkAndRemove(fstest.NewObject(ctx, t, f, remote))
+			}
+
+			t.Run("Simple", func(t *testing.T) {
+				var size int64 = 64 * 1024
+				if *fstest.SizeLimit > 0 && size > *fstest.SizeLimit {
+					size = *fstest.SizeLimit
+					t.Logf("Reduce file size due to limit %d", size)
+				}
+				for _, fault := range faults {
+					t.Run(fault.name, func(t *testing.T) {
+						putRetry(t, "retry-"+fault.name+".bin", size, size, fault.statusCode, fault.err)
+					})
+				}
+			})
+
+			t.Run("Chunked", func(t *testing.T) {
+				if testing.Short() {
+					t.Skip("not running with -short")
+				}
+				if opt.ChunkedUpload.Skip {
+					t.Skip("skipping as ChunkedUpload.Skip is set")
+				}
+				setUploadChunkSizer, _ := f.(SetUploadChunkSizer)
+				if setUploadChunkSizer == nil {
+					t.Skipf("%T does not implement SetUploadChunkSizer", f)
+				}
+				setUploadCutoffer, _ := f.(SetUploadCutoffer)
+
+				// Use a chunk size large enough that only chunk
+				// uploads, not API calls, carry enough body to fault
+				chunkSize := max(opt.ChunkedUpload.MinChunkSize, 64*fs.Kibi)
+				if opt.ChunkedUpload.MaxChunkSize > 0 && chunkSize > opt.ChunkedUpload.MaxChunkSize {
+					chunkSize = opt.ChunkedUpload.MaxChunkSize
+				}
+				if opt.ChunkedUpload.CeilChunkSize != nil {
+					chunkSize = opt.ChunkedUpload.CeilChunkSize(chunkSize)
+				}
+
+				oldChunkSize, err := setUploadChunkSizer.SetUploadChunkSize(chunkSize)
+				require.NoError(t, err)
+				var oldUploadCutoff fs.SizeSuffix
+				if setUploadCutoffer != nil {
+					oldUploadCutoff, err = setUploadCutoffer.SetUploadCutoff(chunkSize)
+					require.NoError(t, err)
+				}
+				defer func() {
+					_, err := setUploadChunkSizer.SetUploadChunkSize(oldChunkSize)
+					assert.NoError(t, err)
+					if setUploadCutoffer != nil {
+						_, err := setUploadCutoffer.SetUploadCutoff(oldUploadCutoff)
+						assert.NoError(t, err)
+					}
+				}()
+
+				for _, fault := range faults {
+					t.Run(fault.name, func(t *testing.T) {
+						putRetry(t, "retry-chunked-"+fault.name+".bin", int64(2*chunkSize+1), int64(chunkSize/2), fault.statusCode, fault.err)
+					})
+				}
+			})
+		})
+
+		// TestFsPutShortEOF tests uploading a file where the reader
+		// returns EOF before the declared size worth of data has been
+		// read.
+		//
+		// go test -v -run 'TestIntegration/FsMkdir/FsPutShortEOF'
+		t.Run("FsPutShortEOF", func(t *testing.T) {
+			skipIfNotOk(t)
+
+			const putTimeout = 5 * time.Minute
+
+			// putShortEOF uploads a file declaring declared bytes but
+			// supplying only actual bytes, then checks the upload
+			// terminates and removes anything it created.
+			putShortEOF := func(t *testing.T, remote string, declared, actual int64) {
+				contents := random.String(int(actual))
+				obji := object.NewStaticObjectInfo(remote, fstest.Time("2003-02-03T04:05:06.499999999Z"), declared, true, nil, nil)
+
+				type result struct {
+					obj      fs.Object
+					err      error
+					panicked any
+				}
+				putCtx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				resultChan := make(chan result, 1)
+				go func() {
+					var res result
+					defer func() {
+						res.panicked = recover()
+						resultChan <- res
+					}()
+					res.obj, res.err = f.Put(putCtx, bytes.NewBufferString(contents), obji)
+				}()
+
+				var res result
+				select {
+				case res = <-resultChan:
+				case <-time.After(putTimeout):
+					t.Errorf("Put did not return within %v with a source %d bytes short of its declared size", putTimeout, declared-actual)
+					cancel()
+					select {
+					case res = <-resultChan:
+					case <-time.After(time.Minute):
+						t.Fatal("Put still did not return after cancelling the context - giving up")
+					}
+				}
+				require.Nil(t, res.panicked, "Put must not panic when the source returns EOF early")
+
+				if res.err != nil {
+					t.Logf("Put returned an error (acceptable): %v", res.err)
+					// Remove any partial object left behind
+					obj, err := f.NewObject(ctx, remote)
+					if err == nil {
+						assert.NoError(t, obj.Remove(ctx))
+					}
+					return
+				}
+
+				// Put claimed success so the object must exist and must
+				// contain only the bytes actually supplied.
+				var obj fs.Object
+				retry(t, "FsPutShortEOF: check uploaded object exists", func() error {
+					var err error
+					obj, err = f.NewObject(ctx, remote)
+					if errors.Is(err, fs.ErrorObjectNotFound) {
+						return fserrors.RetryErrorf("object not found yet")
+					}
+					return err
+				})
+				if size := obj.Size(); size >= 0 {
+					assert.Equal(t, actual, size, "object uploaded from a short source must contain the bytes actually supplied, not the declared size")
+				}
+				assert.NoError(t, obj.Remove(ctx))
+			}
+
+			t.Run("Simple", func(t *testing.T) {
+				var N int64 = 5 * 1024
+				if *fstest.SizeLimit > 0 && N > *fstest.SizeLimit {
+					N = *fstest.SizeLimit
+					t.Logf("Reduce file size due to limit %d", N)
+				}
+				putShortEOF(t, "short-eof.bin", 2*N, N)
+			})
+
+			t.Run("Chunked", func(t *testing.T) {
+				if testing.Short() {
+					t.Skip("not running with -short")
+				}
+				if opt.ChunkedUpload.Skip {
+					t.Skip("skipping as ChunkedUpload.Skip is set")
+				}
+				setUploadChunkSizer, _ := f.(SetUploadChunkSizer)
+				if setUploadChunkSizer == nil {
+					t.Skipf("%T does not implement SetUploadChunkSizer", f)
+				}
+				setUploadCutoffer, _ := f.(SetUploadCutoffer)
+
+				minChunkSize := max(opt.ChunkedUpload.MinChunkSize, 100)
+				if opt.ChunkedUpload.CeilChunkSize != nil {
+					minChunkSize = opt.ChunkedUpload.CeilChunkSize(minChunkSize)
+				}
+
+				// Set the minimum chunk size and upload cutoff, restoring them at the end
+				oldChunkSize, err := setUploadChunkSizer.SetUploadChunkSize(minChunkSize)
+				require.NoError(t, err)
+				var oldUploadCutoff fs.SizeSuffix
+				if setUploadCutoffer != nil {
+					oldUploadCutoff, err = setUploadCutoffer.SetUploadCutoff(minChunkSize)
+					require.NoError(t, err)
+				}
+				defer func() {
+					_, err := setUploadChunkSizer.SetUploadChunkSize(oldChunkSize)
+					assert.NoError(t, err)
+					if setUploadCutoffer != nil {
+						_, err := setUploadCutoffer.SetUploadCutoff(oldUploadCutoff)
+						assert.NoError(t, err)
+					}
+				}()
+
+				// Declare a size spanning 4 chunks but EOF after 1.5
+				cs := int64(minChunkSize)
+				putShortEOF(t, "short-eof-chunked.bin", 4*cs, cs+cs/2)
+			})
+		})
+
+		// Copy files with chunked copy if available
+		t.Run("FsCopyChunked", func(t *testing.T) {
+			skipIfNotOk(t)
+			if testing.Short() {
+				t.Skip("not running with -short")
+			}
+
+			// Check have Copy
+			doCopy := f.Features().Copy
+			if doCopy == nil {
+				t.Skip("FS has no Copier interface")
+			}
+
+			if opt.ChunkedUpload.Skip {
+				t.Skip("skipping as ChunkedUpload.Skip is set")
+			}
+
+			do, _ := f.(SetCopyCutoffer)
+			if do == nil {
+				t.Skipf("%T does not implement SetCopyCutoff", f)
+			}
+
+			minChunkSize := max(opt.ChunkedUpload.MinChunkSize, 100)
+			if opt.ChunkedUpload.CeilChunkSize != nil {
+				minChunkSize = opt.ChunkedUpload.CeilChunkSize(minChunkSize)
+			}
+
+			// Test setting the copy cutoff before we get going
+			_, err := do.SetCopyCutoff(minChunkSize)
+			if errors.Is(err, fs.ErrorNotImplemented) {
+				t.Skipf("%T does not support SetCopyCutoff: %v", f, err)
+			}
+			require.NoError(t, err)
+
+			chunkSizes := fs.SizeSuffixList{
+				minChunkSize,
+				minChunkSize + 1,
+				2*minChunkSize - 1,
+				2 * minChunkSize,
+				2*minChunkSize + 1,
+			}
+			for _, chunkSize := range chunkSizes {
+				t.Run(fmt.Sprintf("%d", chunkSize), func(t *testing.T) {
+					contents := random.String(int(chunkSize))
+					item := fstest.NewItem("chunked-copy", contents, fstest.Time("2001-05-06T04:05:06.499999999Z"))
+					src := PutTestContents(ctx, t, f, &item, contents, true)
+					defer func() {
+						assert.NoError(t, src.Remove(ctx))
+					}()
+
+					var itemCopy = item
+					itemCopy.Path += ".copy"
+
+					// Set copy cutoff to minimum value so we make chunks
+					origCutoff, err := do.SetCopyCutoff(minChunkSize)
+					require.NoError(t, err)
+					defer func() {
+						_, err = do.SetCopyCutoff(origCutoff)
+						require.NoError(t, err)
+					}()
+
+					// Do the copy
+					dst, err := doCopy(ctx, src, itemCopy.Path)
+					require.NoError(t, err)
+					defer func() {
+						assert.NoError(t, dst.Remove(ctx))
+					}()
+
+					// Check size
+					assert.Equal(t, src.Size(), dst.Size())
+
+					// Check modtime
+					srcModTime := src.ModTime(ctx)
+					dstModTime := dst.ModTime(ctx)
+					assert.True(t, srcModTime.Equal(dstModTime))
+
+					// Make sure contents are correct
+					gotContents := ReadObject(ctx, t, dst, -1)
+					assert.Equal(t, contents, gotContents)
 				})
 			}
 		})
@@ -1916,7 +3062,7 @@ func Run(t *testing.T, opt *Opt) {
 				newContents := random.String(200)
 				in := bytes.NewBufferString(newContents)
 
-				obj := findObject(ctx, t, f, unknownSizeUpdateFile.Path)
+				obj := fstest.NewObject(ctx, t, f, unknownSizeUpdateFile.Path)
 				obji := object.NewStaticObjectInfo(unknownSizeUpdateFile.Path, unknownSizeUpdateFile.ModTime, -1, true, nil, obj.Fs())
 				err := obj.Update(ctx, in, obji)
 				if err == nil {
@@ -1929,7 +3075,7 @@ func Run(t *testing.T, opt *Opt) {
 
 		// TestFsRootCollapse tests if the root of an fs "collapses" to the
 		// absolute root. It creates a new fs of the same backend type with its
-		// root set to a *non-existent* folder, and attempts to read the info of
+		// root set to a *nonexistent* folder, and attempts to read the info of
 		// an object in that folder, whose name is taken from a directory that
 		// exists in the absolute root.
 		// This test is added after
@@ -1948,19 +3094,203 @@ func Run(t *testing.T, opt *Opt) {
 			// somehow confused about root and absolute root.
 		})
 
+		// FsDirSetModTime tests setting the mod time on a directory if possible
+		t.Run("FsDirSetModTime", func(t *testing.T) {
+			const name = "dir-mod-time"
+			do := f.Features().DirSetModTime
+			if do == nil {
+				t.Skip("FS has no DirSetModTime interface")
+			}
+
+			// Set ModTime on non existing directory should return error
+			t1 := fstest.Time("2001-02-03T04:05:06.499999999Z")
+			err := do(ctx, name, t1)
+			require.Error(t, err)
+
+			// Make the directory and try again
+			err = f.Mkdir(ctx, name)
+			require.NoError(t, err)
+			err = do(ctx, name, t1)
+			require.NoError(t, err)
+
+			// Check the modtime got set properly
+			dir := fstest.NewDirectory(ctx, t, f, name)
+			fstest.CheckDirModTime(ctx, t, f, dir, t1)
+
+			// Tidy up
+			err = f.Rmdir(ctx, name)
+			require.NoError(t, err)
+		})
+
+		var testMetadata = fs.Metadata{
+			// System metadata supported by all backends
+			"mtime": "2001-02-03T04:05:06.499999999Z",
+			// User metadata
+			"potato": "jersey",
+		}
+		var testMetadata2 = fs.Metadata{
+			// System metadata supported by all backends
+			"mtime": "2002-02-03T04:05:06.499999999Z",
+			// User metadata
+			"potato": "king edwards",
+		}
+
+		// FsMkdirMetadata tests creating a directory with metadata if possible
+		t.Run("FsMkdirMetadata", func(t *testing.T) {
+			ctx, ci := fs.AddConfig(ctx)
+			ci.Metadata = true
+			const name = "dir-metadata"
+			do := f.Features().MkdirMetadata
+			if do == nil {
+				t.Skip("FS has no MkdirMetadata interface")
+			}
+			assert.True(t, f.Features().WriteDirMetadata, "Backends must support Directory.SetMetadata and Fs.MkdirMetadata")
+
+			// Create the directory from fresh
+			dir, err := do(ctx, name, testMetadata)
+			require.NoError(t, err)
+			require.NotNil(t, dir)
+
+			// Check the returned directory and one read from the listing
+			fstest.CheckEntryMetadata(ctx, t, f, dir, testMetadata)
+			fstest.CheckEntryMetadata(ctx, t, f, fstest.NewDirectory(ctx, t, f, name), testMetadata)
+
+			// Now update the metadata on the existing directory
+			t.Run("Update", func(t *testing.T) {
+				dir, err := do(ctx, name, testMetadata2)
+				require.NoError(t, err)
+				require.NotNil(t, dir)
+
+				// Check the returned directory and one read from the listing
+				fstest.CheckEntryMetadata(ctx, t, f, dir, testMetadata2)
+				// The TestUnionPolicy2 has randomness in it so it sets metadata on
+				// one directory but can read a different one from the listing.
+				if f.Name() != "TestUnionPolicy2" {
+					fstest.CheckEntryMetadata(ctx, t, f, fstest.NewDirectory(ctx, t, f, name), testMetadata2)
+				}
+			})
+
+			// Now test the Directory methods
+			t.Run("CheckDirectory", func(t *testing.T) {
+				_, ok := dir.(fs.Object)
+				assert.False(t, ok, "Directory must not type assert to Object")
+				_, ok = dir.(fs.ObjectInfo)
+				assert.False(t, ok, "Directory must not type assert to ObjectInfo")
+			})
+
+			// Tidy up
+			err = f.Rmdir(ctx, name)
+			require.NoError(t, err)
+		})
+
+		// FsDirectory checks methods on the directory object
+		t.Run("FsDirectory", func(t *testing.T) {
+			ctx, ci := fs.AddConfig(ctx)
+			ci.Metadata = true
+			const name = "dir-methods"
+			features := f.Features()
+
+			if !features.CanHaveEmptyDirectories {
+				t.Skip("Can't test if can't have empty directories")
+			}
+			if !features.ReadDirMetadata &&
+				!features.WriteDirMetadata &&
+				!features.WriteDirSetModTime &&
+				!features.UserDirMetadata &&
+				!features.Overlay &&
+				features.UnWrap == nil {
+				t.Skip("FS has no Directory methods and doesn't Wrap")
+			}
+
+			// Create a directory to start with
+			err := f.Mkdir(ctx, name)
+			require.NoError(t, err)
+
+			// Get the directory object
+			dir := fstest.NewDirectory(ctx, t, f, name)
+			_, ok := dir.(fs.Object)
+			assert.False(t, ok, "Directory must not type assert to Object")
+			_, ok = dir.(fs.ObjectInfo)
+			assert.False(t, ok, "Directory must not type assert to ObjectInfo")
+
+			// Now test the directory methods
+			t.Run("ReadDirMetadata", func(t *testing.T) {
+				if !features.ReadDirMetadata {
+					t.Skip("Directories don't support ReadDirMetadata")
+				}
+				if f.Name() == "TestUnionPolicy3" {
+					t.Skipf("Test unreliable on %q", f.Name())
+				}
+				fstest.CheckEntryMetadata(ctx, t, f, dir, fs.Metadata{
+					"mtime": dir.ModTime(ctx).Format(time.RFC3339Nano),
+				})
+			})
+
+			t.Run("WriteDirMetadata", func(t *testing.T) {
+				if !features.WriteDirMetadata {
+					t.Skip("Directories don't support WriteDirMetadata")
+				}
+				assert.NotNil(t, features.MkdirMetadata, "Backends must support Directory.SetMetadata and Fs.MkdirMetadata")
+				do, ok := dir.(fs.SetMetadataer)
+				require.True(t, ok, "Expected to find SetMetadata method on Directory")
+				err := do.SetMetadata(ctx, testMetadata)
+				require.NoError(t, err)
+
+				fstest.CheckEntryMetadata(ctx, t, f, dir, testMetadata)
+				fstest.CheckEntryMetadata(ctx, t, f, fstest.NewDirectory(ctx, t, f, name), testMetadata)
+			})
+
+			t.Run("WriteDirSetModTime", func(t *testing.T) {
+				if !features.WriteDirSetModTime {
+					t.Skip("Directories don't support WriteDirSetModTime")
+				}
+				assert.NotNil(t, features.DirSetModTime, "Backends must support Directory.SetModTime and Fs.DirSetModTime")
+
+				t1 := fstest.Time("2001-02-03T04:05:10.123123123Z")
+
+				do, ok := dir.(fs.SetModTimer)
+				require.True(t, ok, "Expected to find SetMetadata method on Directory")
+				err := do.SetModTime(ctx, t1)
+				require.NoError(t, err)
+
+				fstest.CheckDirModTime(ctx, t, f, dir, t1)
+				fstest.CheckDirModTime(ctx, t, f, fstest.NewDirectory(ctx, t, f, name), t1)
+			})
+
+			// Check to see if Fs that wrap other Directories implement all the optional methods
+			t.Run("DirectoryCheckWrap", func(t *testing.T) {
+				if opt.SkipDirectoryCheckWrap {
+					t.Skip("Skipping DirectoryCheckWrap on this Fs")
+				}
+				if !features.Overlay && features.UnWrap == nil {
+					t.Skip("Not a wrapping Fs")
+				}
+				_, unsupported := fs.DirectoryOptionalInterfaces(dir)
+				for _, name := range unsupported {
+					if !stringsContains(name, opt.UnimplementableDirectoryMethods) {
+						t.Errorf("Missing Directory wrapper for %s", name)
+					}
+				}
+			})
+
+			// Tidy up
+			err = f.Rmdir(ctx, name)
+			require.NoError(t, err)
+		})
+
 		// Purge the folder
 		err = operations.Purge(ctx, f, "")
-		if errors.Cause(err) != fs.ErrorDirNotFound {
+		if !errors.Is(err, fs.ErrorDirNotFound) {
 			require.NoError(t, err)
 		}
 		purged = true
 		fstest.CheckListing(t, f, []fstest.Item{})
 
-		// Check purging again if not bucket based
+		// Check purging again if not bucket-based
 		if !isBucketBasedButNotRoot(f) {
 			err = operations.Purge(ctx, f, "")
 			assert.Error(t, err, "Expecting error after on second purge")
-			if errors.Cause(err) != fs.ErrorDirNotFound {
+			if !errors.Is(err, fs.ErrorDirNotFound) {
 				t.Log("Warning: this should produce fs.ErrorDirNotFound")
 			}
 		}

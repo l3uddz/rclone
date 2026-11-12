@@ -2,12 +2,11 @@ package policy
 
 import (
 	"context"
-	"math/rand"
+	"fmt"
 	"path"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/union/upstream"
 	"github.com/rclone/rclone/fs"
 )
@@ -44,7 +43,7 @@ func registerPolicy(name string, p Policy) {
 func Get(name string) (Policy, error) {
 	p, ok := policies[strings.ToLower(name)]
 	if !ok {
-		return nil, errors.Errorf("didn't find policy called %q", name)
+		return nil, fmt.Errorf("didn't find policy called %q", name)
 	}
 	return p, nil
 }
@@ -109,9 +108,7 @@ func findEntry(ctx context.Context, f fs.Fs, remote string) fs.DirEntry {
 		if err != nil {
 			return nil
 		}
-		// random modtime for root
-		randomNow := time.Unix(time.Now().Unix()-rand.Int63n(10000), 0)
-		return fs.NewDir("", randomNow)
+		return fs.NewDir("", time.Time{})
 	}
 	found := false
 	for _, e := range entries {
